@@ -34,6 +34,27 @@ target_link_libraries(
   velox_tpcds_benchmark_lib
 )
 
+# --- filter, projection and aggregation ---
+
+add_executable(velox_cudf_filter_project_benchmark
+               CudfFilterProjectBenchmark.cpp)
+
+target_link_libraries(
+  velox_cudf_filter_project_benchmark
+  velox_cudf_exec
+  velox_aggregates
+  velox_exec
+  velox_exec_test_lib
+  velox_functions_prestosql
+  velox_memory
+  velox_query_benchmark
+  velox_vector
+  Folly::folly
+  gflags::gflags
+  glog::glog
+  fmt::fmt
+)
+
 # --- other benchmarks ---
 
 add_executable(velox_cudf_interop_benchmark CudfInteropBenchmark.cpp)

@@ -10,6 +10,7 @@ Benchmark binaries for TPC-H and TPC-DS queries with optional CuDF GPU accelerat
 | `velox_cudf_tpch_benchmark` | TPC-H (Q1-Q22) | GPU | `CudfTpchBenchmark.cpp` |
 | `velox_tpcds_benchmark` | TPC-DS (Q1-Q99) | CPU | `velox/benchmarks/tpcds/` |
 | `velox_cudf_tpcds_benchmark` | TPC-DS (Q1-Q99) | GPU | `CudfTpcdsBenchmark.cpp` |
+| `velox_cudf_filter_project_benchmark` | Filter, wide projection list, grouped aggregation | CPU and GPU | `CudfFilterProjectBenchmark.cpp` |
 
 CPU binaries use HiveConnector. GPU binaries use CudfHiveConnector and register
 cuDF GPU operator replacements.
@@ -25,6 +26,75 @@ ninja velox_cudf_tpch_benchmark velox_cudf_tpcds_benchmark
 # CPU-only binaries (no CUDA required)
 ninja velox_tpch_benchmark velox_tpcds_benchmark
 ```
+
+---
+
+## Filter and Projection Benchmark
+
+Runs a filter, a list of polynomial projections and a grouped aggregation over
+synthetic data, with no files to generate. Three arms, one per invocation,
+since cuDF reads the evaluator choice once when its adapter registers:
+
+| Arm | Meaning |
+|-----|---------|
+| `--engine=cpu` | No adapter. The correctness reference. |
+| `--engine=cudf --evaluator=ast` | A runtime AST interpreter, `compute_column`. |
+| `--engine=cudf --evaluator=jit` | A kernel generated and compiled by NVRTC. |
+
+The plan shape is set by flags: the number of columns and projections, the
+polynomial degree, how many columns each projection reads, the filter
+selectivity, the batch size and the total input size.
+
+```bash
+# CPU reference. Note the checksum it prints.
+./velox_cudf_filter_project_benchmark --engine=cpu --num_projections=32
+
+# The two evaluators, both verified against that checksum.
+./velox_cudf_filter_project_benchmark --engine=cudf --evaluator=jit --num_projections=32 \
+  --expect_checksum=<value from the cpu run> --checksum_tolerance=1e-6
+./velox_cudf_filter_project_benchmark --engine=cudf --evaluator=ast --num_projections=32 \
+  --expect_checksum=<value from the cpu run> --checksum_tolerance=1e-6
+```
+
+Correctness is a checksum within a tolerance rather than an exact comparison,
+because NVRTC contracts `a*b+c` into an FMA and the CPU does not, so the
+results differ in the last ulp by design.
+
+To sweep, write one flag per line in a file and pass it as `--test_flags_file`.
+Every combination is run, and the results are printed at the end sorted by time
+and labelled with the flag values that produced them:
+
+```bash
+printf 'num_projections:8,32,128\nbatch_size:100000,1000000\n' > grid
+./velox_cudf_filter_project_benchmark --engine=cudf --evaluator=jit --test_flags_file=grid
+```
+
+Sweeping the column count takes two more flags. The projections have to grow
+with the schema or they stop reading all of it, which `--num_projections=0`
+does by matching the column count, and `--total_bytes` derives the row count so
+the input holds the same bytes at every width:
+
+```bash
+printf 'num_columns:8,32,128,512\n' > grid
+./velox_cudf_filter_project_benchmark --engine=cudf --evaluator=jit --test_flags_file=grid \
+  --num_projections=0 --total_bytes=$((8 << 30))
+```
+
+### Key Flags
+
+| Flag | Description |
+|------|-------------|
+| `--engine` | `cpu` or `cudf` |
+| `--evaluator` | cuDF expression evaluator: `jit`, `ast`, or `default` |
+| `--num_columns` | Number of DOUBLE columns, N |
+| `--num_projections` | Number of polynomial projections, M. 0 matches `--num_columns` |
+| `--poly_degree` | Polynomial order, evaluated in Horner form |
+| `--projection_fanin` | Distinct input columns each projection reads |
+| `--total_bytes` | Derive the row count so the input holds this many bytes at any column count |
+| `--batch_size` | Rows per input RowVector |
+| `--selectivity` | Fraction of rows passing the filter |
+| `--timed_iters` | Timed iterations. Their mean is reported, excluding the first |
+| `--expect_checksum` | Fail unless the result matches, within `--checksum_tolerance` |
 
 ---
 
