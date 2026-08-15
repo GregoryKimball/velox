@@ -91,6 +91,10 @@ if(VELOX_ENABLE_CXL)
   add_subdirectory(experimental/cxl)
 endif()
 
+if(VELOX_ENABLE_FAISS AND VELOX_ENABLE_EXEC)
+  add_subdirectory(experimental/faiss)
+endif()
+
 if(${VELOX_BUILD_TESTING})
   add_subdirectory(tool)
 endif()
