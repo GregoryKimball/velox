@@ -68,6 +68,38 @@ TEST(FaissIndexTest, artifactRoundTripAndBuildLoadParity) {
   std::filesystem::remove_all(directory);
 }
 
+TEST(FaissIndexTest, loadTargetRejectsArtifactMismatch) {
+  auto built = buildFaissIndexState(
+      flatConfig(), {{0, {0, 0, 2, 0}}}, {{0, {10, 20}}});
+  const auto directory = (std::filesystem::temp_directory_path() /
+                          "velox_faiss_load_target_mismatch")
+                             .string();
+  std::filesystem::remove_all(directory);
+  writeFaissArtifact(*built, directory);
+
+  auto dimensionMismatch = flatConfig();
+  dimensionMismatch.dimension = 4;
+  auto loaded = loadFaissArtifact(directory);
+  VELOX_ASSERT_THROW(
+      applyFaissLoadTarget(*loaded, dimensionMismatch),
+      "dimension does not match target");
+
+  auto metricMismatch = flatConfig();
+  metricMismatch.metric = FaissMetric::kInnerProduct;
+  loaded = loadFaissArtifact(directory);
+  VELOX_ASSERT_THROW(
+      applyFaissLoadTarget(*loaded, metricMismatch),
+      "metric does not match target");
+
+  auto algorithmMismatch = flatConfig();
+  algorithmMismatch.algorithm = FaissAlgorithm::kHnsw;
+  loaded = loadFaissArtifact(directory);
+  VELOX_ASSERT_THROW(
+      applyFaissLoadTarget(*loaded, algorithmMismatch),
+      "algorithm does not match target strategy");
+  std::filesystem::remove_all(directory);
+}
+
 TEST(FaissIndexTest, invalidDimensions) {
   auto config = flatConfig();
   config.dimension = 0;
@@ -135,6 +167,29 @@ TEST(FaissIndexTest, cpuGpuFlatParity) {
   }
 }
 
+TEST(FaissIndexTest, cpuArtifactLoadsToGpuTarget) {
+  if (!hasGpu()) {
+    GTEST_SKIP() << "No CUDA GPU available";
+  }
+  auto cpu = buildFaissIndexState(
+      flatConfig(), {{0, {0, 0, 2, 0}}}, {{0, {10, 20}}});
+  const auto directory = (std::filesystem::temp_directory_path() /
+                          "velox_faiss_cpu_artifact_gpu_target")
+                             .string();
+  std::filesystem::remove_all(directory);
+  writeFaissArtifact(*cpu, directory);
+
+  auto loaded = loadFaissArtifact(directory);
+  EXPECT_EQ(loaded->config.executionDevice, FaissExecutionDevice::kCpu);
+  auto target = flatConfig();
+  target.executionDevice = FaissExecutionDevice::kGpu;
+  applyFaissLoadTarget(*loaded, target);
+  EXPECT_EQ(loaded->config.executionDevice, FaissExecutionDevice::kGpu);
+  EXPECT_TRUE(loaded->clusters.at(0).gpuResident);
+  EXPECT_NE(loaded->gpuContext, nullptr);
+  std::filesystem::remove_all(directory);
+}
+
 TEST(FaissIndexTest, cagraConvertsAndPersistsAsCpuHnsw) {
   if (!hasGpu()) {
     GTEST_SKIP() << "No CUDA GPU available";
@@ -168,6 +223,8 @@ TEST(FaissIndexTest, cagraConvertsAndPersistsAsCpuHnsw) {
   std::filesystem::remove_all(directory);
   writeFaissArtifact(*built, directory);
   auto loaded = loadFaissArtifact(directory);
+  applyFaissLoadTarget(*loaded, config);
+  EXPECT_EQ(loaded->config.executionDevice, FaissExecutionDevice::kGpu);
   EXPECT_FALSE(loaded->clusters.at(0).gpuResident);
   EXPECT_NE(
       dynamic_cast<::faiss::IndexHNSWCagra*>(
@@ -216,6 +273,26 @@ TEST_F(FaissPlanNodeTest, serializationRoundTrip) {
       std::dynamic_pointer_cast<const BuildIndexNode>(
           restored->sources().at(1)),
       nullptr);
+
+  auto target = flatConfig();
+  target.nprobe = 7;
+  auto load = std::make_shared<LoadIndexNode>("load", "/tmp/index", target);
+  const auto loadCopy =
+      ISerializable::deserialize<core::PlanNode>(load->serialize(), pool());
+  const auto restoredLoad =
+      std::dynamic_pointer_cast<const LoadIndexNode>(loadCopy);
+  ASSERT_NE(restoredLoad, nullptr);
+  ASSERT_TRUE(restoredLoad->targetConfig().has_value());
+  EXPECT_EQ(restoredLoad->targetConfig()->nprobe, 7);
+
+  auto legacy = load->serialize();
+  legacy.erase("targetConfig");
+  const auto legacyCopy =
+      ISerializable::deserialize<core::PlanNode>(legacy, pool());
+  const auto restoredLegacy =
+      std::dynamic_pointer_cast<const LoadIndexNode>(legacyCopy);
+  ASSERT_NE(restoredLegacy, nullptr);
+  EXPECT_FALSE(restoredLegacy->targetConfig().has_value());
 }
 
 TEST_F(FaissPlanNodeTest, rejectsNullEmbeddings) {

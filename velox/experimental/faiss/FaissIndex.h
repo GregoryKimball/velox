@@ -45,6 +45,12 @@ struct FaissIndexState {
   std::map<int64_t, FaissClusterIndex> clusters;
   int64_t rowCount{0};
   double cagraCopyToMilliseconds{0};
+  double trainMilliseconds{0};
+  double addMilliseconds{0};
+  double searchMilliseconds{0};
+  double loadReadMilliseconds{0};
+  double loadDeserializeMilliseconds{0};
+  double loadUploadMilliseconds{0};
 };
 
 void searchFaissIndex(
@@ -72,5 +78,11 @@ void writeFaissArtifact(
 
 std::shared_ptr<FaissIndexState> loadFaissArtifact(
     const std::string& directory);
+
+/// Validates a CPU-loaded artifact against the requested serving config,
+/// applies search parameters and uploads indexes when GPU serving is requested.
+void applyFaissLoadTarget(
+    FaissIndexState& state,
+    const FaissIndexConfig& targetConfig);
 
 } // namespace facebook::velox::faiss

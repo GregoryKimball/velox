@@ -18,6 +18,8 @@ std::string algorithmName(FaissAlgorithm algorithm) {
       return "ivf_flat";
     case FaissAlgorithm::kIvfPq:
       return "ivf_pq";
+    case FaissAlgorithm::kCagra:
+      return "cagra";
     case FaissAlgorithm::kHnsw:
       return "hnsw";
     case FaissAlgorithm::kHnswCagra:
@@ -35,6 +37,9 @@ FaissAlgorithm parseAlgorithm(const std::string& value) {
   }
   if (value == "ivf_pq") {
     return FaissAlgorithm::kIvfPq;
+  }
+  if (value == "cagra") {
+    return FaissAlgorithm::kCagra;
   }
   if (value == "hnsw") {
     return FaissAlgorithm::kHnsw;
@@ -150,6 +155,10 @@ void FaissIndexConfig::validate() const {
       executionDevice != FaissExecutionDevice::kGpu ||
           algorithm != FaissAlgorithm::kHnsw,
       "FAISS GPU supports CAGRA, not the CPU HNSW build strategy");
+  VELOX_USER_CHECK(
+      algorithm != FaissAlgorithm::kCagra ||
+          executionDevice == FaissExecutionDevice::kGpu,
+      "FAISS CAGRA requires GPU execution");
   if (algorithm == FaissAlgorithm::kIvfPq) {
     VELOX_USER_CHECK_GT(
         pqSubquantizers, 0, "FAISS PQ subquantizers must be positive");
@@ -276,10 +285,17 @@ core::PlanNodePtr BuildIndexNode::create(
       optionalString(obj, "artifactDirectory"));
 }
 
-LoadIndexNode::LoadIndexNode(core::PlanNodeId id, std::string artifactDirectory)
+LoadIndexNode::LoadIndexNode(
+    core::PlanNodeId id,
+    std::string artifactDirectory,
+    std::optional<FaissIndexConfig> targetConfig)
     : PlanNode(std::move(id)),
-      artifactDirectory_(std::move(artifactDirectory)) {
+      artifactDirectory_(std::move(artifactDirectory)),
+      targetConfig_(std::move(targetConfig)) {
   VELOX_USER_CHECK(!artifactDirectory_.empty(), "Artifact directory is empty");
+  if (targetConfig_) {
+    targetConfig_->validate();
+  }
 }
 
 const std::vector<core::PlanNodePtr>& LoadIndexNode::sources() const {
@@ -289,19 +305,30 @@ const std::vector<core::PlanNodePtr>& LoadIndexNode::sources() const {
 
 void LoadIndexNode::addDetails(std::stringstream& stream) const {
   stream << artifactDirectory_;
+  if (targetConfig_) {
+    stream << ", target " << deviceName(targetConfig_->executionDevice);
+  }
 }
 
 folly::dynamic LoadIndexNode::serialize() const {
   auto obj = PlanNode::serialize();
   obj["artifactDirectory"] = artifactDirectory_;
+  obj["targetConfig"] =
+      targetConfig_ ? targetConfig_->serialize() : folly::dynamic(nullptr);
   return obj;
 }
 
 core::PlanNodePtr LoadIndexNode::create(
     const folly::dynamic& obj,
     void* /* context */) {
+  std::optional<FaissIndexConfig> targetConfig;
+  if (obj.count("targetConfig") && !obj["targetConfig"].isNull()) {
+    targetConfig = FaissIndexConfig::deserialize(obj["targetConfig"]);
+  }
   return std::make_shared<LoadIndexNode>(
-      obj["id"].asString(), obj["artifactDirectory"].asString());
+      obj["id"].asString(),
+      obj["artifactDirectory"].asString(),
+      std::move(targetConfig));
 }
 
 SearchIndexNode::SearchIndexNode(

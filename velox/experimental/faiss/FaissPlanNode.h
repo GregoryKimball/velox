@@ -11,7 +11,14 @@
 
 namespace facebook::velox::faiss {
 
-enum class FaissAlgorithm { kFlat, kIvfFlat, kIvfPq, kHnsw, kHnswCagra };
+enum class FaissAlgorithm {
+  kFlat,
+  kIvfFlat,
+  kIvfPq,
+  kCagra,
+  kHnsw,
+  kHnswCagra
+};
 enum class FaissMetric { kL2, kInnerProduct };
 enum class FaissExecutionDevice { kCpu, kGpu };
 
@@ -131,7 +138,10 @@ class BuildIndexNode final : public core::PlanNode {
 
 class LoadIndexNode final : public core::PlanNode {
  public:
-  LoadIndexNode(core::PlanNodeId id, std::string artifactDirectory);
+  LoadIndexNode(
+      core::PlanNodeId id,
+      std::string artifactDirectory,
+      std::optional<FaissIndexConfig> targetConfig = std::nullopt);
 
   const RowTypePtr& outputType() const override {
     return outputType_;
@@ -143,6 +153,9 @@ class LoadIndexNode final : public core::PlanNode {
   const std::string& artifactDirectory() const {
     return artifactDirectory_;
   }
+  const std::optional<FaissIndexConfig>& targetConfig() const {
+    return targetConfig_;
+  }
   folly::dynamic serialize() const override;
   static core::PlanNodePtr create(const folly::dynamic& obj, void* context);
 
@@ -150,6 +163,7 @@ class LoadIndexNode final : public core::PlanNode {
   void addDetails(std::stringstream& stream) const override;
   RowTypePtr outputType_{ROW({}, {})};
   std::string artifactDirectory_;
+  std::optional<FaissIndexConfig> targetConfig_;
 };
 
 class SearchIndexNode final : public core::PlanNode {

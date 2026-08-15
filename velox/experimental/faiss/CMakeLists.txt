@@ -21,6 +21,7 @@ velox_add_library(
   FaissIndex.h
   FaissOperators.h
   FaissGpuIndex.h
+  FaissNvtx.h
 )
 
 velox_link_libraries(
@@ -51,4 +52,12 @@ endif()
 
 if(VELOX_BUILD_TESTING)
   add_subdirectory(tests)
+endif()
+
+if(
+  VELOX_ENABLE_BENCHMARKS
+  AND VELOX_ENABLE_PARQUET
+  AND VELOX_ENABLE_HIVE_CONNECTOR
+)
+  add_subdirectory(benchmarks)
 endif()

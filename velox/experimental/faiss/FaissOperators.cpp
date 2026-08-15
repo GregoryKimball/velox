@@ -4,14 +4,25 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  */
 #include "velox/experimental/faiss/FaissOperators.h"
+#include "velox/experimental/faiss/FaissNvtx.h"
 
 #include "velox/exec/Task.h"
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/FlatVector.h"
 
 #include <limits>
+#include <chrono>
 
 namespace facebook::velox::faiss {
+namespace {
+
+RuntimeCounter milliseconds(double value) {
+  return RuntimeCounter(
+      static_cast<int64_t>(value * 1'000'000),
+      RuntimeCounter::Unit::kNanos);
+}
+
+} // namespace
 
 const ArrayVector* validateFaissEmbeddings(
     const RowVectorPtr& input,
@@ -325,6 +336,28 @@ class IndexBuildOperator final : public exec::Operator {
     } else {
       VELOX_CHECK_NOT_NULL(loadNode_);
       state = loadFaissArtifact(loadNode_->artifactDirectory());
+      if (loadNode_->targetConfig()) {
+        applyFaissLoadTarget(*state, *loadNode_->targetConfig());
+      }
+    }
+    {
+      auto stats = stats_.wlock();
+      stats->addRuntimeStat(
+          "faissTrainWallNanos", milliseconds(state->trainMilliseconds));
+      stats->addRuntimeStat(
+          "faissAddWallNanos", milliseconds(state->addMilliseconds));
+      stats->addRuntimeStat(
+          "faissLoadReadWallNanos",
+          milliseconds(state->loadReadMilliseconds));
+      stats->addRuntimeStat(
+          "faissLoadDeserializeWallNanos",
+          milliseconds(state->loadDeserializeMilliseconds));
+      stats->addRuntimeStat(
+          "faissLoadUploadWallNanos",
+          milliseconds(state->loadUploadMilliseconds));
+      stats->addRuntimeStat(
+          "faissCagraToHnswWallNanos",
+          milliseconds(state->cagraCopyToMilliseconds));
     }
     auto bridge = std::dynamic_pointer_cast<FaissIndexBridge>(
         operatorCtx_->task()->getCustomJoinBridge(
@@ -383,6 +416,8 @@ class IndexSearchOperator final : public exec::Operator {
     if (!input_ || !state_) {
       return nullptr;
     }
+    FaissNvtxRange queryRange("candidate retrieval query");
+    const auto conversionStart = std::chrono::steady_clock::now();
     const auto queryType = node_->sources()[0]->outputType();
     const ArrayVector* arrays = nullptr;
     const SimpleVector<int64_t>* queryIds = nullptr;
@@ -417,6 +452,10 @@ class IndexSearchOperator final : public exec::Operator {
         VELOX_USER_CHECK_NOT_NULL(clusters);
       }
     }
+    conversionMilliseconds_ +=
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - conversionStart)
+            .count();
     std::vector<int64_t> outputQueryIds;
     std::vector<int64_t> outputResultIds;
     std::vector<float> outputDistances;
@@ -459,6 +498,8 @@ class IndexSearchOperator final : public exec::Operator {
           distances.data(),
           labels.data(),
           stream);
+      FaissNvtxRange gatherRange("ID gather");
+      const auto gatherStart = std::chrono::steady_clock::now();
       for (int32_t rank = 0; rank < node_->topK(); ++rank) {
         const auto ordinal = labels[rank];
         if (ordinal < 0) {
@@ -473,6 +514,10 @@ class IndexSearchOperator final : public exec::Operator {
         outputDistances.push_back(distances[rank]);
         outputRanks.push_back(rank + 1);
       }
+      gatherMilliseconds_ +=
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - gatherStart)
+              .count();
     }
     input_.reset();
     std::vector<VectorPtr> children{
@@ -489,6 +534,16 @@ class IndexSearchOperator final : public exec::Operator {
   }
   bool isFinished() override {
     if (noMoreInput_ && input_ == nullptr) {
+      if (state_ && !reportedStats_) {
+        auto stats = stats_.wlock();
+        stats->addRuntimeStat(
+            "faissConversionWallNanos", milliseconds(conversionMilliseconds_));
+        stats->addRuntimeStat(
+            "faissSearchWallNanos", milliseconds(state_->searchMilliseconds));
+        stats->addRuntimeStat(
+            "faissIdGatherWallNanos", milliseconds(gatherMilliseconds_));
+        reportedStats_ = true;
+      }
       state_.reset();
       return true;
     }
@@ -498,6 +553,9 @@ class IndexSearchOperator final : public exec::Operator {
  private:
   std::shared_ptr<const SearchIndexNode> node_;
   std::shared_ptr<FaissIndexState> state_;
+  double conversionMilliseconds_{0};
+  double gatherMilliseconds_{0};
+  bool reportedStats_{false};
 };
 
 } // namespace

@@ -4,6 +4,7 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  */
 #include "velox/experimental/faiss/FaissGpuIndex.h"
+#include "velox/experimental/faiss/FaissNvtx.h"
 
 #include <faiss/IndexHNSW.h>
 #include <faiss/IndexIVF.h>
@@ -33,6 +34,7 @@ std::string factoryDescription(const FaissIndexConfig& config) {
     case FaissAlgorithm::kIvfPq:
       return fmt::format(
           "IVF{},PQ{}x{}", config.nlist, config.pqSubquantizers, config.pqBits);
+    case FaissAlgorithm::kCagra:
     case FaissAlgorithm::kHnsw:
     case FaissAlgorithm::kHnswCagra:
       VELOX_UNREACHABLE();
@@ -91,7 +93,9 @@ class FaissGpuContextImpl final : public FaissGpuContext {
 std::unique_ptr<::faiss::Index> buildCpuStagingIndex(
     const FaissIndexConfig& config,
     ::faiss::idx_t count,
-    const float* values) {
+    const float* values,
+    double& trainMilliseconds,
+    double& addMilliseconds) {
   auto index = std::unique_ptr<::faiss::Index>(::faiss::index_factory(
       config.dimension,
       factoryDescription(config).c_str(),
@@ -101,10 +105,20 @@ std::unique_ptr<::faiss::Index> buildCpuStagingIndex(
     ivf->nprobe = config.nprobe;
   }
   if (!index->is_trained && count > 0) {
+    FaissNvtxRange range("FAISS train");
+    const auto start = std::chrono::steady_clock::now();
     index->train(count, values);
+    trainMilliseconds += std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
   }
   if (count > 0) {
+    FaissNvtxRange range("FAISS add");
+    const auto start = std::chrono::steady_clock::now();
     index->add(count, values);
+    addMilliseconds += std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
   }
   return index;
 }
@@ -114,7 +128,8 @@ std::unique_ptr<::faiss::Index> buildCagraCpuSearchIndex(
     ::faiss::gpu::StandardGpuResources* resources,
     ::faiss::idx_t count,
     const float* values,
-    double& copyMilliseconds) {
+    double& copyMilliseconds,
+    double& trainMilliseconds) {
   auto cpuIndex = std::make_unique<::faiss::IndexHNSWCagra>(
       config.dimension, config.hnswM, metricType(config.metric));
   cpuIndex->base_level_only = true;
@@ -139,9 +154,15 @@ std::unique_ptr<::faiss::Index> buildCagraCpuSearchIndex(
   gpuConfig.build_algo = ::faiss::gpu::graph_build_algo::NN_DESCENT;
   ::faiss::gpu::GpuIndexCagra gpuIndex(
       resources, config.dimension, metricType(config.metric), gpuConfig);
+  FaissNvtxRange trainRange("FAISS train");
+  const auto trainStart = std::chrono::steady_clock::now();
   gpuIndex.train(count, values);
+  trainMilliseconds += std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - trainStart)
+                           .count();
 
   const auto start = std::chrono::steady_clock::now();
+  FaissNvtxRange copyRange("CAGRA-to-HNSW");
   gpuIndex.copyTo(cpuIndex.get());
   resources->getResources()->syncDefaultStream(config.gpuDevice);
   copyMilliseconds += std::chrono::duration<double, std::milli>(
@@ -187,10 +208,38 @@ std::shared_ptr<FaissIndexState> buildFaissGpuIndexState(
           context->resources(),
           count,
           values.data(),
-          state->cagraCopyToMilliseconds);
+          state->cagraCopyToMilliseconds,
+          state->trainMilliseconds);
       gpuResident = false;
+    } else if (config.algorithm == FaissAlgorithm::kCagra) {
+      ::faiss::gpu::GpuIndexCagraConfig gpuConfig;
+      gpuConfig.device = config.gpuDevice;
+      gpuConfig.use_cuvs = true;
+      gpuConfig.graph_degree = static_cast<size_t>(config.hnswM) * 2;
+      gpuConfig.intermediate_graph_degree =
+          std::max<size_t>(128, gpuConfig.graph_degree * 2);
+      auto gpuIndex = std::make_unique<::faiss::gpu::GpuIndexCagra>(
+          context->resources(),
+          config.dimension,
+          metricType(config.metric),
+          gpuConfig);
+      {
+        FaissNvtxRange range("FAISS train");
+        const auto start = std::chrono::steady_clock::now();
+        gpuIndex->train(count, values.data());
+        state->trainMilliseconds +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start)
+                .count();
+      }
+      index = std::move(gpuIndex);
     } else {
-      auto cpuIndex = buildCpuStagingIndex(config, count, values.data());
+      auto cpuIndex = buildCpuStagingIndex(
+          config,
+          count,
+          values.data(),
+          state->trainMilliseconds,
+          state->addMilliseconds);
       index = context->toGpu(cpuIndex.get());
     }
 
@@ -206,7 +255,7 @@ void promoteLoadedIndexesToGpu(FaissIndexState& state) {
   VELOX_USER_CHECK(state.config.executionDevice == FaissExecutionDevice::kGpu);
   VELOX_USER_CHECK(
       state.config.algorithm != FaissAlgorithm::kHnswCagra,
-      "CAGRA artifacts must remain CPU HNSW indexes when loaded");
+      "CAGRA-to-HNSW artifacts must remain CPU HNSW indexes when loaded");
   auto context = std::make_shared<FaissGpuContextImpl>(state.config.gpuDevice);
   for (auto& [cluster, value] : state.clusters) {
     value.index = context->toGpu(value.index.get());
