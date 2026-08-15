@@ -72,6 +72,16 @@ block()
   # Make FAISS available
   FetchContent_MakeAvailable(faiss)
   add_library(FAISS::faiss ALIAS faiss)
+  if(VELOX_ENABLE_FAISS_GPU AND TARGET faiss_gpu_objs AND TARGET CCCL::CCCL)
+    # CUDA toolkit releases may ship an older CCCL under include/cccl. Ensure
+    # RAPIDS' selected CCCL is searched first when compiling FAISS GPU sources.
+    target_include_directories(
+      faiss_gpu_objs
+      SYSTEM
+      BEFORE
+      PRIVATE $<TARGET_PROPERTY:CCCL::CCCL,INTERFACE_INCLUDE_DIRECTORIES>
+    )
+  endif()
   unset(BUILD_TESTING CACHE)
   unset(BUILD_SHARED_LIBS CACHE)
 endblock()

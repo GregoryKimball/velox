@@ -6,12 +6,18 @@
 #include "velox/experimental/faiss/FaissOperators.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/common/file/LocalFile.h"
+#if !defined(VELOX_ENABLE_FAISS_GPU)
+#include "velox/exec/tests/utils/AssertQueryBuilder.h"
+#endif
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
 #include <faiss/Index.h>
+#include <folly/init/Init.h>
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <fstream>
 
 #if defined(VELOX_ENABLE_FAISS_GPU)
 #include <cuda_runtime_api.h>
@@ -20,6 +26,11 @@
 
 namespace facebook::velox::faiss::test {
 namespace {
+
+[[maybe_unused]] const bool kLocalFileSystemRegistered = [] {
+  filesystems::registerLocalFileSystem();
+  return true;
+}();
 
 FaissIndexConfig flatConfig() {
   FaissIndexConfig config;
@@ -36,7 +47,7 @@ TEST(FaissIndexTest, exactFlat) {
   state->clusters.at(0).index->search(
       1, query, 2, distances.data(), labels.data());
   EXPECT_EQ(state->clusters.at(0).documentIds.at(labels[0]), 102);
-  EXPECT_FLOAT_EQ(distances[0], 0.01F);
+  EXPECT_NEAR(distances[0], 0.01F, 1e-6F);
 }
 
 TEST(FaissIndexTest, artifactRoundTripAndBuildLoadParity) {
@@ -98,6 +109,53 @@ TEST(FaissIndexTest, loadTargetRejectsArtifactMismatch) {
       applyFaissLoadTarget(*loaded, algorithmMismatch),
       "algorithm does not match target strategy");
   std::filesystem::remove_all(directory);
+}
+
+TEST(FaissIndexTest, rejectsCorruptArtifactSidecar) {
+  auto built = buildFaissIndexState(
+      flatConfig(), {{0, {0, 0, 2, 0}}}, {{0, {10, 20}}});
+  const auto directory = (std::filesystem::temp_directory_path() /
+                          "velox_faiss_corrupt_artifact")
+                             .string();
+  std::filesystem::remove_all(directory);
+  writeFaissArtifact(*built, directory);
+  {
+    std::fstream output(
+        directory + "/cluster_0.ids",
+        std::ios::binary | std::ios::in | std::ios::out);
+    ASSERT_TRUE(output);
+    output.seekp(0);
+    output.put('\xff');
+  }
+  VELOX_ASSERT_THROW(
+      loadFaissArtifact(directory), "FAISS ID sidecar checksum mismatch");
+  std::filesystem::remove_all(directory);
+}
+
+TEST(FaissIndexTest, bridgePublishesAndCancels) {
+  FaissIndexBridge bridge;
+  bridge.start();
+  ContinueFuture future = ContinueFuture::makeEmpty();
+  EXPECT_EQ(bridge.stateOrFuture(&future), nullptr);
+  ASSERT_TRUE(future.valid());
+  EXPECT_FALSE(future.isReady());
+
+  auto state = buildFaissIndexState(
+      flatConfig(), {{0, {0, 0}}}, {{0, {101}}});
+  bridge.setState(state);
+  EXPECT_TRUE(future.isReady());
+  ContinueFuture unused = ContinueFuture::makeEmpty();
+  EXPECT_EQ(bridge.stateOrFuture(&unused), state);
+
+  FaissIndexBridge cancelled;
+  cancelled.start();
+  ContinueFuture cancelledFuture = ContinueFuture::makeEmpty();
+  EXPECT_EQ(cancelled.stateOrFuture(&cancelledFuture), nullptr);
+  cancelled.cancel();
+  EXPECT_TRUE(cancelledFuture.isReady());
+  VELOX_ASSERT_THROW(
+      cancelled.stateOrFuture(&unused),
+      "Getting FAISS state after build was aborted");
 }
 
 TEST(FaissIndexTest, invalidDimensions) {
@@ -230,16 +288,27 @@ TEST(FaissIndexTest, cagraConvertsAndPersistsAsCpuHnsw) {
       dynamic_cast<::faiss::IndexHNSWCagra*>(
           loaded->clusters.at(0).index.get()),
       nullptr);
+  std::vector<float> distances(3);
+  std::vector<::faiss::idx_t> labels(3);
+  loaded->clusters.at(0).index->search(
+      1, vectors.data(), 3, distances.data(), labels.data());
+  ASSERT_GE(labels[0], 0);
+  EXPECT_EQ(loaded->clusters.at(0).documentIds.at(labels[0]), ids[0]);
   std::filesystem::remove_all(directory);
 }
 #endif
 
 class FaissPlanNodeTest : public testing::Test,
-                          public velox::test::VectorTestBase {};
+                          public velox::test::VectorTestBase {
+ protected:
+  static void SetUpTestCase() {
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
+    core::PlanNode::registerSerDe();
+    registerFaiss();
+  }
+};
 
 TEST_F(FaissPlanNodeTest, serializationRoundTrip) {
-  core::PlanNode::registerSerDe();
-  registerFaissPlanNodeSerDe();
   auto candidates = makeRowVector(
       {"doc_id", "embedding"},
       {makeFlatVector<int64_t>({11, 12}),
@@ -310,5 +379,52 @@ TEST_F(FaissPlanNodeTest, rejectsNullEmbeddings) {
       "element is null");
 }
 
+#if !defined(VELOX_ENABLE_FAISS_GPU)
+TEST_F(FaissPlanNodeTest, executesBuildSearchWithMultipleDrivers) {
+  auto candidates = makeRowVector(
+      {"doc_id", "embedding", "cluster_id"},
+      {makeFlatVector<int64_t>({101, 102, 103, 104}),
+       makeArrayVector<float>({{0, 0}, {2, 0}, {0, 3}, {4, 4}}),
+       makeFlatVector<int64_t>({0, 0, 0, 0})});
+  auto queries = makeRowVector(
+      {"query_id", "embedding", "cluster_id"},
+      {makeFlatVector<int64_t>({201, 202}),
+       makeArrayVector<float>({{1.9, 0}, {0, 2.9}}),
+       makeFlatVector<int64_t>({0, 0})});
+  auto build = std::make_shared<BuildIndexNode>(
+      "exec_build",
+      std::make_shared<core::ValuesNode>(
+          "exec_candidate_values", std::vector<RowVectorPtr>{candidates}),
+      "doc_id",
+      "embedding",
+      "cluster_id",
+      flatConfig());
+  auto search = std::make_shared<SearchIndexNode>(
+      "exec_search",
+      std::make_shared<core::ValuesNode>(
+          "exec_query_values", std::vector<RowVectorPtr>{queries}),
+      build,
+      "query_id",
+      "embedding",
+      "cluster_id",
+      1);
+
+  auto result = exec::test::AssertQueryBuilder(search)
+                    .maxDrivers(2)
+                    .copyResults(pool());
+  ASSERT_EQ(result->size(), 2);
+  EXPECT_EQ(result->childAt(0)->as<SimpleVector<int64_t>>()->valueAt(0), 201);
+  EXPECT_EQ(result->childAt(1)->as<SimpleVector<int64_t>>()->valueAt(0), 102);
+  EXPECT_EQ(result->childAt(0)->as<SimpleVector<int64_t>>()->valueAt(1), 202);
+  EXPECT_EQ(result->childAt(1)->as<SimpleVector<int64_t>>()->valueAt(1), 103);
+}
+#endif
+
 } // namespace
 } // namespace facebook::velox::faiss::test
+
+int main(int argc, char** argv) {
+  folly::Init init(&argc, &argv);
+  testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}

@@ -56,6 +56,10 @@ DEFINE_string(input, "", "Parquet input directory");
 DEFINE_string(output, "", "JSON report path; stdout when empty");
 DEFINE_int32(warmups, 1, "Warmup repetitions");
 DEFINE_int32(repetitions, 3, "Measured repetitions");
+DEFINE_double(
+    min_recall,
+    0.1,
+    "Minimum recall@k required for approximate strategies");
 DEFINE_bool(
     prepare_artifacts,
     false,
@@ -174,11 +178,18 @@ FaissIndexConfig indexConfig(const Options& o) {
       ? FaissExecutionDevice::kCpu
       : FaissExecutionDevice::kGpu;
   config.dimension = o.dimension;
-  config.nlist =
-      std::max<int32_t>(1, std::min<int64_t>(4096, std::sqrt(o.candidates)));
+  const auto clusterCount =
+      std::max<int64_t>(1, std::min<int64_t>(8, o.candidates / 2'000));
+  const auto estimatedRowsPerCluster =
+      std::max<int64_t>(1, o.candidates * 10 / 44 / clusterCount);
+  config.nlist = std::max<int32_t>(
+      1, std::min<int64_t>(4096, std::sqrt(estimatedRowsPerCluster)));
   config.nprobe = std::max(1, config.nlist / 16);
   config.pqSubquantizers =
       o.dimension % 16 == 0 ? 16 : (o.dimension % 8 == 0 ? 8 : 1);
+  // Small routed partitions cannot train the 256 codewords implied by
+  // eight-bit PQ. Use 16 codewords until partitions are large enough.
+  config.pqBits = estimatedRowsPerCluster >= 1'024 ? 8 : 4;
   config.hnswM = 32;
   config.efConstruction = 80;
   config.efSearch = std::max(64, o.topK * 4);
@@ -254,8 +265,11 @@ class CandidateRetrievalBenchmark final : public HiveConnectorTestBase {
   }
 
   std::vector<float> centroids(const Options& o) {
-    const auto count = std::max<int32_t>(
-        1, std::min<int64_t>(256, std::sqrt(o.candidates)));
+    // Keep enough post-filter rows in every routed partition for PQ training
+    // and CAGRA's graph degree. Eight partitions preserve the prior prototype
+    // shape while the small CI preset intentionally uses one.
+    const auto count =
+        std::max<int64_t>(1, std::min<int64_t>(8, o.candidates / 2'000));
     std::vector<float> result(count * o.dimension);
     std::mt19937 random(41);
     std::uniform_real_distribution<float> value(0, 1);
@@ -315,8 +329,12 @@ class CandidateRetrievalBenchmark final : public HiveConnectorTestBase {
       const std::string& directory) {
     auto plan = scan(centroidType(), "", pool_.get());
     auto result = AssertQueryBuilder(plan)
-                      .split(makeHiveConnectorSplit(
-                          directory + "/centroids.parquet"))
+                      .split(
+                          connector::hive::HiveConnectorSplitBuilder(
+                              directory + "/centroids.parquet")
+                              .connectorId(exec::test::kHiveConnectorId)
+                              .fileFormat(dwio::common::FileFormat::PARQUET)
+                              .build())
                       .copyResults(pool_.get());
     const auto* arrays = validateFaissEmbeddings(
         result, centroidType(), "embedding", o.dimension);
@@ -335,8 +353,12 @@ class CandidateRetrievalBenchmark final : public HiveConnectorTestBase {
   core::PlanNodePtr scan(
       const RowTypePtr& type,
       const std::string& filter,
-      memory::MemoryPool* pool) {
-    auto builder = PlanBuilder(pool).tableScan(type);
+      memory::MemoryPool* pool,
+      std::shared_ptr<core::PlanNodeIdGenerator> idGenerator = nullptr) {
+    if (!idGenerator) {
+      idGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    }
+    auto builder = PlanBuilder(std::move(idGenerator), pool).tableScan(type);
     if (!filter.empty()) {
       builder.filter(filter);
     }
@@ -356,9 +378,14 @@ class CandidateRetrievalBenchmark final : public HiveConnectorTestBase {
       const std::vector<float>& centers,
       const std::string& input,
       bool captureRows) {
-    auto candidateSource =
-        scan(candidateType(), "active AND market = 0", pool_.get());
-    auto querySource = scan(queryType(), "market = 0", pool_.get());
+    auto idGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    auto candidateSource = scan(
+        candidateType(),
+        "active AND market = 0",
+        pool_.get(),
+        idGenerator);
+    auto querySource =
+        scan(queryType(), "market = 0", pool_.get(), idGenerator);
     const auto candidateLeaf = leaf(candidateSource)->id();
     const auto queryLeaf = leaf(querySource)->id();
 
@@ -381,6 +408,8 @@ class CandidateRetrievalBenchmark final : public HiveConnectorTestBase {
     if (FLAGS_execution != "cpu") {
       candidateSource = std::make_shared<cudf_velox::CudfFromVeloxNode>(
           "candidate_to_cudf", candidateSource);
+    }
+    if (FLAGS_execution == "gpu") {
       querySource = std::make_shared<cudf_velox::CudfFromVeloxNode>(
           "query_to_cudf", querySource);
     }
@@ -419,10 +448,19 @@ class CandidateRetrievalBenchmark final : public HiveConnectorTestBase {
     builder.maxDrivers(1)
         .split(
             queryLeaf,
-            makeHiveConnectorSplit(input + "/retrieval_queries.parquet"));
+            connector::hive::HiveConnectorSplitBuilder(
+                input + "/retrieval_queries.parquet")
+                .connectorId(exec::test::kHiveConnectorId)
+                .fileFormat(dwio::common::FileFormat::PARQUET)
+                .build());
     if (FLAGS_provider == "build") {
       builder.split(
-          candidateLeaf, makeHiveConnectorSplit(input + "/candidates.parquet"));
+          candidateLeaf,
+          connector::hive::HiveConnectorSplitBuilder(
+              input + "/candidates.parquet")
+              .connectorId(exec::test::kHiveConnectorId)
+              .fileFormat(dwio::common::FileFormat::PARQUET)
+              .build());
     }
     std::shared_ptr<exec::Task> task;
     RunResult result;
@@ -502,7 +540,13 @@ class CandidateRetrievalBenchmark final : public HiveConnectorTestBase {
       FLAGS_provider = savedProvider;
       VELOX_USER_CHECK_EQ(actual->size(), second->size());
       for (vector_size_t row = 0; row < actual->size(); ++row) {
-        VELOX_USER_CHECK(actual->equalValueAt(second.get(), row, row));
+        for (const auto child : {0, 1, 3}) {
+          VELOX_USER_CHECK(
+              actual->childAt(child)->equalValueAt(
+                  second->childAt(child).get(), row, row),
+              "Flat result ID/rank mismatch at output row {}",
+              row);
+        }
       }
       return;
     }
@@ -529,8 +573,14 @@ class CandidateRetrievalBenchmark final : public HiveConnectorTestBase {
       hits += expected[actualQuery->valueAt(row)].count(actualId->valueAt(row));
     }
     const auto denominator = std::max<int64_t>(1, truth->size());
-    LOG(INFO) << "recall@" << o.topK << "="
-              << static_cast<double>(hits) / denominator;
+    const auto recall = static_cast<double>(hits) / denominator;
+    LOG(INFO) << "recall@" << o.topK << "=" << recall;
+    VELOX_USER_CHECK_GE(
+        recall,
+        FLAGS_min_recall,
+        "{} recall@{} is below the required threshold",
+        FLAGS_strategy,
+        o.topK);
   }
 
  private:
@@ -549,7 +599,7 @@ folly::dynamic summarize(
   report["dimension"] = o.dimension;
   report["topK"] = o.topK;
   report["repetitions"] = measured.size();
-  auto phases = folly::dynamic::object;
+  folly::dynamic phases = folly::dynamic::object;
   for (const auto& [name, getter] :
        std::vector<std::pair<std::string, std::function<double(const RunResult&)>>>{
            {"full_query", [](const auto& r) { return r.fullQueryMs; }},

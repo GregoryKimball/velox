@@ -1,5 +1,11 @@
 {
   "packages": {
+    "cuco": {
+      "version": "0.0.1",
+      "git_url": "https://github.com/NVIDIA/cuCollections.git",
+      "git_tag": "0883368d39296f3bef3a058033141bcc642c5c54",
+      "git_shallow": false
+    },
     "spdlog": {
       "version": "1.15.3",
       "git_url": "https://github.com/gabime/spdlog.git",

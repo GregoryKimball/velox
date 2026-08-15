@@ -6,12 +6,17 @@
 #include "velox/experimental/faiss/FaissOperators.h"
 #include "velox/experimental/faiss/FaissNvtx.h"
 
+#if defined(VELOX_ENABLE_FAISS_GPU)
+#include "velox/experimental/faiss/FaissGpuIndex.h"
+#endif
+
 #include "velox/exec/Task.h"
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/FlatVector.h"
 
-#include <limits>
 #include <chrono>
+#include <iterator>
+#include <limits>
 
 namespace facebook::velox::faiss {
 namespace {
@@ -30,9 +35,12 @@ const ArrayVector* validateFaissEmbeddings(
     const std::string& name,
     int32_t dimension) {
   const auto channel = type->getChildIdx(name);
-  const auto* arrays = input->childAt(channel)->as<ArrayVector>();
+  auto& embeddings = input->childAt(channel);
+  embeddings = BaseVector::loadedVectorShared(embeddings);
+  BaseVector::flattenVector(embeddings);
+  const auto* arrays = embeddings->as<ArrayVector>();
   VELOX_USER_CHECK_NOT_NULL(
-      arrays, "FAISS embedding column must be a flat ARRAY<REAL>");
+      arrays, "FAISS embedding column must be ARRAY<REAL>");
   VELOX_USER_CHECK_EQ(arrays->elements()->typeKind(), TypeKind::REAL);
   const auto* elements = arrays->elements()->as<SimpleVector<float>>();
   VELOX_USER_CHECK_NOT_NULL(elements);
@@ -65,6 +73,19 @@ std::vector<float> embeddingAt(const ArrayVector* arrays, vector_size_t row) {
     result[d] = elements->valueAt(offset + d);
   }
   return result;
+}
+
+template <typename T>
+const SimpleVector<T>* materializeSimpleColumn(
+    const RowVectorPtr& input,
+    const RowTypePtr& type,
+    const std::string& name) {
+  auto& column = input->childAt(type->getChildIdx(name));
+  column = BaseVector::loadedVectorShared(column);
+  BaseVector::flattenVector(column);
+  const auto* simple = column->as<SimpleVector<T>>();
+  VELOX_USER_CHECK_NOT_NULL(simple, "FAISS column {} has an invalid type", name);
+  return simple;
 }
 
 template <typename T>
@@ -246,7 +267,7 @@ class IndexBuildOperator final : public exec::Operator {
     }
 #if defined(VELOX_ENABLE_FAISS_GPU)
     if (buildNode_->config().executionDevice == FaissExecutionDevice::kGpu) {
-      auto gpuInput = copyFaissGpuBuildInput(
+      auto gpuInput = extractFaissGpuBuildInput(
           input,
           buildNode_->outputType(),
           buildNode_->idColumn(),
@@ -254,17 +275,7 @@ class IndexBuildOperator final : public exec::Operator {
           buildNode_->clusterColumn(),
           buildNode_->config().dimension);
       if (gpuInput) {
-        for (vector_size_t row = 0; row < input->size(); ++row) {
-          const auto cluster =
-              gpuInput->clusters ? gpuInput->clusters->at(row) : 0;
-          const auto begin = gpuInput->embeddings.begin() +
-              row * buildNode_->config().dimension;
-          vectors_[cluster].insert(
-              vectors_[cluster].end(),
-              begin,
-              begin + buildNode_->config().dimension);
-          ids_[cluster].push_back(gpuInput->documentIds[row]);
-        }
+        gpuInputs_.push_back(std::move(*gpuInput));
         return;
       }
     }
@@ -274,18 +285,16 @@ class IndexBuildOperator final : public exec::Operator {
         buildNode_->outputType(),
         buildNode_->embeddingColumn(),
         buildNode_->config().dimension);
-    const auto* ids = input
-                          ->childAt(buildNode_->outputType()->getChildIdx(
-                              buildNode_->idColumn()))
-                          ->as<SimpleVector<int64_t>>();
-    VELOX_USER_CHECK_NOT_NULL(ids);
+    const auto* ids = materializeSimpleColumn<int64_t>(
+        input,
+        buildNode_->outputType(),
+        buildNode_->idColumn());
     const SimpleVector<int64_t>* clusters = nullptr;
     if (buildNode_->clusterColumn()) {
-      clusters = input
-                     ->childAt(buildNode_->outputType()->getChildIdx(
-                         *buildNode_->clusterColumn()))
-                     ->as<SimpleVector<int64_t>>();
-      VELOX_USER_CHECK_NOT_NULL(clusters);
+      clusters = materializeSimpleColumn<int64_t>(
+          input,
+          buildNode_->outputType(),
+          *buildNode_->clusterColumn());
     }
     for (vector_size_t row = 0; row < input->size(); ++row) {
       VELOX_USER_CHECK(!ids->isNullAt(row), "FAISS document ID is null");
@@ -321,6 +330,12 @@ class IndexBuildOperator final : public exec::Operator {
       for (auto& [cluster, ids] : build->ids_) {
         ids_[cluster].insert(ids_[cluster].end(), ids.begin(), ids.end());
       }
+#if defined(VELOX_ENABLE_FAISS_GPU)
+      gpuInputs_.insert(
+          gpuInputs_.end(),
+          std::make_move_iterator(build->gpuInputs_.begin()),
+          std::make_move_iterator(build->gpuInputs_.end()));
+#endif
     }
     peers.clear();
     for (auto& promise : promises) {
@@ -329,7 +344,20 @@ class IndexBuildOperator final : public exec::Operator {
 
     std::shared_ptr<FaissIndexState> state;
     if (buildNode_) {
+#if defined(VELOX_ENABLE_FAISS_GPU)
+      if (buildNode_->config().executionDevice ==
+              FaissExecutionDevice::kGpu &&
+          !gpuInputs_.empty()) {
+        VELOX_USER_CHECK(
+            vectors_.empty(),
+            "FAISS GPU index build cannot mix CudfVector and RowVector input");
+        state = buildFaissGpuIndexState(buildNode_->config(), gpuInputs_);
+      } else {
+        state = buildFaissIndexState(buildNode_->config(), vectors_, ids_);
+      }
+#else
       state = buildFaissIndexState(buildNode_->config(), vectors_, ids_);
+#endif
       if (buildNode_->artifactDirectory()) {
         writeFaissArtifact(*state, *buildNode_->artifactDirectory());
       }
@@ -382,6 +410,9 @@ class IndexBuildOperator final : public exec::Operator {
   std::shared_ptr<const LoadIndexNode> loadNode_;
   std::map<int64_t, std::vector<float>> vectors_;
   std::map<int64_t, std::vector<int64_t>> ids_;
+#if defined(VELOX_ENABLE_FAISS_GPU)
+  std::vector<FaissGpuBuildInput> gpuInputs_;
+#endif
   ContinueFuture future_{ContinueFuture::makeEmpty()};
 };
 
@@ -441,15 +472,11 @@ class IndexSearchOperator final : public exec::Operator {
           queryType,
           node_->queryEmbeddingColumn(),
           state_->config.dimension);
-      queryIds = input_->childAt(queryType->getChildIdx(node_->queryIdColumn()))
-                     ->as<SimpleVector<int64_t>>();
-      VELOX_USER_CHECK_NOT_NULL(queryIds);
+      queryIds = materializeSimpleColumn<int64_t>(
+          input_, queryType, node_->queryIdColumn());
       if (node_->queryClusterColumn()) {
-        clusters =
-            input_
-                ->childAt(queryType->getChildIdx(*node_->queryClusterColumn()))
-                ->as<SimpleVector<int64_t>>();
-        VELOX_USER_CHECK_NOT_NULL(clusters);
+        clusters = materializeSimpleColumn<int64_t>(
+            input_, queryType, *node_->queryClusterColumn());
       }
     }
     conversionMilliseconds_ +=
@@ -460,8 +487,12 @@ class IndexSearchOperator final : public exec::Operator {
     std::vector<int64_t> outputResultIds;
     std::vector<float> outputDistances;
     std::vector<int32_t> outputRanks;
-    std::vector<::faiss::idx_t> labels(node_->topK());
-    std::vector<float> distances(node_->topK());
+    outputQueryIds.reserve(input_->size() * node_->topK());
+    outputResultIds.reserve(input_->size() * node_->topK());
+    outputDistances.reserve(input_->size() * node_->topK());
+    outputRanks.reserve(input_->size() * node_->topK());
+
+    std::map<int64_t, std::vector<vector_size_t>> rowsByCluster;
     for (vector_size_t row = 0; row < input_->size(); ++row) {
       if (!gpuInput) {
         VELOX_USER_CHECK(!queryIds->isNullAt(row), "FAISS query ID is null");
@@ -470,49 +501,72 @@ class IndexSearchOperator final : public exec::Operator {
               !clusters->isNullAt(row), "FAISS cluster ID is null");
         }
       }
-      const auto queryId =
-          gpuInput ? gpuInput->queryIds[row] : queryIds->valueAt(row);
       const auto cluster = gpuInput
           ? (gpuInput->clusters ? gpuInput->clusters->at(row) : 0)
           : (clusters ? clusters->valueAt(row) : 0);
+      rowsByCluster[cluster].push_back(row);
+    }
+
+    for (const auto& [cluster, rows] : rowsByCluster) {
       const auto it = state_->clusters.find(cluster);
       if (it == state_->clusters.end()) {
         continue;
       }
-      std::vector<float> hostVector;
-      const float* query;
-      uintptr_t stream = 0;
+      std::vector<::faiss::idx_t> labels;
+      std::vector<float> distances;
+#if defined(VELOX_ENABLE_FAISS_GPU)
       if (gpuInput) {
-        query = gpuInput->embeddings + row * state_->config.dimension;
-        stream = gpuInput->stream;
-      } else {
-        hostVector = embeddingAt(arrays, row);
-        query = hostVector.data();
+        searchFaissGpuRows(
+            *state_,
+            it->second,
+            *gpuInput,
+            rows,
+            state_->config.dimension,
+            node_->topK(),
+            distances,
+            labels);
+      } else
+#endif
+      {
+        std::vector<float> queries;
+        queries.reserve(rows.size() * state_->config.dimension);
+        for (const auto row : rows) {
+          const auto vector = embeddingAt(arrays, row);
+          queries.insert(queries.end(), vector.begin(), vector.end());
+        }
+        distances.resize(rows.size() * node_->topK());
+        labels.resize(rows.size() * node_->topK());
+        searchFaissIndex(
+            *state_,
+            it->second,
+            rows.size(),
+            queries.data(),
+            node_->topK(),
+            distances.data(),
+            labels.data());
       }
-      searchFaissIndex(
-          *state_,
-          it->second,
-          1,
-          query,
-          node_->topK(),
-          distances.data(),
-          labels.data(),
-          stream);
       FaissNvtxRange gatherRange("ID gather");
       const auto gatherStart = std::chrono::steady_clock::now();
-      for (int32_t rank = 0; rank < node_->topK(); ++rank) {
-        const auto ordinal = labels[rank];
-        if (ordinal < 0) {
-          continue;
+      for (size_t batchRow = 0; batchRow < rows.size(); ++batchRow) {
+        const auto row = rows[batchRow];
+        const auto queryId =
+            gpuInput ? gpuInput->queryIds[row] : queryIds->valueAt(row);
+        for (int32_t rank = 0; rank < node_->topK(); ++rank) {
+          const auto result = batchRow * node_->topK() + rank;
+          const auto ordinal = labels[result];
+          if (ordinal < 0) {
+            continue;
+          }
+          VELOX_CHECK_LT(ordinal, it->second.documentIds.size());
+          if (node_->maxDistance() &&
+              distances[result] > *node_->maxDistance()) {
+            continue;
+          }
+          outputQueryIds.push_back(queryId);
+          outputResultIds.push_back(it->second.documentIds[ordinal]);
+          outputDistances.push_back(distances[result]);
+          outputRanks.push_back(rank + 1);
         }
-        VELOX_CHECK_LT(ordinal, it->second.documentIds.size());
-        if (node_->maxDistance() && distances[rank] > *node_->maxDistance()) {
-          continue;
-        }
-        outputQueryIds.push_back(queryId);
-        outputResultIds.push_back(it->second.documentIds[ordinal]);
-        outputDistances.push_back(distances[rank]);
-        outputRanks.push_back(rank + 1);
       }
       gatherMilliseconds_ +=
           std::chrono::duration<double, std::milli>(

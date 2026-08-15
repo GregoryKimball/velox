@@ -6,22 +6,27 @@
 #include "velox/experimental/faiss/FaissIndex.h"
 #include "velox/experimental/faiss/FaissNvtx.h"
 
+#include "velox/common/file/File.h"
+#include "velox/common/file/FileSystems.h"
+
 #if defined(VELOX_ENABLE_FAISS_GPU)
 #include "velox/experimental/faiss/FaissGpuIndex.h"
 #endif
 
-#include "folly/FileUtil.h"
 #include "folly/json.h"
 
+#include <faiss/IndexFlat.h>
 #include <faiss/IndexHNSW.h>
 #include <faiss/IndexIVF.h>
+#include <faiss/IndexIVFFlat.h>
+#include <faiss/IndexIVFPQ.h>
+#include <faiss/impl/io.h>
 #include <faiss/index_factory.h>
 #include <faiss/index_io.h>
 
-#include <filesystem>
-#include <fstream>
-#include <iomanip>
 #include <chrono>
+#include <iomanip>
+#include <string_view>
 
 namespace facebook::velox::faiss {
 namespace {
@@ -69,16 +74,33 @@ std::unique_ptr<::faiss::Index> createIndex(const FaissIndexConfig& config) {
   return index;
 }
 
-uint64_t checksum(const std::string& path) {
-  std::ifstream input(path, std::ios::binary);
-  VELOX_USER_CHECK(input, "Cannot open artifact file: {}", path);
+std::string artifactPath(
+    const std::string& directory,
+    const std::string& file) {
+  return directory.ends_with('/') ? directory + file
+                                    : fmt::format("{}/{}", directory, file);
+}
+
+std::string readArtifactFile(const std::string& path) {
+  auto file = filesystems::getFileSystem(path, nullptr)->openFileForRead(path);
+  return file->pread(0, file->size());
+}
+
+void writeArtifactFile(const std::string& path, std::string_view data) {
+  auto file = filesystems::getFileSystem(path, nullptr)
+                  ->openFileForWrite(
+                      path,
+                      {.shouldCreateParentDirectories = true,
+                       .shouldThrowOnFileAlreadyExists = true});
+  file->append(data);
+  file->close();
+}
+
+uint64_t checksum(std::string_view data) {
   uint64_t hash = 1469598103934665603ULL;
-  char buffer[8192];
-  while (input.read(buffer, sizeof(buffer)) || input.gcount() > 0) {
-    for (std::streamsize i = 0; i < input.gcount(); ++i) {
-      hash ^= static_cast<uint8_t>(buffer[i]);
-      hash *= 1099511628211ULL;
-    }
+  for (const auto byte : data) {
+    hash ^= static_cast<uint8_t>(byte);
+    hash *= 1099511628211ULL;
   }
   return hash;
 }
@@ -91,33 +113,60 @@ std::string clusterStem(int64_t cluster) {
   return fmt::format("cluster_{}", cluster);
 }
 
-void writeIds(const std::string& path, const std::vector<int64_t>& ids) {
-  std::ofstream output(path, std::ios::binary | std::ios::trunc);
-  VELOX_USER_CHECK(output, "Cannot create ID sidecar: {}", path);
-  for (uint64_t value : ids) {
+std::string encodeIds(const std::vector<int64_t>& ids) {
+  std::string output(ids.size() * sizeof(int64_t), '\0');
+  for (size_t row = 0; row < ids.size(); ++row) {
+    const auto value = static_cast<uint64_t>(ids[row]);
     for (int byte = 0; byte < 8; ++byte) {
-      output.put(static_cast<char>((value >> (byte * 8)) & 0xff));
+      output[row * sizeof(int64_t) + byte] =
+          static_cast<char>((value >> (byte * 8)) & 0xff);
     }
   }
-  VELOX_USER_CHECK(output.good(), "Failed writing ID sidecar: {}", path);
+  return output;
 }
 
-std::vector<int64_t> readIds(const std::string& path, size_t count) {
-  std::ifstream input(path, std::ios::binary);
-  VELOX_USER_CHECK(input, "Cannot open ID sidecar: {}", path);
+std::vector<int64_t> decodeIds(std::string_view input, size_t count) {
+  VELOX_USER_CHECK_EQ(
+      input.size(),
+      count * sizeof(int64_t),
+      "FAISS ID sidecar size mismatch");
   std::vector<int64_t> ids(count);
   for (size_t i = 0; i < count; ++i) {
     uint64_t value = 0;
     for (int byte = 0; byte < 8; ++byte) {
-      const auto ch = input.get();
-      VELOX_USER_CHECK_NE(ch, EOF, "Truncated ID sidecar: {}", path);
-      value |= static_cast<uint64_t>(static_cast<uint8_t>(ch)) << (byte * 8);
+      value |= static_cast<uint64_t>(
+                   static_cast<uint8_t>(input[i * sizeof(int64_t) + byte]))
+          << (byte * 8);
     }
     ids[i] = static_cast<int64_t>(value);
   }
-  VELOX_USER_CHECK_EQ(
-      input.get(), EOF, "ID sidecar has trailing bytes: {}", path);
   return ids;
+}
+
+void validateArtifactIndex(
+    const ::faiss::Index& index,
+    FaissAlgorithm algorithm) {
+  bool matches = false;
+  switch (algorithm) {
+    case FaissAlgorithm::kFlat:
+      matches = dynamic_cast<const ::faiss::IndexFlat*>(&index) != nullptr;
+      break;
+    case FaissAlgorithm::kIvfFlat:
+      matches = dynamic_cast<const ::faiss::IndexIVFFlat*>(&index) != nullptr;
+      break;
+    case FaissAlgorithm::kIvfPq:
+      matches = dynamic_cast<const ::faiss::IndexIVFPQ*>(&index) != nullptr;
+      break;
+    case FaissAlgorithm::kCagra:
+      matches =
+          dynamic_cast<const ::faiss::IndexHNSWCagra*>(&index) != nullptr;
+      break;
+    case FaissAlgorithm::kHnsw:
+    case FaissAlgorithm::kHnswCagra:
+      matches = dynamic_cast<const ::faiss::IndexHNSW*>(&index) != nullptr;
+      break;
+  }
+  VELOX_USER_CHECK(matches, "FAISS artifact index strategy mismatch");
 }
 
 } // namespace
@@ -206,24 +255,19 @@ void searchFaissIndex(
 void writeFaissArtifact(
     const FaissIndexState& state,
     const std::string& directory) {
-  std::filesystem::create_directories(directory);
   folly::dynamic manifest = folly::dynamic::object;
   manifest["artifactVersion"] = kArtifactVersion;
   manifest["faissVersion"] = "1.14.3";
   manifest["idEncoding"] = "little-endian-int64-ordinal-map";
   manifest["config"] = state.config.serialize();
   manifest["rowCount"] = state.rowCount;
-  if (state.cagraCopyToMilliseconds > 0) {
-    manifest["cagraCopyToMilliseconds"] = state.cagraCopyToMilliseconds;
-  }
   manifest["clusters"] = folly::dynamic::array;
   for (const auto& [cluster, value] : state.clusters) {
     const auto stem = clusterStem(cluster);
     const auto indexFile = stem + ".faiss";
     const auto idsFile = stem + ".ids";
-    const auto indexPath =
-        (std::filesystem::path(directory) / indexFile).string();
-    const auto idsPath = (std::filesystem::path(directory) / idsFile).string();
+    const auto indexPath = artifactPath(directory, indexFile);
+    const auto idsPath = artifactPath(directory, idsFile);
     std::unique_ptr<::faiss::Index> cpuIndex;
     const ::faiss::Index* persistedIndex = value.index.get();
     if (value.gpuResident) {
@@ -231,42 +275,43 @@ void writeFaissArtifact(
       cpuIndex = state.gpuContext->toCpu(value.index.get());
       persistedIndex = cpuIndex.get();
     }
-    ::faiss::write_index(persistedIndex, indexPath.c_str());
-    writeIds(idsPath, value.documentIds);
+    ::faiss::VectorIOWriter writer;
+    writer.name = indexPath;
+    ::faiss::write_index(persistedIndex, &writer);
+    const std::string_view indexBytes(
+        reinterpret_cast<const char*>(writer.data.data()), writer.data.size());
+    writeArtifactFile(indexPath, indexBytes);
+    const auto idsBytes = encodeIds(value.documentIds);
+    writeArtifactFile(idsPath, idsBytes);
     manifest["clusters"].push_back(
         folly::dynamic::object("cluster", cluster)(
             "rows", static_cast<int64_t>(value.documentIds.size()))(
             "indexFile", indexFile)("idsFile", idsFile)(
-            "indexChecksum", checksumString(checksum(indexPath)))(
-            "idsChecksum", checksumString(checksum(idsPath))));
+            "indexChecksum", checksumString(checksum(indexBytes)))(
+            "idsChecksum", checksumString(checksum(idsBytes))));
   }
-  const auto manifestPath =
-      (std::filesystem::path(directory) / "manifest.json").string();
-  VELOX_USER_CHECK(
-      folly::writeFile(folly::toPrettyJson(manifest), manifestPath.c_str()),
-      "Cannot write FAISS manifest: {}",
-      manifestPath);
+  writeArtifactFile(
+      artifactPath(directory, "manifest.json"),
+      folly::toPrettyJson(manifest));
 }
 
 std::shared_ptr<FaissIndexState> loadFaissArtifact(
     const std::string& directory) {
   auto readStart = std::chrono::steady_clock::now();
-  const auto manifestPath =
-      (std::filesystem::path(directory) / "manifest.json").string();
-  std::string contents;
+  const auto manifestPath = artifactPath(directory, "manifest.json");
   folly::dynamic manifest;
   {
     FaissNvtxRange readRange("FAISS load read");
-    VELOX_USER_CHECK(
-        folly::readFile(manifestPath.c_str(), contents),
-        "Cannot read FAISS manifest: {}",
-        manifestPath);
-    manifest = folly::parseJson(contents);
+    manifest = folly::parseJson(readArtifactFile(manifestPath));
   }
   VELOX_USER_CHECK_EQ(
       manifest["artifactVersion"].asInt(),
       kArtifactVersion,
       "Unsupported FAISS artifact version");
+  VELOX_USER_CHECK_EQ(
+      manifest["faissVersion"].asString(),
+      "1.14.3",
+      "Unsupported FAISS library version");
   VELOX_USER_CHECK_EQ(
       manifest["idEncoding"].asString(),
       "little-endian-int64-ordinal-map",
@@ -281,28 +326,25 @@ std::shared_ptr<FaissIndexState> loadFaissArtifact(
   // Artifacts always contain CPU FAISS indexes. Serving placement is selected
   // explicitly by applyFaissLoadTarget, never by persisted build metadata.
   state->config.executionDevice = FaissExecutionDevice::kCpu;
-  if (manifest.count("cagraCopyToMilliseconds")) {
-    state->cagraCopyToMilliseconds =
-        manifest["cagraCopyToMilliseconds"].asDouble();
-  }
   for (const auto& entry : manifest["clusters"]) {
     readStart = std::chrono::steady_clock::now();
     const auto cluster = entry["cluster"].asInt();
     const auto rows = entry["rows"].asInt();
     const auto indexPath =
-        (std::filesystem::path(directory) / entry["indexFile"].asString())
-            .string();
-    const auto idsPath =
-        (std::filesystem::path(directory) / entry["idsFile"].asString())
-            .string();
+        artifactPath(directory, entry["indexFile"].asString());
+    const auto idsPath = artifactPath(directory, entry["idsFile"].asString());
+    std::string indexBytes;
+    std::string idsBytes;
     {
       FaissNvtxRange readRange("FAISS load read");
+      indexBytes = readArtifactFile(indexPath);
+      idsBytes = readArtifactFile(idsPath);
       VELOX_USER_CHECK_EQ(
-          checksumString(checksum(indexPath)),
+          checksumString(checksum(indexBytes)),
           entry["indexChecksum"].asString(),
           "FAISS index checksum mismatch");
       VELOX_USER_CHECK_EQ(
-          checksumString(checksum(idsPath)),
+          checksumString(checksum(idsBytes)),
           entry["idsChecksum"].asString(),
           "FAISS ID sidecar checksum mismatch");
     }
@@ -312,10 +354,18 @@ std::shared_ptr<FaissIndexState> loadFaissArtifact(
             .count();
     const auto deserializeStart = std::chrono::steady_clock::now();
     FaissNvtxRange deserializeRange("FAISS load deserialize");
-    auto index = ::faiss::read_index_up(indexPath.c_str());
+    ::faiss::VectorIOReader reader;
+    reader.name = indexPath;
+    reader.data.assign(indexBytes.begin(), indexBytes.end());
+    auto index =
+        std::unique_ptr<::faiss::Index>(::faiss::read_index(&reader));
     VELOX_USER_CHECK_EQ(index->d, state->config.dimension);
+    VELOX_USER_CHECK_EQ(
+        static_cast<int>(index->metric_type),
+        static_cast<int>(metricType(state->config.metric)));
+    validateArtifactIndex(*index, state->config.algorithm);
     VELOX_USER_CHECK_EQ(index->ntotal, rows);
-    auto ids = readIds(idsPath, rows);
+    auto ids = decodeIds(idsBytes, rows);
     state->loadDeserializeMilliseconds +=
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - deserializeStart)

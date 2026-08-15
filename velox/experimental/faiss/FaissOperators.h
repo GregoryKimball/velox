@@ -21,9 +21,14 @@ struct FaissGpuQueryInput {
 };
 
 struct FaissGpuBuildInput {
-  std::vector<float> embeddings;
+  const float* embeddings{nullptr};
+  vector_size_t rowCount{0};
   std::vector<int64_t> documentIds;
   std::optional<std::vector<int64_t>> clusters;
+  uintptr_t stream{0};
+  // Retains the CudfVector and its device buffers until the index build is
+  // complete.
+  RowVectorPtr owner;
 };
 
 /// Validates and returns a flat ARRAY<REAL> embedding column.
@@ -43,13 +48,23 @@ std::optional<FaissGpuQueryInput> extractFaissGpuQueryInput(
     int32_t dimension,
     bool copyEmbeddingsToHost = false);
 
-std::optional<FaissGpuBuildInput> copyFaissGpuBuildInput(
+std::optional<FaissGpuBuildInput> extractFaissGpuBuildInput(
     const RowVectorPtr& input,
     const RowTypePtr& type,
     const std::string& idColumn,
     const std::string& embeddingColumn,
     const std::optional<std::string>& clusterColumn,
     int32_t dimension);
+
+void searchFaissGpuRows(
+    FaissIndexState& state,
+    FaissClusterIndex& cluster,
+    const FaissGpuQueryInput& input,
+    const std::vector<vector_size_t>& rows,
+    int32_t dimension,
+    int32_t topK,
+    std::vector<float>& distances,
+    std::vector<::faiss::idx_t>& labels);
 #endif
 
 class FaissIndexBridge final : public exec::JoinBridge {

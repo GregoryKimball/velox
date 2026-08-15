@@ -8,8 +8,12 @@
 
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
+#include "folly/ScopeGuard.h"
+
 #include <cuda_runtime_api.h>
 #include <cudf/lists/lists_column_view.hpp>
+
+#include <algorithm>
 
 namespace facebook::velox::faiss {
 namespace {
@@ -133,7 +137,7 @@ std::optional<FaissGpuQueryInput> extractFaissGpuQueryInput(
   return result;
 }
 
-std::optional<FaissGpuBuildInput> copyFaissGpuBuildInput(
+std::optional<FaissGpuBuildInput> extractFaissGpuBuildInput(
     const RowVectorPtr& input,
     const RowTypePtr& type,
     const std::string& idColumn,
@@ -147,23 +151,68 @@ std::optional<FaissGpuBuildInput> copyFaissGpuBuildInput(
   }
 
   FaissGpuBuildInput result;
+  result.embeddings = deviceInput->embeddings;
+  result.rowCount = input->size();
   result.documentIds = std::move(deviceInput->queryIds);
   result.clusters = std::move(deviceInput->clusters);
-  result.embeddings.resize(input->size() * dimension);
-  if (!result.embeddings.empty()) {
-    const auto stream = reinterpret_cast<cudaStream_t>(deviceInput->stream);
-    checkCuda(
-        cudaMemcpyAsync(
-            result.embeddings.data(),
-            deviceInput->embeddings,
-            result.embeddings.size() * sizeof(float),
-            cudaMemcpyDeviceToHost,
-            stream),
-        "copying FAISS build embeddings");
-    checkCuda(
-        cudaStreamSynchronize(stream), "synchronizing FAISS build embeddings");
-  }
+  result.stream = deviceInput->stream;
+  result.owner = input;
   return result;
+}
+
+void searchFaissGpuRows(
+    FaissIndexState& state,
+    FaissClusterIndex& cluster,
+    const FaissGpuQueryInput& input,
+    const std::vector<vector_size_t>& rows,
+    int32_t dimension,
+    int32_t topK,
+    std::vector<float>& distances,
+    std::vector<::faiss::idx_t>& labels) {
+  VELOX_CHECK(!rows.empty());
+  distances.resize(rows.size() * topK);
+  labels.resize(rows.size() * topK);
+
+  vector_size_t offset = 0;
+  const bool contiguous = std::all_of(
+      rows.begin(), rows.end(), [&](vector_size_t row) {
+        return row == rows.front() + offset++;
+      });
+  const float* queries = input.embeddings + rows.front() * dimension;
+  float* gathered = nullptr;
+  auto freeGathered = folly::makeGuard([&] {
+    if (gathered) {
+      cudaFree(gathered);
+    }
+  });
+  if (!contiguous) {
+    checkCuda(
+        cudaMalloc(
+            reinterpret_cast<void**>(&gathered),
+            rows.size() * dimension * sizeof(float)),
+        "allocating routed FAISS queries");
+    const auto stream = reinterpret_cast<cudaStream_t>(input.stream);
+    for (size_t index = 0; index < rows.size(); ++index) {
+      checkCuda(
+          cudaMemcpyAsync(
+              gathered + index * dimension,
+              input.embeddings + rows[index] * dimension,
+              dimension * sizeof(float),
+              cudaMemcpyDeviceToDevice,
+              stream),
+          "gathering routed FAISS queries");
+    }
+    queries = gathered;
+  }
+  searchFaissIndex(
+      state,
+      cluster,
+      rows.size(),
+      queries,
+      topK,
+      distances.data(),
+      labels.data(),
+      input.stream);
 }
 
 } // namespace facebook::velox::faiss

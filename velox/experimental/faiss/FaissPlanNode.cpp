@@ -244,13 +244,13 @@ BuildIndexNode::BuildIndexNode(
       config_(std::move(config)),
       artifactDirectory_(std::move(artifactDirectory)) {
   config_.validate();
-  VELOX_USER_CHECK_EQ(
-      outputType_->childAt(outputType_->getChildIdx(idColumn_)),
-      BIGINT(),
+  VELOX_USER_CHECK(
+      outputType_->childAt(outputType_->getChildIdx(idColumn_))
+          ->kindEquals(BIGINT()),
       "FAISS document ID column must be BIGINT");
-  VELOX_USER_CHECK_EQ(
-      outputType_->childAt(outputType_->getChildIdx(embeddingColumn_)),
-      ARRAY(REAL()),
+  VELOX_USER_CHECK(
+      outputType_->childAt(outputType_->getChildIdx(embeddingColumn_))
+          ->kindEquals(ARRAY(REAL())),
       "FAISS embedding column must be ARRAY<REAL>");
 }
 
@@ -349,11 +349,14 @@ SearchIndexNode::SearchIndexNode(
       maxDistance_(maxDistance) {
   VELOX_USER_CHECK_GT(topK_, 0, "FAISS top-k must be positive");
   const auto& queryType = sources_[0]->outputType();
-  VELOX_USER_CHECK_EQ(
-      queryType->childAt(queryType->getChildIdx(queryIdColumn_)), BIGINT());
-  VELOX_USER_CHECK_EQ(
-      queryType->childAt(queryType->getChildIdx(queryEmbeddingColumn_)),
-      ARRAY(REAL()));
+  VELOX_USER_CHECK(
+      queryType->childAt(queryType->getChildIdx(queryIdColumn_))
+          ->kindEquals(BIGINT()),
+      "FAISS query ID column must be BIGINT");
+  VELOX_USER_CHECK(
+      queryType->childAt(queryType->getChildIdx(queryEmbeddingColumn_))
+          ->kindEquals(ARRAY(REAL())),
+      "FAISS query embedding column must be ARRAY<REAL>");
   VELOX_USER_CHECK(
       std::dynamic_pointer_cast<const BuildIndexNode>(sources_[1]) ||
           std::dynamic_pointer_cast<const LoadIndexNode>(sources_[1]),

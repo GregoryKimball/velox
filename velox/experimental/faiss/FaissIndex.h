@@ -42,6 +42,9 @@ struct FaissIndexState {
   // Declared before clusters so GPU indexes are destroyed before their
   // task-scoped resources.
   std::shared_ptr<FaissGpuContext> gpuContext;
+  // Some GPU indexes retain the build dataset for search/refinement. These
+  // owners are destroyed after the indexes but before the GPU context.
+  std::vector<std::shared_ptr<void>> retainedGpuBuffers;
   std::map<int64_t, FaissClusterIndex> clusters;
   int64_t rowCount{0};
   double cagraCopyToMilliseconds{0};

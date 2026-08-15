@@ -11,7 +11,6 @@ target_link_libraries(
     velox_vector_test_lib
     Folly::folly
     GTest::gtest
-    GTest::gtest_main
 )
 
 if(VELOX_ENABLE_FAISS_GPU)
@@ -21,6 +20,11 @@ if(VELOX_ENABLE_FAISS_GPU)
   )
   target_link_libraries(
     velox_experimental_faiss_test
-    PRIVATE CUDA::cudart
+    PRIVATE CUDA::cudart velox_cudf_vector
+  )
+else()
+  target_link_libraries(
+    velox_experimental_faiss_test
+    PRIVATE velox_exec_test_lib
   )
 endif()

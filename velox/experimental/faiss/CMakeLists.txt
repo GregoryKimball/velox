@@ -35,6 +35,10 @@ velox_link_libraries(
 if(VELOX_ENABLE_FAISS_GPU)
   if(VELOX_MONO_LIBRARY)
     target_compile_definitions(velox PRIVATE VELOX_ENABLE_FAISS_GPU)
+    # CudfVector is otherwise kept in a separate static target. The FAISS GPU
+    # operators live in the monolithic shared library and require its RTTI and
+    # implementation there as well.
+    target_sources(velox PRIVATE ../cudf/vector/CudfVector.cpp)
   else()
     target_compile_definitions(
       velox_experimental_faiss
