@@ -5,6 +5,10 @@
  */
 #include "velox/experimental/faiss/FaissIndex.h"
 
+#if defined(VELOX_ENABLE_FAISS_GPU)
+#include "velox/experimental/faiss/FaissGpuIndex.h"
+#endif
+
 #include "folly/FileUtil.h"
 #include "folly/json.h"
 
@@ -107,7 +111,8 @@ std::vector<int64_t> readIds(const std::string& path, size_t count) {
     }
     ids[i] = static_cast<int64_t>(value);
   }
-  VELOX_USER_CHECK_EQ(input.get(), EOF, "ID sidecar has trailing bytes: {}", path);
+  VELOX_USER_CHECK_EQ(
+      input.get(), EOF, "ID sidecar has trailing bytes: {}", path);
   return ids;
 }
 
@@ -118,12 +123,22 @@ std::shared_ptr<FaissIndexState> buildFaissIndexState(
     const std::map<int64_t, std::vector<float>>& vectors,
     const std::map<int64_t, std::vector<int64_t>>& documentIds) {
   config.validate();
+  if (config.executionDevice == FaissExecutionDevice::kGpu) {
+#if defined(VELOX_ENABLE_FAISS_GPU)
+    return buildFaissGpuIndexState(config, vectors, documentIds);
+#else
+    VELOX_USER_FAIL(
+        "FAISS GPU execution requested, but VELOX_ENABLE_FAISS_GPU is disabled");
+#endif
+  }
   auto state = std::make_shared<FaissIndexState>();
   state->config = config;
   for (const auto& [cluster, values] : vectors) {
     const auto idIt = documentIds.find(cluster);
     VELOX_USER_CHECK(
-        idIt != documentIds.end(), "Missing document IDs for cluster {}", cluster);
+        idIt != documentIds.end(),
+        "Missing document IDs for cluster {}",
+        cluster);
     VELOX_USER_CHECK_EQ(
         values.size(),
         idIt->second.size() * static_cast<size_t>(config.dimension),
@@ -144,6 +159,24 @@ std::shared_ptr<FaissIndexState> buildFaissIndexState(
   return state;
 }
 
+void searchFaissIndex(
+    FaissIndexState& state,
+    FaissClusterIndex& cluster,
+    ::faiss::idx_t count,
+    const float* queries,
+    ::faiss::idx_t topK,
+    float* distances,
+    ::faiss::idx_t* labels,
+    uintptr_t stream) {
+  if (cluster.gpuResident) {
+    VELOX_CHECK_NOT_NULL(state.gpuContext);
+    state.gpuContext->search(
+        cluster.index.get(), count, queries, topK, distances, labels, stream);
+    return;
+  }
+  cluster.index->search(count, queries, topK, distances, labels);
+}
+
 void writeFaissArtifact(
     const FaissIndexState& state,
     const std::string& directory) {
@@ -154,14 +187,25 @@ void writeFaissArtifact(
   manifest["idEncoding"] = "little-endian-int64-ordinal-map";
   manifest["config"] = state.config.serialize();
   manifest["rowCount"] = state.rowCount;
+  if (state.cagraCopyToMilliseconds > 0) {
+    manifest["cagraCopyToMilliseconds"] = state.cagraCopyToMilliseconds;
+  }
   manifest["clusters"] = folly::dynamic::array;
   for (const auto& [cluster, value] : state.clusters) {
     const auto stem = clusterStem(cluster);
     const auto indexFile = stem + ".faiss";
     const auto idsFile = stem + ".ids";
-    const auto indexPath = (std::filesystem::path(directory) / indexFile).string();
+    const auto indexPath =
+        (std::filesystem::path(directory) / indexFile).string();
     const auto idsPath = (std::filesystem::path(directory) / idsFile).string();
-    ::faiss::write_index(value.index.get(), indexPath.c_str());
+    std::unique_ptr<::faiss::Index> cpuIndex;
+    const ::faiss::Index* persistedIndex = value.index.get();
+    if (value.gpuResident) {
+      VELOX_CHECK_NOT_NULL(state.gpuContext);
+      cpuIndex = state.gpuContext->toCpu(value.index.get());
+      persistedIndex = cpuIndex.get();
+    }
+    ::faiss::write_index(persistedIndex, indexPath.c_str());
     writeIds(idsPath, value.documentIds);
     manifest["clusters"].push_back(
         folly::dynamic::object("cluster", cluster)(
@@ -199,6 +243,10 @@ std::shared_ptr<FaissIndexState> loadFaissArtifact(
 
   auto state = std::make_shared<FaissIndexState>();
   state->config = FaissIndexConfig::deserialize(manifest["config"]);
+  if (manifest.count("cagraCopyToMilliseconds")) {
+    state->cagraCopyToMilliseconds =
+        manifest["cagraCopyToMilliseconds"].asDouble();
+  }
   for (const auto& entry : manifest["clusters"]) {
     const auto cluster = entry["cluster"].asInt();
     const auto rows = entry["rows"].asInt();
@@ -206,7 +254,8 @@ std::shared_ptr<FaissIndexState> loadFaissArtifact(
         (std::filesystem::path(directory) / entry["indexFile"].asString())
             .string();
     const auto idsPath =
-        (std::filesystem::path(directory) / entry["idsFile"].asString()).string();
+        (std::filesystem::path(directory) / entry["idsFile"].asString())
+            .string();
     VELOX_USER_CHECK_EQ(
         checksumString(checksum(indexPath)),
         entry["indexChecksum"].asString(),
@@ -224,6 +273,15 @@ std::shared_ptr<FaissIndexState> loadFaissArtifact(
         cluster, FaissClusterIndex{std::move(index), std::move(ids)});
   }
   VELOX_USER_CHECK_EQ(state->rowCount, manifest["rowCount"].asInt());
+  if (state->config.executionDevice == FaissExecutionDevice::kGpu &&
+      state->config.algorithm != FaissAlgorithm::kHnswCagra) {
+#if defined(VELOX_ENABLE_FAISS_GPU)
+    promoteLoadedIndexesToGpu(*state);
+#else
+    VELOX_USER_FAIL(
+        "FAISS GPU artifact requested, but VELOX_ENABLE_FAISS_GPU is disabled");
+#endif
+  }
   return state;
 }
 

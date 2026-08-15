@@ -13,6 +13,11 @@
 
 #include <filesystem>
 
+#if defined(VELOX_ENABLE_FAISS_GPU)
+#include <cuda_runtime_api.h>
+#include <faiss/IndexHNSW.h>
+#endif
+
 namespace facebook::velox::faiss::test {
 namespace {
 
@@ -24,9 +29,7 @@ FaissIndexConfig flatConfig() {
 
 TEST(FaissIndexTest, exactFlat) {
   auto state = buildFaissIndexState(
-      flatConfig(),
-      {{0, {0, 0, 2, 0, 0, 3}}},
-      {{0, {101, 102, 103}}});
+      flatConfig(), {{0, {0, 0, 2, 0, 0, 3}}}, {{0, {101, 102, 103}}});
   std::vector<float> distances(2);
   std::vector<::faiss::idx_t> labels(2);
   const float query[] = {1.9, 0};
@@ -41,10 +44,9 @@ TEST(FaissIndexTest, artifactRoundTripAndBuildLoadParity) {
       flatConfig(),
       {{7, {0, 0, 2, 0}}, {9, {5, 5}}},
       {{7, {std::numeric_limits<int64_t>::min(), 42}}, {9, {99}}});
-  const auto directory =
-      (std::filesystem::temp_directory_path() /
-       "velox_faiss_artifact_roundtrip")
-          .string();
+  const auto directory = (std::filesystem::temp_directory_path() /
+                          "velox_faiss_artifact_roundtrip")
+                             .string();
   std::filesystem::remove_all(directory);
   writeFaissArtifact(*built, directory);
   auto loaded = loadFaissArtifact(directory);
@@ -75,9 +77,105 @@ TEST(FaissIndexTest, invalidDimensions) {
   config.pqSubquantizers = 3;
   VELOX_ASSERT_THROW(config.validate(), "divisible");
   VELOX_ASSERT_THROW(
-      buildFaissIndexState(config, {{0, {1, 2}}}, {{0, {1}}}),
-      "divisible");
+      buildFaissIndexState(config, {{0, {1, 2}}}, {{0, {1}}}), "divisible");
 }
+
+TEST(FaissIndexTest, executionDeviceSerialization) {
+  auto config = flatConfig();
+  config.executionDevice = FaissExecutionDevice::kGpu;
+  config.gpuDevice = 3;
+  const auto restored = FaissIndexConfig::deserialize(config.serialize());
+  EXPECT_EQ(restored.executionDevice, FaissExecutionDevice::kGpu);
+  EXPECT_EQ(restored.gpuDevice, 3);
+}
+
+#if defined(VELOX_ENABLE_FAISS_GPU)
+bool hasGpu() {
+  int count = 0;
+  return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
+}
+
+TEST(FaissIndexTest, cpuGpuFlatParity) {
+  if (!hasGpu()) {
+    GTEST_SKIP() << "No CUDA GPU available";
+  }
+  auto cpuConfig = flatConfig();
+  auto gpuConfig = cpuConfig;
+  gpuConfig.executionDevice = FaissExecutionDevice::kGpu;
+  const std::map<int64_t, std::vector<float>> vectors{
+      {0, {0, 0, 2, 0, 0, 3, 4, 4}}};
+  const std::map<int64_t, std::vector<int64_t>> ids{{0, {101, 102, 103, 104}}};
+  auto cpu = buildFaissIndexState(cpuConfig, vectors, ids);
+  auto gpu = buildFaissIndexState(gpuConfig, vectors, ids);
+
+  const float queries[] = {1.9F, 0, 0, 2.8F};
+  std::vector<float> cpuDistances(4);
+  std::vector<float> gpuDistances(4);
+  std::vector<::faiss::idx_t> cpuLabels(4);
+  std::vector<::faiss::idx_t> gpuLabels(4);
+  searchFaissIndex(
+      *cpu,
+      cpu->clusters.at(0),
+      2,
+      queries,
+      2,
+      cpuDistances.data(),
+      cpuLabels.data());
+  searchFaissIndex(
+      *gpu,
+      gpu->clusters.at(0),
+      2,
+      queries,
+      2,
+      gpuDistances.data(),
+      gpuLabels.data());
+  EXPECT_EQ(gpuLabels, cpuLabels);
+  for (size_t i = 0; i < cpuDistances.size(); ++i) {
+    EXPECT_NEAR(gpuDistances[i], cpuDistances[i], 1e-5);
+  }
+}
+
+TEST(FaissIndexTest, cagraConvertsAndPersistsAsCpuHnsw) {
+  if (!hasGpu()) {
+    GTEST_SKIP() << "No CUDA GPU available";
+  }
+  FaissIndexConfig config;
+  config.algorithm = FaissAlgorithm::kHnswCagra;
+  config.executionDevice = FaissExecutionDevice::kGpu;
+  config.dimension = 8;
+  config.hnswM = 8;
+  config.efSearch = 32;
+  std::vector<float> vectors(256 * config.dimension);
+  std::vector<int64_t> ids(256);
+  for (size_t row = 0; row < ids.size(); ++row) {
+    ids[row] = 1000 + row;
+    for (int32_t d = 0; d < config.dimension; ++d) {
+      vectors[row * config.dimension + d] =
+          static_cast<float>((row * 17 + d * 3) % 101) / 101.0F;
+    }
+  }
+
+  auto built = buildFaissIndexState(config, {{0, vectors}}, {{0, ids}});
+  EXPECT_FALSE(built->clusters.at(0).gpuResident);
+  EXPECT_NE(
+      dynamic_cast<::faiss::IndexHNSWCagra*>(built->clusters.at(0).index.get()),
+      nullptr);
+  EXPECT_GT(built->cagraCopyToMilliseconds, 0);
+
+  const auto directory = (std::filesystem::temp_directory_path() /
+                          "velox_faiss_cagra_hnsw_artifact")
+                             .string();
+  std::filesystem::remove_all(directory);
+  writeFaissArtifact(*built, directory);
+  auto loaded = loadFaissArtifact(directory);
+  EXPECT_FALSE(loaded->clusters.at(0).gpuResident);
+  EXPECT_NE(
+      dynamic_cast<::faiss::IndexHNSWCagra*>(
+          loaded->clusters.at(0).index.get()),
+      nullptr);
+  std::filesystem::remove_all(directory);
+}
+#endif
 
 class FaissPlanNodeTest : public testing::Test,
                           public velox::test::VectorTestBase {};
@@ -109,10 +207,9 @@ TEST_F(FaissPlanNodeTest, serializationRoundTrip) {
       "embedding",
       std::nullopt,
       1);
-  const auto copy = ISerializable::deserialize<core::PlanNode>(
-      search->serialize(), pool());
-  const auto restored =
-      std::dynamic_pointer_cast<const SearchIndexNode>(copy);
+  const auto copy =
+      ISerializable::deserialize<core::PlanNode>(search->serialize(), pool());
+  const auto restored = std::dynamic_pointer_cast<const SearchIndexNode>(copy);
   ASSERT_NE(restored, nullptr);
   EXPECT_EQ(restored->topK(), 1);
   ASSERT_NE(
@@ -123,16 +220,13 @@ TEST_F(FaissPlanNodeTest, serializationRoundTrip) {
 
 TEST_F(FaissPlanNodeTest, rejectsNullEmbeddings) {
   auto nullRow = makeRowVector(
-      {"embedding"},
-      {makeNullableArrayVector<float>({std::nullopt})});
+      {"embedding"}, {makeNullableArrayVector<float>({std::nullopt})});
   VELOX_ASSERT_THROW(
-      validateFaissEmbeddings(
-          nullRow, nullRow->rowType(), "embedding", 2),
+      validateFaissEmbeddings(nullRow, nullRow->rowType(), "embedding", 2),
       "embedding is null");
 
   auto nullElement = makeRowVector(
-      {"embedding"},
-      {makeNullableArrayVector<float>({{1.0F, std::nullopt}})});
+      {"embedding"}, {makeNullableArrayVector<float>({{1.0F, std::nullopt}})});
   VELOX_ASSERT_THROW(
       validateFaissEmbeddings(
           nullElement, nullElement->rowType(), "embedding", 2),

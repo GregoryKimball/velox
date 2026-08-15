@@ -13,10 +13,13 @@ namespace facebook::velox::faiss {
 
 enum class FaissAlgorithm { kFlat, kIvfFlat, kIvfPq, kHnsw, kHnswCagra };
 enum class FaissMetric { kL2, kInnerProduct };
+enum class FaissExecutionDevice { kCpu, kGpu };
 
 struct FaissIndexConfig {
   FaissAlgorithm algorithm{FaissAlgorithm::kFlat};
   FaissMetric metric{FaissMetric::kL2};
+  FaissExecutionDevice executionDevice{FaissExecutionDevice::kCpu};
+  int32_t gpuDevice{0};
   int32_t dimension{0};
   int32_t nlist{1};
   int32_t nprobe{1};

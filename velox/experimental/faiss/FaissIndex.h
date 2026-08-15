@@ -14,16 +14,48 @@
 
 namespace facebook::velox::faiss {
 
+class FaissGpuContext {
+ public:
+  virtual ~FaissGpuContext() = default;
+
+  virtual void search(
+      const ::faiss::Index* index,
+      ::faiss::idx_t count,
+      const float* queries,
+      ::faiss::idx_t topK,
+      float* distances,
+      ::faiss::idx_t* labels,
+      uintptr_t stream = 0) = 0;
+
+  virtual std::unique_ptr<::faiss::Index> toCpu(
+      const ::faiss::Index* index) = 0;
+};
+
 struct FaissClusterIndex {
   std::unique_ptr<::faiss::Index> index;
   std::vector<int64_t> documentIds;
+  bool gpuResident{false};
 };
 
 struct FaissIndexState {
   FaissIndexConfig config;
+  // Declared before clusters so GPU indexes are destroyed before their
+  // task-scoped resources.
+  std::shared_ptr<FaissGpuContext> gpuContext;
   std::map<int64_t, FaissClusterIndex> clusters;
   int64_t rowCount{0};
+  double cagraCopyToMilliseconds{0};
 };
+
+void searchFaissIndex(
+    FaissIndexState& state,
+    FaissClusterIndex& cluster,
+    ::faiss::idx_t count,
+    const float* queries,
+    ::faiss::idx_t topK,
+    float* distances,
+    ::faiss::idx_t* labels,
+    uintptr_t stream = 0);
 
 std::shared_ptr<FaissIndexState> buildFaissIndexState(
     const FaissIndexConfig& config,

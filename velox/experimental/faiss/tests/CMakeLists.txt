@@ -13,3 +13,14 @@ target_link_libraries(
     GTest::gtest
     GTest::gtest_main
 )
+
+if(VELOX_ENABLE_FAISS_GPU)
+  target_compile_definitions(
+    velox_experimental_faiss_test
+    PRIVATE VELOX_ENABLE_FAISS_GPU
+  )
+  target_link_libraries(
+    velox_experimental_faiss_test
+    PRIVATE CUDA::cudart
+  )
+endif()
