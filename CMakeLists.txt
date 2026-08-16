@@ -174,8 +174,18 @@ option(
 )
 option(VELOX_SIMDJSON_SKIPUTF8VALIDATION "Skip simdjson utf8 validation in JSON parsing" OFF)
 option(VELOX_ENABLE_FAISS "Build faiss vector search support" OFF)
+option(
+  VELOX_ENABLE_FAISS_GPU
+  "Build experimental FAISS GPU support using the cuVS backend"
+  OFF
+)
 option(VELOX_ENABLE_TORCHWAVE "Build TorchWave experimental subsystem." OFF)
 option(VELOX_ENABLE_CXL "Build CXL experimental memory subsystem (Linux only)." OFF)
+
+if(VELOX_ENABLE_FAISS_GPU)
+  set(VELOX_ENABLE_FAISS ON)
+  set(VELOX_ENABLE_CUDF ON)
+endif()
 
 # Explicitly force compilers to generate colored output. Compilers usually do
 # this by default if they detect the output is a terminal, but this assumption
@@ -281,7 +291,7 @@ if(${VELOX_ENABLE_DUCKDB})
   velox_resolve_dependency(DuckDB)
 endif()
 
-if(VELOX_ENABLE_FAISS)
+if(VELOX_ENABLE_FAISS AND NOT VELOX_ENABLE_FAISS_GPU)
   velox_set_source(faiss)
   velox_resolve_dependency(faiss)
   if(NOT TARGET FAISS::faiss)
@@ -542,6 +552,16 @@ if(VELOX_ENABLE_WAVE OR VELOX_ENABLE_CUDF)
         PROPERTIES INTERFACE_LINK_LIBRARIES "${override_curl_lib}"
       )
     endif()
+  endif()
+endif()
+
+if(VELOX_ENABLE_FAISS_GPU)
+  # Resolve cuDF first so FAISS/cuVS reuse the RAPIDS dependency versions
+  # selected by Velox instead of creating a competing RMM dependency graph.
+  velox_set_source(faiss)
+  velox_resolve_dependency(faiss)
+  if(NOT TARGET FAISS::faiss)
+    add_library(FAISS::faiss ALIAS faiss)
   endif()
 endif()
 
