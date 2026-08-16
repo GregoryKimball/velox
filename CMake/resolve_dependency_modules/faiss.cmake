@@ -13,10 +13,10 @@
 # limitations under the License.
 include_guard(GLOBAL)
 
-set(VELOX_FAISS_BUILD_VERSION 1.11.0)
+set(VELOX_FAISS_BUILD_VERSION 1.14.3)
 set(
   VELOX_FAISS_BUILD_SHA256_CHECKSUM
-  c5d517da6deb6a6d74290d7145331fc7474426025e2d826fa4a6d40670f4493c
+  7f3c4ed9aec3bd7524382862f5fcbd4d8984e2a8979ff3bdb2c0bcea5144149e
 )
 set(
   VELOX_FAISS_SOURCE_URL
@@ -55,6 +55,8 @@ FetchContent_Declare(
   URL_HASH ${VELOX_FAISS_BUILD_SHA256_CHECKSUM}
   SYSTEM
   EXCLUDE_FROM_ALL
+  PATCH_COMMAND
+    patch -p1 -i ${CMAKE_CURRENT_LIST_DIR}/faiss/faiss-1.14-cuvs-26.08.patch
 )
 
 # Set build options
@@ -62,12 +64,24 @@ block()
   set(BUILD_SHARED_LIBS OFF)
   set(BUILD_TESTING OFF)
   set(CMAKE_BUILD_TYPE Release)
-  set(FAISS_ENABLE_GPU OFF)
+  set(FAISS_ENABLE_GPU ${VELOX_ENABLE_FAISS_GPU})
+  set(FAISS_ENABLE_CUVS ${VELOX_ENABLE_FAISS_GPU})
+  set(FAISS_USE_CUDA_TOOLKIT_STATIC ON)
   set(FAISS_ENABLE_PYTHON OFF)
   set(FAISS_ENABLE_GPU_TESTS OFF)
   # Make FAISS available
   FetchContent_MakeAvailable(faiss)
   add_library(FAISS::faiss ALIAS faiss)
+  if(VELOX_ENABLE_FAISS_GPU AND TARGET faiss_gpu_objs AND TARGET CCCL::CCCL)
+    # CUDA toolkit releases may ship an older CCCL under include/cccl. Ensure
+    # RAPIDS' selected CCCL is searched first when compiling FAISS GPU sources.
+    target_include_directories(
+      faiss_gpu_objs
+      SYSTEM
+      BEFORE
+      PRIVATE $<TARGET_PROPERTY:CCCL::CCCL,INTERFACE_INCLUDE_DIRECTORIES>
+    )
+  endif()
   unset(BUILD_TESTING CACHE)
   unset(BUILD_SHARED_LIBS CACHE)
 endblock()

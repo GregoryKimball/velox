@@ -269,7 +269,9 @@ if(${VELOX_ENABLE_BENCHMARKS})
 endif()
 
 add_subdirectory(prefixsort)
-add_subdirectory(rpc)
+if(VELOX_ENABLE_REMOTE_FUNCTIONS)
+  add_subdirectory(rpc)
+endif()
 add_subdirectory(trace)
 add_subdirectory(window)
 
