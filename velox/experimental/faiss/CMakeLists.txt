@@ -21,7 +21,6 @@ velox_add_library(
   FaissIndex.h
   FaissOperators.h
   FaissGpuIndex.h
-  FaissNvtx.h
 )
 
 velox_link_libraries(
@@ -44,6 +43,7 @@ if(VELOX_ENABLE_FAISS_GPU)
       velox_experimental_faiss
       PRIVATE VELOX_ENABLE_FAISS_GPU
     )
+    velox_link_libraries(velox_experimental_faiss velox_cudf_exec)
   endif()
   velox_link_libraries(
     velox_experimental_faiss
@@ -51,6 +51,7 @@ if(VELOX_ENABLE_FAISS_GPU)
     cudf::cudf
     cuvs::cuvs
     CUDA::cudart
+    nvtx3::nvtx3-cpp
   )
 endif()
 

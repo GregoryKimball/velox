@@ -39,6 +39,11 @@ const ArrayVector* validateFaissEmbeddings(
     int32_t dimension);
 
 #if defined(VELOX_ENABLE_FAISS_GPU)
+std::unique_ptr<exec::Operator> makeFaissGpuAssignClusters(
+    int32_t operatorId,
+    exec::DriverCtx* driverCtx,
+    std::shared_ptr<const AssignClustersNode> planNode);
+
 std::optional<FaissGpuQueryInput> extractFaissGpuQueryInput(
     const RowVectorPtr& input,
     const RowTypePtr& type,

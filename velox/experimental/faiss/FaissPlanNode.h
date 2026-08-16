@@ -50,7 +50,8 @@ class AssignClustersNode final : public core::PlanNode {
       std::string clusterColumn,
       int32_t dimension,
       std::vector<float> centroids,
-      FaissMetric metric = FaissMetric::kL2);
+      FaissMetric metric = FaissMetric::kL2,
+      FaissExecutionDevice executionDevice = FaissExecutionDevice::kCpu);
 
   const RowTypePtr& outputType() const override {
     return outputType_;
@@ -73,6 +74,9 @@ class AssignClustersNode final : public core::PlanNode {
   FaissMetric metric() const {
     return metric_;
   }
+  FaissExecutionDevice executionDevice() const {
+    return executionDevice_;
+  }
   folly::dynamic serialize() const override;
   static core::PlanNodePtr create(const folly::dynamic& obj, void* context);
 
@@ -85,6 +89,7 @@ class AssignClustersNode final : public core::PlanNode {
   int32_t dimension_;
   std::vector<float> centroids_;
   FaissMetric metric_;
+  FaissExecutionDevice executionDevice_;
 };
 
 class BuildIndexNode final : public core::PlanNode {

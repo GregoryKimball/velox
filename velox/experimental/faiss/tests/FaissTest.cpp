@@ -362,6 +362,34 @@ TEST_F(FaissPlanNodeTest, serializationRoundTrip) {
       std::dynamic_pointer_cast<const LoadIndexNode>(legacyCopy);
   ASSERT_NE(restoredLegacy, nullptr);
   EXPECT_FALSE(restoredLegacy->targetConfig().has_value());
+
+  auto assignment = std::make_shared<AssignClustersNode>(
+      "assign",
+      std::make_shared<core::ValuesNode>(
+          "assignment_values", std::vector<RowVectorPtr>{queries}),
+      "embedding",
+      "cluster_id",
+      2,
+      std::vector<float>{0, 0, 1, 1},
+      FaissMetric::kL2,
+      FaissExecutionDevice::kGpu);
+  const auto assignmentCopy = ISerializable::deserialize<core::PlanNode>(
+      assignment->serialize(), pool());
+  const auto restoredAssignment =
+      std::dynamic_pointer_cast<const AssignClustersNode>(assignmentCopy);
+  ASSERT_NE(restoredAssignment, nullptr);
+  EXPECT_EQ(
+      restoredAssignment->executionDevice(), FaissExecutionDevice::kGpu);
+  EXPECT_EQ(restoredAssignment->centroids().size(), 4);
+
+  auto legacyAssignment = assignment->serialize();
+  legacyAssignment.erase("executionDevice");
+  const auto legacyAssignmentCopy = ISerializable::deserialize<core::PlanNode>(
+      legacyAssignment, pool());
+  EXPECT_EQ(
+      std::dynamic_pointer_cast<const AssignClustersNode>(legacyAssignmentCopy)
+          ->executionDevice(),
+      FaissExecutionDevice::kCpu);
 }
 
 TEST_F(FaissPlanNodeTest, rejectsNullEmbeddings) {

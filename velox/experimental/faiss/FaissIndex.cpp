@@ -4,8 +4,6 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  */
 #include "velox/experimental/faiss/FaissIndex.h"
-#include "velox/experimental/faiss/FaissNvtx.h"
-
 #include "velox/common/file/File.h"
 #include "velox/common/file/FileSystems.h"
 
@@ -200,7 +198,6 @@ std::shared_ptr<FaissIndexState> buildFaissIndexState(
     auto index = createIndex(config);
     const auto count = static_cast<::faiss::idx_t>(idIt->second.size());
     if (!index->is_trained && count > 0) {
-      FaissNvtxRange range("FAISS train");
       const auto start = std::chrono::steady_clock::now();
       index->train(count, values.data());
       state->trainMilliseconds +=
@@ -209,7 +206,6 @@ std::shared_ptr<FaissIndexState> buildFaissIndexState(
               .count();
     }
     if (count > 0) {
-      FaissNvtxRange range("FAISS add");
       const auto start = std::chrono::steady_clock::now();
       index->add(count, values.data());
       state->addMilliseconds += std::chrono::duration<double, std::milli>(
@@ -234,7 +230,6 @@ void searchFaissIndex(
     uintptr_t stream) {
   if (cluster.gpuResident) {
     VELOX_CHECK_NOT_NULL(state.gpuContext);
-    FaissNvtxRange range("FAISS search");
     const auto start = std::chrono::steady_clock::now();
     state.gpuContext->search(
         cluster.index.get(), count, queries, topK, distances, labels, stream);
@@ -243,7 +238,6 @@ void searchFaissIndex(
                                     .count();
     return;
   }
-  FaissNvtxRange range("FAISS search");
   const auto start = std::chrono::steady_clock::now();
   cluster.index->search(count, queries, topK, distances, labels);
   state.searchMilliseconds +=
@@ -301,7 +295,6 @@ std::shared_ptr<FaissIndexState> loadFaissArtifact(
   const auto manifestPath = artifactPath(directory, "manifest.json");
   folly::dynamic manifest;
   {
-    FaissNvtxRange readRange("FAISS load read");
     manifest = folly::parseJson(readArtifactFile(manifestPath));
   }
   VELOX_USER_CHECK_EQ(
@@ -336,7 +329,6 @@ std::shared_ptr<FaissIndexState> loadFaissArtifact(
     std::string indexBytes;
     std::string idsBytes;
     {
-      FaissNvtxRange readRange("FAISS load read");
       indexBytes = readArtifactFile(indexPath);
       idsBytes = readArtifactFile(idsPath);
       VELOX_USER_CHECK_EQ(
@@ -353,7 +345,6 @@ std::shared_ptr<FaissIndexState> loadFaissArtifact(
             std::chrono::steady_clock::now() - readStart)
             .count();
     const auto deserializeStart = std::chrono::steady_clock::now();
-    FaissNvtxRange deserializeRange("FAISS load deserialize");
     ::faiss::VectorIOReader reader;
     reader.name = indexPath;
     reader.data.assign(indexBytes.begin(), indexBytes.end());
@@ -428,7 +419,6 @@ void applyFaissLoadTarget(
       targetConfig.algorithm != FaissAlgorithm::kHnswCagra) {
 #if defined(VELOX_ENABLE_FAISS_GPU)
     const auto uploadStart = std::chrono::steady_clock::now();
-    FaissNvtxRange uploadRange("FAISS load upload");
     promoteLoadedIndexesToGpu(state);
     state.loadUploadMilliseconds +=
         std::chrono::duration<double, std::milli>(

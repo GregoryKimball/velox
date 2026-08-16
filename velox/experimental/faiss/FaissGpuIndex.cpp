@@ -4,7 +4,6 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  */
 #include "velox/experimental/faiss/FaissGpuIndex.h"
-#include "velox/experimental/faiss/FaissNvtx.h"
 #include "velox/experimental/faiss/FaissOperators.h"
 
 #include "folly/ScopeGuard.h"
@@ -187,7 +186,6 @@ std::unique_ptr<::faiss::Index> buildCagraCpuSearchIndex(
   gpuConfig.build_algo = ::faiss::gpu::graph_build_algo::NN_DESCENT;
   ::faiss::gpu::GpuIndexCagra gpuIndex(
       resources, config.dimension, metricType(config.metric), gpuConfig);
-  FaissNvtxRange trainRange("FAISS train");
   const auto trainStart = std::chrono::steady_clock::now();
   gpuIndex.train(count, values);
   trainMilliseconds += std::chrono::duration<double, std::milli>(
@@ -195,7 +193,6 @@ std::unique_ptr<::faiss::Index> buildCagraCpuSearchIndex(
                            .count();
 
   const auto start = std::chrono::steady_clock::now();
-  FaissNvtxRange copyRange("CAGRA-to-HNSW");
   gpuIndex.copyTo(cpuIndex.get());
   resources->getResources()->syncDefaultStream(config.gpuDevice);
   copyMilliseconds += std::chrono::duration<double, std::milli>(
@@ -237,7 +234,6 @@ void addGpuCluster(
         metricType(config.metric),
         gpuConfig);
     {
-      FaissNvtxRange range("FAISS train");
       const auto start = std::chrono::steady_clock::now();
       gpuIndex->train(count, values);
       state.trainMilliseconds +=
@@ -250,7 +246,6 @@ void addGpuCluster(
     auto cpuIndex = createCpuTemplateIndex(config);
     index = context.toGpu(cpuIndex.get());
     if (!index->is_trained && count > 0) {
-      FaissNvtxRange range("FAISS train");
       const auto start = std::chrono::steady_clock::now();
       index->train(count, values);
       state.trainMilliseconds +=
@@ -259,7 +254,6 @@ void addGpuCluster(
               .count();
     }
     if (count > 0) {
-      FaissNvtxRange range("FAISS add");
       const auto start = std::chrono::steady_clock::now();
       index->add(count, values);
       state.addMilliseconds +=

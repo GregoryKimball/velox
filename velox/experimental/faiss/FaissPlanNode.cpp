@@ -176,14 +176,16 @@ AssignClustersNode::AssignClustersNode(
     std::string clusterColumn,
     int32_t dimension,
     std::vector<float> centroids,
-    FaissMetric metric)
+    FaissMetric metric,
+    FaissExecutionDevice executionDevice)
     : PlanNode(std::move(id)),
       sources_{std::move(source)},
       embeddingColumn_(std::move(embeddingColumn)),
       clusterColumn_(std::move(clusterColumn)),
       dimension_(dimension),
       centroids_(std::move(centroids)),
-      metric_(metric) {
+      metric_(metric),
+      executionDevice_(executionDevice) {
   VELOX_USER_CHECK_GT(dimension_, 0);
   VELOX_USER_CHECK(
       !centroids_.empty() && centroids_.size() % dimension_ == 0,
@@ -201,7 +203,8 @@ AssignClustersNode::AssignClustersNode(
 
 void AssignClustersNode::addDetails(std::stringstream& stream) const {
   stream << embeddingColumn_ << " -> " << clusterColumn_ << ", "
-         << centroids_.size() / dimension_ << " centroids";
+         << centroids_.size() / dimension_ << " centroids, "
+         << deviceName(executionDevice_);
 }
 
 folly::dynamic AssignClustersNode::serialize() const {
@@ -211,6 +214,7 @@ folly::dynamic AssignClustersNode::serialize() const {
   obj["dimension"] = dimension_;
   obj["centroids"] = serializeFloats(centroids_);
   obj["metric"] = metricName(metric_);
+  obj["executionDevice"] = deviceName(executionDevice_);
   return obj;
 }
 
@@ -224,7 +228,10 @@ core::PlanNodePtr AssignClustersNode::create(
       obj["clusterColumn"].asString(),
       obj["dimension"].asInt(),
       deserializeFloats(obj["centroids"]),
-      parseMetric(obj["metric"].asString()));
+      parseMetric(obj["metric"].asString()),
+      obj.count("executionDevice")
+          ? parseDevice(obj["executionDevice"].asString())
+          : FaissExecutionDevice::kCpu);
 }
 
 BuildIndexNode::BuildIndexNode(

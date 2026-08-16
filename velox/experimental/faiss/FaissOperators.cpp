@@ -4,9 +4,9 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  */
 #include "velox/experimental/faiss/FaissOperators.h"
-#include "velox/experimental/faiss/FaissNvtx.h"
-
 #if defined(VELOX_ENABLE_FAISS_GPU)
+#include "velox/experimental/cudf/exec/NvtxHelper.h"
+#include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/faiss/FaissGpuIndex.h"
 #endif
 
@@ -20,6 +20,32 @@
 
 namespace facebook::velox::faiss {
 namespace {
+
+#if defined(VELOX_ENABLE_FAISS_GPU)
+using cudf_velox::extractClassAndFunction;
+using cudf_velox::extractFunctionName;
+using cudf_velox::NvtxHelper;
+using cudf_velox::VeloxDomain;
+
+class FaissOperatorNvtx : public NvtxHelper {
+ public:
+  FaissOperatorNvtx(int32_t operatorId, const core::PlanNodeId& nodeId)
+      : NvtxHelper(
+            nvtx3::rgb{147, 112, 219}, // Medium purple.
+            operatorId,
+            fmt::format("[{}]", nodeId)) {}
+};
+
+#define VELOX_FAISS_NVTX_OPERATOR_FUNC_RANGE(name) \
+  VELOX_NVTX_OPERATOR_FUNC_RANGE(name)
+#else
+class FaissOperatorNvtx {
+ public:
+  FaissOperatorNvtx(int32_t /* operatorId */, const core::PlanNodeId& /* id */) {}
+};
+
+#define VELOX_FAISS_NVTX_OPERATOR_FUNC_RANGE(name)
+#endif
 
 RuntimeCounter milliseconds(double value) {
   return RuntimeCounter(
@@ -100,7 +126,9 @@ std::shared_ptr<FlatVector<T>> makeFlat(
   return result;
 }
 
-class AssignClustersOperator final : public exec::Operator {
+class AssignClustersOperator final
+    : public exec::Operator,
+      public FaissOperatorNvtx {
  public:
   AssignClustersOperator(
       int32_t id,
@@ -112,18 +140,21 @@ class AssignClustersOperator final : public exec::Operator {
             id,
             node->id(),
             "FaissAssignClusters"),
+        FaissOperatorNvtx(id, node->id()),
         node_(std::move(node)) {}
 
   bool needsInput() const override {
     return !noMoreInput_ && input_ == nullptr;
   }
   void addInput(RowVectorPtr input) override {
+    VELOX_FAISS_NVTX_OPERATOR_FUNC_RANGE("FaissAssignClusters");
     input_ = std::move(input);
   }
   exec::BlockingReason isBlocked(ContinueFuture* /* future */) override {
     return exec::BlockingReason::kNotBlocked;
   }
   RowVectorPtr getOutput() override {
+    VELOX_FAISS_NVTX_OPERATOR_FUNC_RANGE("FaissAssignClusters");
     if (!input_) {
       return nullptr;
     }
@@ -177,7 +208,9 @@ class AssignClustersOperator final : public exec::Operator {
   std::shared_ptr<const AssignClustersNode> node_;
 };
 
-class ProviderPassThrough final : public exec::Operator {
+class ProviderPassThrough final
+    : public exec::Operator,
+      public FaissOperatorNvtx {
  public:
   ProviderPassThrough(
       int32_t id,
@@ -188,17 +221,20 @@ class ProviderPassThrough final : public exec::Operator {
             node->outputType(),
             id,
             node->id(),
-            "FaissBuildIndexProvider") {}
+            "FaissBuildIndexProvider"),
+        FaissOperatorNvtx(id, node->id()) {}
   bool needsInput() const override {
     return !noMoreInput_ && input_ == nullptr;
   }
   void addInput(RowVectorPtr input) override {
+    VELOX_FAISS_NVTX_OPERATOR_FUNC_RANGE("FaissBuildIndexProvider");
     input_ = std::move(input);
   }
   exec::BlockingReason isBlocked(ContinueFuture* /* future */) override {
     return exec::BlockingReason::kNotBlocked;
   }
   RowVectorPtr getOutput() override {
+    VELOX_FAISS_NVTX_OPERATOR_FUNC_RANGE("FaissBuildIndexProvider");
     return std::exchange(input_, nullptr);
   }
   bool isFinished() override {
@@ -206,7 +242,9 @@ class ProviderPassThrough final : public exec::Operator {
   }
 };
 
-class LoadProviderSource final : public exec::Operator {
+class LoadProviderSource final
+    : public exec::Operator,
+      public FaissOperatorNvtx {
  public:
   LoadProviderSource(
       int32_t id,
@@ -217,7 +255,8 @@ class LoadProviderSource final : public exec::Operator {
             node->outputType(),
             id,
             node->id(),
-            "FaissLoadIndexProvider") {}
+            "FaissLoadIndexProvider"),
+        FaissOperatorNvtx(id, node->id()) {}
   bool needsInput() const override {
     return false;
   }
@@ -228,6 +267,7 @@ class LoadProviderSource final : public exec::Operator {
     return exec::BlockingReason::kNotBlocked;
   }
   RowVectorPtr getOutput() override {
+    VELOX_FAISS_NVTX_OPERATOR_FUNC_RANGE("FaissLoadIndexProvider");
     if (finished_) {
       return nullptr;
     }
@@ -243,13 +283,16 @@ class LoadProviderSource final : public exec::Operator {
   bool finished_{false};
 };
 
-class IndexBuildOperator final : public exec::Operator {
+class IndexBuildOperator final
+    : public exec::Operator,
+      public FaissOperatorNvtx {
  public:
   IndexBuildOperator(
       int32_t id,
       exec::DriverCtx* ctx,
       std::shared_ptr<const SearchIndexNode> node)
       : Operator(ctx, nullptr, id, node->id(), "FaissIndexBuild"),
+        FaissOperatorNvtx(id, node->id()),
         node_(std::move(node)),
         buildNode_(
             std::dynamic_pointer_cast<const BuildIndexNode>(
@@ -262,6 +305,7 @@ class IndexBuildOperator final : public exec::Operator {
     return !noMoreInput_;
   }
   void addInput(RowVectorPtr input) override {
+    VELOX_FAISS_NVTX_OPERATOR_FUNC_RANGE("FaissIndexBuild");
     if (!buildNode_ || input->size() == 0) {
       return;
     }
@@ -312,6 +356,7 @@ class IndexBuildOperator final : public exec::Operator {
     return nullptr;
   }
   void noMoreInput() override {
+    VELOX_FAISS_NVTX_OPERATOR_FUNC_RANGE("FaissIndexBuild");
     Operator::noMoreInput();
     std::vector<ContinuePromise> promises;
     std::vector<std::shared_ptr<exec::Driver>> peers;
@@ -394,6 +439,7 @@ class IndexBuildOperator final : public exec::Operator {
     bridge->setState(std::move(state));
   }
   exec::BlockingReason isBlocked(ContinueFuture* future) override {
+    VELOX_FAISS_NVTX_OPERATOR_FUNC_RANGE("FaissIndexBuild");
     if (!future_.valid()) {
       return exec::BlockingReason::kNotBlocked;
     }
@@ -416,22 +462,27 @@ class IndexBuildOperator final : public exec::Operator {
   ContinueFuture future_{ContinueFuture::makeEmpty()};
 };
 
-class IndexSearchOperator final : public exec::Operator {
+class IndexSearchOperator final
+    : public exec::Operator,
+      public FaissOperatorNvtx {
  public:
   IndexSearchOperator(
       int32_t id,
       exec::DriverCtx* ctx,
       std::shared_ptr<const SearchIndexNode> node)
       : Operator(ctx, node->outputType(), id, node->id(), "FaissIndexSearch"),
+        FaissOperatorNvtx(id, node->id()),
         node_(std::move(node)) {}
 
   bool needsInput() const override {
     return !noMoreInput_ && input_ == nullptr;
   }
   void addInput(RowVectorPtr input) override {
+    VELOX_FAISS_NVTX_OPERATOR_FUNC_RANGE("FaissIndexSearch");
     input_ = std::move(input);
   }
   exec::BlockingReason isBlocked(ContinueFuture* future) override {
+    VELOX_FAISS_NVTX_OPERATOR_FUNC_RANGE("FaissIndexSearch");
     if (state_) {
       return exec::BlockingReason::kNotBlocked;
     }
@@ -444,10 +495,10 @@ class IndexSearchOperator final : public exec::Operator {
                   : exec::BlockingReason::kWaitForJoinBuild;
   }
   RowVectorPtr getOutput() override {
+    VELOX_FAISS_NVTX_OPERATOR_FUNC_RANGE("FaissIndexSearch");
     if (!input_ || !state_) {
       return nullptr;
     }
-    FaissNvtxRange queryRange("candidate retrieval query");
     const auto conversionStart = std::chrono::steady_clock::now();
     const auto queryType = node_->sources()[0]->outputType();
     const ArrayVector* arrays = nullptr;
@@ -545,7 +596,6 @@ class IndexSearchOperator final : public exec::Operator {
             distances.data(),
             labels.data());
       }
-      FaissNvtxRange gatherRange("ID gather");
       const auto gatherStart = std::chrono::steady_clock::now();
       for (size_t batchRow = 0; batchRow < rows.size(); ++batchRow) {
         const auto row = rows[batchRow];
@@ -611,6 +661,182 @@ class IndexSearchOperator final : public exec::Operator {
   double gatherMilliseconds_{0};
   bool reportedStats_{false};
 };
+
+#if defined(VELOX_ENABLE_FAISS_GPU)
+bool usesGpuIndex(const std::shared_ptr<const SearchIndexNode>& search) {
+  if (auto build =
+          std::dynamic_pointer_cast<const BuildIndexNode>(search->sources()[1])) {
+    return build->config().executionDevice == FaissExecutionDevice::kGpu;
+  }
+  if (auto load =
+          std::dynamic_pointer_cast<const LoadIndexNode>(search->sources()[1])) {
+    return load->targetConfig() &&
+        load->targetConfig()->executionDevice == FaissExecutionDevice::kGpu;
+  }
+  return false;
+}
+
+bool buildsGpuIndex(const std::shared_ptr<const SearchIndexNode>& search) {
+  const auto build =
+      std::dynamic_pointer_cast<const BuildIndexNode>(search->sources()[1]);
+  return build &&
+      build->config().executionDevice == FaissExecutionDevice::kGpu;
+}
+
+class AssignClustersAdapter final : public cudf_velox::OperatorAdapter {
+ public:
+  AssignClustersAdapter() : OperatorAdapter("FaissAssignClusters") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const AssignClustersOperator*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    const auto assign =
+        std::dynamic_pointer_cast<const AssignClustersNode>(planNode);
+    return assign &&
+        assign->executionDevice() == FaissExecutionDevice::kGpu;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto assign = std::dynamic_pointer_cast<const AssignClustersNode>(planNode);
+    VELOX_CHECK_NOT_NULL(assign);
+    std::vector<std::unique_ptr<exec::Operator>> replacements;
+    replacements.push_back(
+        makeFaissGpuAssignClusters(operatorId, ctx, std::move(assign)));
+    return replacements;
+  }
+};
+
+class BuildProviderAdapter final : public cudf_velox::OperatorAdapter {
+ public:
+  BuildProviderAdapter() : OperatorAdapter("FaissBuildIndexProvider") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const ProviderPassThrough*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    const auto build = std::dynamic_pointer_cast<const BuildIndexNode>(planNode);
+    return build &&
+        build->config().executionDevice == FaissExecutionDevice::kGpu;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/,
+      int32_t /*operatorId*/) const override {
+    return {};
+  }
+
+  bool keepOperator() const override {
+    return true;
+  }
+};
+
+class IndexBuildAdapter final : public cudf_velox::OperatorAdapter {
+ public:
+  IndexBuildAdapter() : OperatorAdapter("FaissIndexBuild") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const IndexBuildOperator*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    const auto search =
+        std::dynamic_pointer_cast<const SearchIndexNode>(planNode);
+    return search && buildsGpuIndex(search);
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return false;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/,
+      int32_t /*operatorId*/) const override {
+    return {};
+  }
+
+  bool keepOperator() const override {
+    return true;
+  }
+};
+
+class IndexSearchAdapter final : public cudf_velox::OperatorAdapter {
+ public:
+  IndexSearchAdapter() : OperatorAdapter("FaissIndexSearch") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const IndexSearchOperator*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    const auto search =
+        std::dynamic_pointer_cast<const SearchIndexNode>(planNode);
+    return search && usesGpuIndex(search);
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return false;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/,
+      int32_t /*operatorId*/) const override {
+    return {};
+  }
+
+  bool keepOperator() const override {
+    return true;
+  }
+};
+#endif
 
 } // namespace
 
@@ -685,6 +911,13 @@ std::optional<uint32_t> FaissPlanNodeTranslator::maxDrivers(
 void registerFaiss() {
   registerFaissPlanNodeSerDe();
   exec::Operator::registerOperator(std::make_unique<FaissPlanNodeTranslator>());
+#if defined(VELOX_ENABLE_FAISS_GPU)
+  auto& adapters = cudf_velox::OperatorAdapterRegistry::getInstance();
+  adapters.registerAdapter(std::make_unique<AssignClustersAdapter>());
+  adapters.registerAdapter(std::make_unique<BuildProviderAdapter>());
+  adapters.registerAdapter(std::make_unique<IndexBuildAdapter>());
+  adapters.registerAdapter(std::make_unique<IndexSearchAdapter>());
+#endif
 }
 
 } // namespace facebook::velox::faiss

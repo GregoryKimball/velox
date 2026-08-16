@@ -16,6 +16,7 @@ target_link_libraries(
     velox_dwio_parquet_writer
     velox_functions_prestosql
     Folly::folly
+    Folly::follybenchmark
     GTest::gtest
     gflags::gflags
 )
@@ -27,6 +28,6 @@ if(VELOX_ENABLE_FAISS_GPU)
   )
   target_link_libraries(
     velox_candidate_retrieval_benchmark
-    PRIVATE velox_cudf_exec nvtx3::nvtx3-c
+    PRIVATE velox_cudf_exec velox_cudf_hive_connector nvtx3::nvtx3-c
   )
 endif()
