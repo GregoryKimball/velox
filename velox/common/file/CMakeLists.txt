@@ -37,8 +37,8 @@ velox_add_library(
 )
 velox_link_libraries(
   velox_file
-  PUBLIC velox_exception Folly::folly
-  PRIVATE velox_buffer velox_common_base velox_memory fmt::fmt glog::glog
+  PUBLIC velox_buffer velox_exception Folly::folly
+  PRIVATE velox_common_base velox_memory fmt::fmt glog::glog
 )
 
 if(${VELOX_BUILD_TESTING} OR ${VELOX_BUILD_TEST_UTILS})
