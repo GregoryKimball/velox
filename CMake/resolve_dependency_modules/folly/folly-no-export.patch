@@ -57,3 +57,27 @@
 
  # Generate a pkg-config file so that downstream projects that don't use
  # CMake can depend on folly using pkg-config.
+@@ -573,6 +573,6 @@
+-file(
+-  GENERATE
+-  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/libfolly.pc
+-  INPUT ${CMAKE_CURRENT_BINARY_DIR}/libfolly.pc.gen
+-  ${target_arg}
+-)
++#file(
++#  GENERATE
++#  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/libfolly.pc
++#  INPUT ${CMAKE_CURRENT_BINARY_DIR}/libfolly.pc.gen
++#  ${target_arg}
++#)
+@@ -580,6 +580,6 @@
+-install(
+-  FILES ${CMAKE_CURRENT_BINARY_DIR}/libfolly.pc
+-  DESTINATION ${LIB_INSTALL_DIR}/pkgconfig
+-  COMPONENT dev
+-)
++#install(
++#  FILES ${CMAKE_CURRENT_BINARY_DIR}/libfolly.pc
++#  DESTINATION ${LIB_INSTALL_DIR}/pkgconfig
++#  COMPONENT dev
++#)
