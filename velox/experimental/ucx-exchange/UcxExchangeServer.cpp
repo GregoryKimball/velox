@@ -15,6 +15,7 @@
  */
 #include <rmm/cuda_stream.hpp>
 
+#include <cudf/utilities/error.hpp>
 #include <glog/logging.h>
 #include <rmm/cuda_stream_view.hpp>
 #include <functional>
@@ -57,6 +58,25 @@ serverStateNames() {
               {UcxExchangeServer::ServerState::Done, "Done"},
           };
   return kNames;
+}
+
+void prefetchManagedSendBuffer(void* data, std::size_t bytes) {
+  cudaPointerAttributes attributes{};
+  CUDF_CUDA_TRY(cudaPointerGetAttributes(&attributes, data));
+  if (attributes.type != cudaMemoryTypeManaged) {
+    return;
+  }
+
+  CUDF_CUDA_TRY(cudaSetDevice(attributes.device));
+  static thread_local rmm::cuda_stream prefetchStream;
+  const cudaMemLocation location{
+      cudaMemLocationTypeDevice, attributes.device};
+  CUDF_CUDA_TRY(cudaMemPrefetchAsync(
+      data, bytes, location, 0, prefetchStream.value()));
+  prefetchStream.synchronize();
+
+  VLOG(2) << "Prefetched managed UCX send buffer: bytes=" << bytes
+          << " device=" << attributes.device;
 }
 
 bool meetsCompressionMinimum(std::size_t bytes) {
@@ -1044,6 +1064,7 @@ void UcxExchangeServer::sendData() {
       const std::size_t sendBytes = compressedData
           ? compressedData->size()
           : dataCtx->data->gpu_data->size();
+      prefetchManagedSendBuffer(sendPtr, sendBytes);
       dataRequest_ = endpointRef_->endpoint_->tagSend(
           sendPtr,
           sendBytes,
