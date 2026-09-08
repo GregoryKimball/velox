@@ -41,10 +41,11 @@ base is:
 - 4,327 deletions
 - 16,151 changed lines
 
-The complete focused patch is stored in
-`upstreaming/main-to-pre-flow-control-snapshot-focused.patch`. It is retained
-as source evidence; it is not intended to be applied wholesale because it
-includes same-module drift.
+These numbers measure the raw focused tree comparison and are used only to
+estimate scope. The patch is not embedded in this branch because doing so
+would duplicate the implementation diff, inflate the PR by 21,982 lines, and
+include same-module drift. The source references above preserve the inputs
+needed to reproduce the comparison.
 
 ## Major upstreaming workstreams
 
