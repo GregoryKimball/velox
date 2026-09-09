@@ -40,7 +40,8 @@ TEST(ConfigTest, cudfConfig) {
       {CudfConfig::kCudfStreamingGroupbyCapacityMultiplier, "3.5"},
       {CudfConfig::kCudfAllowCpuFallback, "false"},
       {CudfConfig::kCudfBatchSizeMinThreshold, "123456"},
-      {CudfConfig::kCudfBatchSizeMinBytes, "2147483648"}};
+      {CudfConfig::kCudfBatchSizeMinBytes, "2147483648"},
+      {CudfConfig::kCudfHashJoinLoadFactor, "0.8"}};
 
   CudfConfig config;
   ASSERT_FALSE(config.streamingGroupbyEnabled);
@@ -56,6 +57,7 @@ TEST(ConfigTest, cudfConfig) {
   ASSERT_EQ(config.allowCpuFallback, false);
   ASSERT_EQ(config.batchSizeMinThreshold, 123'456);
   ASSERT_EQ(config.batchSizeMinBytes.value(), 2'147'483'648);
+  ASSERT_DOUBLE_EQ(config.hashJoinLoadFactor, 0.8);
 }
 
 TEST(ConfigTest, rejectsNonPositiveBatchConcatTargets) {

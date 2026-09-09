@@ -479,6 +479,14 @@ void CudfConfig::initialize(
         value);
     batchSizeMinBytes = targetBytes.value();
   }
+  if (config.find(kCudfHashJoinLoadFactor) != config.end()) {
+    hashJoinLoadFactor = folly::to<double>(config[kCudfHashJoinLoadFactor]);
+    VELOX_USER_CHECK(
+        hashJoinLoadFactor > 0.0 && hashJoinLoadFactor <= 1.0,
+        "{} must be in (0, 1], got {}",
+        kCudfHashJoinLoadFactor,
+        hashJoinLoadFactor);
+  }
   if (config.find(kCudfBatchSizeMaxThreshold) != config.end()) {
     batchSizeMaxThreshold =
         folly::to<int32_t>(config[kCudfBatchSizeMaxThreshold]);
