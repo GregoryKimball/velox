@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/expression/DateTruncFunction.h"
 #include "velox/experimental/cudf/expression/DecimalExpressionKernels.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
+#include "velox/experimental/cudf/expression/GeometryKernels.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluatorRegistry.h"
 #include "velox/experimental/cudf/expression/NullMask.h"
 
@@ -41,11 +42,15 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/datetime.hpp>
+#include <cudf/filling.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/hashing.hpp>
 #include <cudf/lists/count_elements.hpp>
+#include <cudf/lists/lists_column_view.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/replace.hpp>
+#include <cudf/reshape.hpp>
 #include <cudf/round.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
@@ -65,13 +70,18 @@
 #include <cudf/transform.hpp>
 #include <cudf/types.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/error.hpp>
+#include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/traits.hpp>
 
+#include <rmm/device_scalar.hpp>
 #include <rmm/device_uvector.hpp>
 
 #include <cctype>
 #include <cmath>
 #include <memory>
+
+#include <cmath>
 
 namespace facebook::velox::cudf_velox {
 
@@ -2047,6 +2057,350 @@ std::unique_ptr<cudf::column> RowConstructorFunction::makeOwnedColumn(
       holder);
 }
 
+
+/// GPU great-circle distance using cuSpatial's `haversine_distance` kernel
+/// (matching BingTileType::greatCircleDistance's radius constant). See
+/// GeometryKernels.cu's `haversineGreatCircleDistance` for why cuSpatial
+/// (rather than a hand-rolled AST formula) computes this, and for the note
+/// on haversine vs. the previous Vincenty/atan2 formulation: both are exact
+/// great-circle-distance formulas for a sphere and agree to floating-point
+/// precision away from antipodal points.
+class GreatCircleDistanceFunction : public CudfFunction {
+ public:
+  explicit GreatCircleDistanceFunction(const core::TypedExprPtr& expr) {
+    VELOX_CHECK_EQ(
+        expr->inputs().size(),
+        4,
+        "great_circle_distance expects 4 inputs (lat1, lon1, lat2, lon2)");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    auto lat1 = asView(inputColumns[0]);
+    auto lon1 = asView(inputColumns[1]);
+    auto lat2 = asView(inputColumns[2]);
+    auto lon2 = asView(inputColumns[3]);
+
+    return haversineGreatCircleDistance(
+        lat1, lon1, lat2, lon2, kEarthRadiusKm, stream, mr);
+  }
+
+ private:
+  static constexpr double kEarthRadiusKm = 6371.0088;
+};
+
+namespace {
+
+void throwIfInvalidGeometryType(
+    rmm::device_scalar<int32_t>& flag,
+    rmm::cuda_stream_view stream) {
+  if (flag.value(stream) != 0) {
+    VELOX_USER_FAIL("Invalid geometry input to ST_*");
+  }
+}
+
+class StXFunction : public CudfFunction {
+ public:
+  explicit StXFunction(const core::TypedExprPtr& expr) {
+    VELOX_CHECK_EQ(expr->inputs().size(), 1, "ST_X expects 1 input");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    rmm::device_scalar<int32_t> invalid(0, stream, mr);
+    auto out = extractPointCoordinate(
+        asView(inputColumns[0]), false, invalid.data(), stream, mr);
+    throwIfInvalidGeometryType(invalid, stream);
+    return out;
+  }
+};
+
+class StYFunction : public CudfFunction {
+ public:
+  explicit StYFunction(const core::TypedExprPtr& expr) {
+    VELOX_CHECK_EQ(expr->inputs().size(), 1, "ST_Y expects 1 input");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    rmm::device_scalar<int32_t> invalid(0, stream, mr);
+    auto out = extractPointCoordinate(
+        asView(inputColumns[0]), true, invalid.data(), stream, mr);
+    throwIfInvalidGeometryType(invalid, stream);
+    return out;
+  }
+};
+
+class StPointFunction : public CudfFunction {
+ public:
+  explicit StPointFunction(const core::TypedExprPtr& expr) {
+    VELOX_CHECK_EQ(expr->inputs().size(), 2, "ST_Point expects 2 inputs");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    return makePointGeometry(
+        asView(inputColumns[0]), asView(inputColumns[1]), stream, mr);
+  }
+};
+
+/// Phase-1 WKB POINT/POLYGON → Velox geometry blobs (SpatialBench Q1/Q8).
+class StGeomFromBinaryFunction : public CudfFunction {
+ public:
+  explicit StGeomFromBinaryFunction(const core::TypedExprPtr& expr) {
+    VELOX_CHECK_EQ(
+        expr->inputs().size(), 1, "ST_GeomFromBinary expects 1 input");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    rmm::device_scalar<int32_t> invalid(0, stream, mr);
+    auto out = wkbToVeloxGeometry(
+        asView(inputColumns[0]), invalid.data(), stream, mr);
+    throwIfInvalidGeometryType(invalid, stream);
+    return out;
+  }
+};
+
+/// Phase-1 ST_Distance: POINT–POINT, POINT–POLYGON column pairs, or POINT vs
+/// constant POLYGON/ENVELOPE (SpatialBench Q1/Q3/Q8).
+class StDistanceFunction : public CudfFunction {
+ public:
+  struct GpuPolygon {
+    rmm::device_uvector<double> xy;
+    rmm::device_uvector<int32_t> partEnds;
+    int32_t numParts{0};
+    int32_t numPoints{0};
+
+    GpuPolygon(
+        std::size_t xyCount,
+        std::size_t partCount,
+        rmm::cuda_stream_view stream,
+        rmm::device_async_resource_ref mr)
+        : xy(xyCount, stream, mr),
+          partEnds(partCount, stream, mr),
+          numParts(static_cast<int32_t>(partCount)),
+          numPoints(static_cast<int32_t>(xyCount / 2)) {}
+
+    DevicePolygonView view() const {
+      return DevicePolygonView{
+          xy.data(), partEnds.data(), numParts, numPoints};
+    }
+  };
+
+  StDistanceFunction(
+      const core::TypedExprPtr& expr,
+      memory::MemoryPool* pool) {
+    VELOX_CHECK_EQ(expr->inputs().size(), 2, "ST_Distance expects 2 inputs");
+    if (expr->inputs()[0]->isConstantKind()) {
+      initConstant(expr->inputs()[0], pool, /*polygonOnLeft=*/true);
+    } else if (expr->inputs()[1]->isConstantKind()) {
+      initConstant(expr->inputs()[1], pool, /*polygonOnLeft=*/false);
+    }
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    rmm::device_scalar<int32_t> invalid(0, stream, mr);
+
+    if (constPolygon_) {
+      VELOX_CHECK_EQ(inputColumns.size(), 1);
+      auto points = asView(inputColumns[0]);
+      auto out = pointToConstantPolygonDistance(
+          points, constPolygon_->view(), invalid.data(), stream, mr);
+      throwIfInvalidGeometryType(invalid, stream);
+      return out;
+    }
+
+    std::unique_ptr<cudf::column> leftCol;
+    std::unique_ptr<cudf::column> rightCol;
+    cudf::column_view leftView;
+    cudf::column_view rightView;
+
+    if (leftScalar_) {
+      VELOX_CHECK_EQ(inputColumns.size(), 1);
+      rightView = asView(inputColumns[0]);
+      leftCol = cudf::make_column_from_scalar(
+          *leftScalar_, rightView.size(), stream, mr);
+      leftView = leftCol->view();
+    } else if (rightScalar_) {
+      VELOX_CHECK_EQ(inputColumns.size(), 1);
+      leftView = asView(inputColumns[0]);
+      rightCol = cudf::make_column_from_scalar(
+          *rightScalar_, leftView.size(), stream, mr);
+      rightView = rightCol->view();
+    } else {
+      VELOX_CHECK_EQ(inputColumns.size(), 2);
+      leftView = asView(inputColumns[0]);
+      rightView = asView(inputColumns[1]);
+    }
+
+    auto out =
+        geometryDistance(leftView, rightView, invalid.data(), stream, mr);
+    throwIfInvalidGeometryType(invalid, stream);
+    return out;
+  }
+
+ private:
+  void initConstant(
+      const core::TypedExprPtr& constantExpr,
+      memory::MemoryPool* pool,
+      bool polygonOnLeft) {
+    auto vec = toConstantVector(constantExpr, pool);
+    VELOX_CHECK(!vec->isNullAt(0), "ST_Distance constant geometry is null");
+    auto sv = vec->as<SimpleVector<StringView>>()->valueAt(0);
+    std::string_view bytes(sv.data(), sv.size());
+    VELOX_CHECK(!bytes.empty(), "ST_Distance constant geometry is empty");
+
+    auto tag = static_cast<uint8_t>(bytes[0]);
+    constexpr uint8_t kPointTag = 0;
+    constexpr uint8_t kPolygonTag = 4;
+    constexpr uint8_t kEnvelopeTag = 7;
+
+    if (tag == kPolygonTag || tag == kEnvelopeTag) {
+      std::vector<double> xy;
+      std::vector<int32_t> partEnds;
+      VELOX_CHECK(
+          parseVeloxPolygon(bytes, xy, partEnds),
+          "ST_Distance GPU supports constant POLYGON/ENVELOPE only");
+      auto stream = cudf::get_default_stream(cudf::allow_default_stream);
+      auto mr = get_temp_mr();
+      auto poly =
+          std::make_shared<GpuPolygon>(xy.size(), partEnds.size(), stream, mr);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          poly->xy.data(),
+          xy.data(),
+          xy.size() * sizeof(double),
+          cudaMemcpyHostToDevice,
+          stream.value()));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          poly->partEnds.data(),
+          partEnds.data(),
+          partEnds.size() * sizeof(int32_t),
+          cudaMemcpyHostToDevice,
+          stream.value()));
+      stream.synchronize();
+      constPolygon_ = std::move(poly);
+      polygonOnLeft_ = polygonOnLeft;
+      VELOX_CHECK(
+          !polygonOnLeft_,
+          "ST_Distance GPU expects POINT column vs constant POLYGON (Q3 order)");
+      return;
+    }
+
+    VELOX_CHECK_EQ(
+        tag,
+        kPointTag,
+        "ST_Distance GPU constant must be POINT, POLYGON, or ENVELOPE");
+    if (polygonOnLeft) {
+      leftScalar_ = makeScalarFromConstantExpr(constantExpr, pool);
+    } else {
+      rightScalar_ = makeScalarFromConstantExpr(constantExpr, pool);
+    }
+  }
+
+  std::unique_ptr<cudf::scalar> leftScalar_;
+  std::unique_ptr<cudf::scalar> rightScalar_;
+  std::shared_ptr<GpuPolygon> constPolygon_;
+  bool polygonOnLeft_{false};
+};
+
+/// Build array(T) from N columns of T via interleave + fixed-size lists.
+/// Required for SpatialBench Q7: ST_LineString(ARRAY[...]).
+class ArrayConstructorFunction : public CudfFunction {
+ public:
+  explicit ArrayConstructorFunction(const core::TypedExprPtr& expr) {
+    VELOX_CHECK(
+        !expr->inputs().empty(),
+        "GPU array_constructor requires at least one argument");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK(!inputColumns.empty());
+    auto const numElements = static_cast<cudf::size_type>(inputColumns.size());
+    auto const numRows = asView(inputColumns[0]).size();
+
+    std::vector<cudf::column_view> views;
+    views.reserve(inputColumns.size());
+    for (auto& col : inputColumns) {
+      auto view = asView(col);
+      VELOX_CHECK_EQ(view.size(), numRows, "array_constructor size mismatch");
+      views.push_back(view);
+    }
+
+    auto interleaved =
+        cudf::interleave_columns(cudf::table_view{views}, stream, mr);
+
+    cudf::numeric_scalar<int32_t> init(0, true, stream, mr);
+    cudf::numeric_scalar<int32_t> step(numElements, true, stream, mr);
+    auto offsetsCol = cudf::sequence(numRows + 1, init, step, stream, mr);
+
+    auto nullMask =
+        cudf::create_null_mask(numRows, cudf::mask_state::ALL_VALID, stream, mr);
+    return cudf::make_lists_column(
+        numRows,
+        std::move(offsetsCol),
+        std::move(interleaved),
+        0,
+        std::move(nullMask));
+  }
+};
+
+/// Phase-1 ST_LineString(array(geometry)) for SpatialBench Q7.
+class StLineStringFunction : public CudfFunction {
+ public:
+  explicit StLineStringFunction(const core::TypedExprPtr& expr) {
+    VELOX_CHECK_EQ(expr->inputs().size(), 1, "ST_LineString expects 1 input");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    rmm::device_scalar<int32_t> invalid(0, stream, mr);
+    auto out = makeLineStringFromPointList(
+        asView(inputColumns[0]), invalid.data(), stream, mr);
+    throwIfInvalidGeometryType(invalid, stream);
+    return out;
+  }
+};
+
+/// Phase-1 ST_Length(linestring) for SpatialBench Q7.
+class StLengthFunction : public CudfFunction {
+ public:
+  explicit StLengthFunction(const core::TypedExprPtr& expr) {
+    VELOX_CHECK_EQ(expr->inputs().size(), 1, "ST_Length expects 1 input");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    rmm::device_scalar<int32_t> invalid(0, stream, mr);
+    auto out =
+        lineStringLength(asView(inputColumns[0]), invalid.data(), stream, mr);
+    throwIfInvalidGeometryType(invalid, stream);
+    return out;
+  }
+};
+
+} // namespace
+
 bool registerCudfFunction(
     const std::string& name,
     CudfFunctionFactory factory,
@@ -2738,6 +3092,122 @@ bool registerBuiltinFunctions(const std::string& prefix) {
 
   // Note: Spark and Presto functions are now registered separately via
   // registerSparkFunctions() and registerPrestoFunctions()
+
+  registerCudfFunction(
+      prefix + "great_circle_distance",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool* /*pool*/) {
+        return std::make_shared<GreatCircleDistanceFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("double")
+           .argumentType("double")
+           .argumentType("double")
+           .argumentType("double")
+           .argumentType("double")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "st_x",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool* /*pool*/) {
+        return std::make_shared<StXFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("double")
+           .argumentType("geometry")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "st_y",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool* /*pool*/) {
+        return std::make_shared<StYFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("double")
+           .argumentType("geometry")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "st_point",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool* /*pool*/) {
+        return std::make_shared<StPointFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("geometry")
+           .argumentType("double")
+           .argumentType("double")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "st_geomfrombinary",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool* /*pool*/) {
+        return std::make_shared<StGeomFromBinaryFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("geometry")
+           .argumentType("varbinary")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "st_distance",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool* pool) {
+        return std::make_shared<StDistanceFunction>(expr, pool);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("double")
+           .argumentType("geometry")
+           .argumentType("geometry")
+           .build()});
+
+  registerCudfFunction(
+      "array_constructor",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool* /*pool*/) {
+        return std::make_shared<ArrayConstructorFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .typeVariable("T")
+           .returnType("array(T)")
+           .argumentType("T")
+           .variableArity("T")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "st_linestring",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool* /*pool*/) {
+        return std::make_shared<StLineStringFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("geometry")
+           .argumentType("array(geometry)")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "st_length",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool* /*pool*/) {
+        return std::make_shared<StLengthFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("double")
+           .argumentType("geometry")
+           .build()});
+
   return true;
 }
 

@@ -59,6 +59,8 @@
 #include "velox/exec/NestedLoopJoinProbe.h"
 #include "velox/exec/OrderBy.h"
 #include "velox/exec/PartitionedOutput.h"
+#include "velox/exec/SpatialJoinBuild.h"
+#include "velox/exec/SpatialJoinProbe.h"
 #include "velox/exec/StreamingAggregation.h"
 #include "velox/exec/TableScan.h"
 #include "velox/exec/Task.h"
@@ -563,6 +565,108 @@ class NestedLoopJoinProbeAdapter : public CudfNestedLoopJoinBaseAdapter {
     result.push_back(
         std::make_unique<CudfNestedLoopJoinProbe>(
             operatorId, ctx, joinPlanNode));
+    return result;
+  }
+};
+
+class CudfSpatialJoinBaseAdapter : public OperatorAdapter {
+ public:
+  using OperatorAdapter::OperatorAdapter;
+
+  bool canRunOnGPU(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx) const override {
+    if (!canHandle(op)) {
+      return false;
+    }
+    auto join =
+        std::dynamic_pointer_cast<const core::SpatialJoinNode>(planNode);
+    if (!join ||
+        !core::SpatialJoinNode::isSupported(join->joinType()) ||
+        !CudfNestedLoopJoinProbe::isSupportedJoinType(join->joinType())) {
+      LOG_FALLBACK(
+          "SpatialJoin plan or join type is unsupported on GPU, PlanNode id: {}",
+          planNode->id());
+      return false;
+    }
+    if (join->joinCondition() &&
+        !canExprRunOnGpu(
+            join->joinCondition(), ctx->task->queryCtx().get(), op->pool())) {
+      LOG_FALLBACK(
+          "SpatialJoin filter cannot be evaluated by cuDF, PlanNode id: {}",
+          planNode->id());
+      return false;
+    }
+    return true;
+  }
+};
+
+class SpatialJoinBuildAdapter : public CudfSpatialJoinBaseAdapter {
+ public:
+  SpatialJoinBuildAdapter() : CudfSpatialJoinBaseAdapter("SpatialJoinBuild") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const exec::SpatialJoinBuild*>(op) != nullptr;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return false;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto spatialJoin =
+        std::dynamic_pointer_cast<const core::SpatialJoinNode>(planNode);
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(std::make_unique<CudfNestedLoopJoinBuild>(
+        operatorId, ctx, nestedLoopJoinFromSpatialJoin(spatialJoin)));
+    return result;
+  }
+};
+
+class SpatialJoinProbeAdapter : public CudfSpatialJoinBaseAdapter {
+ public:
+  SpatialJoinProbeAdapter() : CudfSpatialJoinBaseAdapter("SpatialJoinProbe") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const exec::SpatialJoinProbe*>(op) != nullptr;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto spatialJoin =
+        std::dynamic_pointer_cast<const core::SpatialJoinNode>(planNode);
+    SpatialEnvelopePrune prune;
+    prune.probeGeometryName = spatialJoin->probeGeometry()->name();
+    prune.buildGeometryName = spatialJoin->buildGeometry()->name();
+    if (spatialJoin->radius().has_value()) {
+      prune.buildRadiusName = spatialJoin->radius().value()->name();
+    }
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(std::make_unique<CudfNestedLoopJoinProbe>(
+        operatorId,
+        ctx,
+        nestedLoopJoinFromSpatialJoin(spatialJoin),
+        std::move(prune)));
     return result;
   }
 };
@@ -1246,6 +1350,8 @@ void registerAllOperatorAdapters() {
   registry.registerAdapter(std::make_unique<HashJoinProbeAdapter>());
   registry.registerAdapter(std::make_unique<NestedLoopJoinBuildAdapter>());
   registry.registerAdapter(std::make_unique<NestedLoopJoinProbeAdapter>());
+  registry.registerAdapter(std::make_unique<SpatialJoinBuildAdapter>());
+  registry.registerAdapter(std::make_unique<SpatialJoinProbeAdapter>());
   registry.registerAdapter(std::make_unique<OrderByAdapter>());
   registry.registerAdapter(std::make_unique<TopNAdapter>());
   registry.registerAdapter(std::make_unique<TopNRowNumberAdapter>());

@@ -28,6 +28,7 @@ add_library(
   DateTruncFunction.cpp
   DecimalExpressionKernels.cpp
   DecimalExpressionKernelsGpu.cu
+  GeometryKernels.cu
   ExpressionEvaluator.cpp
   JitExpression.cpp
   NullMask.cpp
@@ -46,6 +47,7 @@ target_link_libraries(
   PUBLIC cudf::cudf
   PRIVATE
     arrow
+    cuspatial::headers
     velox_common_base
     velox_cudf_expression_registry
     velox_cudf_vector
@@ -54,3 +56,8 @@ target_link_libraries(
 )
 
 target_compile_options(velox_cudf_expression PRIVATE -Wno-missing-field-initializers)
+# Device lambdas in GeometryKernels.cu need extended-lambda support.
+target_compile_options(
+  velox_cudf_expression
+  PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+)

@@ -300,7 +300,7 @@ if(${VELOX_ENABLE_DUCKDB})
   velox_resolve_dependency(DuckDB)
 endif()
 
-if(VELOX_ENABLE_FAISS)
+if(VELOX_ENABLE_FAISS OR VELOX_ENABLE_NIMBLE)
   velox_set_source(faiss)
   velox_resolve_dependency(faiss)
   if(NOT TARGET FAISS::faiss)
@@ -551,6 +551,10 @@ if(VELOX_ENABLE_WAVE OR VELOX_ENABLE_CUDF)
     set(VELOX_ENABLE_ARROW ON)
     velox_set_source(cudf)
     velox_resolve_dependency(cudf)
+    # Header-only cuSpatial algorithm kernels used by the cuDF geospatial
+    # functions (see CMake/resolve_dependency_modules/cuspatial.cmake for why
+    # this is header-only rather than a linked libcuspatial dependency).
+    include(cuspatial)
     if(TARGET aws-cpp-sdk-core)
       # Fix for AWS SDK CPP using hardcoded system curl instead of soft link to curl
       get_target_property(override_curl_lib aws-cpp-sdk-core INTERFACE_LINK_LIBRARIES)

@@ -16,8 +16,10 @@
 
 #pragma once
 
+#include "velox/experimental/cudf/exec/CudfJoin.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
+#include "velox/experimental/cudf/expression/GeometryKernels.h"
 #include "velox/experimental/cudf/expression/PrecomputeInstruction.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
@@ -32,10 +34,18 @@
 #include <rmm/cuda_stream_view.hpp>
 
 #include <memory>
+#include <optional>
+#include <string>
 
 namespace facebook::velox::cudf_velox {
 
 class CudaEvent;
+
+struct SpatialEnvelopePrune {
+  std::string probeGeometryName;
+  std::string buildGeometryName;
+  std::optional<std::string> buildRadiusName;
+};
 
 /// Coordinates data transfer from build to probe operators for nested loop
 /// join. Build operators accumulate batches, then one operator transfers them
@@ -176,7 +186,8 @@ class CudfNestedLoopJoinProbe : public CudfOperatorBase {
   CudfNestedLoopJoinProbe(
       int32_t operatorId,
       exec::DriverCtx* driverCtx,
-      std::shared_ptr<const core::NestedLoopJoinNode> joinNode);
+      std::shared_ptr<const core::NestedLoopJoinNode> joinNode,
+      std::optional<SpatialEnvelopePrune> spatialPrune = std::nullopt);
 
   void initialize() override;
 
@@ -249,6 +260,28 @@ class CudfNestedLoopJoinProbe : public CudfOperatorBase {
   // if buildStream_ was never fetched (e.g. build side never ran).
   void recordReadCompletion(rmm::cuda_stream_view probeStream);
 
+  /// Evaluates a join condition that isn't AST-representable (e.g. `probe.col
+  /// LIKE build.pattern`) by materializing the probe x build cross product
+  /// and running filterEvaluator_ over it. Returns (probeIndex, buildIndex)
+  /// pairs where the condition holds, matching cudf::conditional_inner_join's
+  /// output shape. `needBuildIndices=false` skips building the build-index
+  /// column for callers that don't need it (e.g. left semi project).
+  std::pair<std::unique_ptr<cudf::column>, std::unique_ptr<cudf::column>>
+  crossJoinConditionalIndices(
+      cudf::table_view probeTableView,
+      cudf::table_view buildView,
+      rmm::cuda_stream_view stream,
+      bool needBuildIndices = true);
+
+  void ensureSpatialIndex(rmm::cuda_stream_view stream);
+
+  std::pair<std::unique_ptr<cudf::column>, std::unique_ptr<cudf::column>>
+  spatialPruneConditionalIndices(
+      cudf::table_view probeTableView,
+      cudf::table_view buildView,
+      rmm::cuda_stream_view stream,
+      bool needBuildIndices);
+
   bool isLeftOrFullJoin() const {
     return joinType_ == core::JoinType::kLeft ||
         joinType_ == core::JoinType::kFull;
@@ -273,12 +306,15 @@ class CudfNestedLoopJoinProbe : public CudfOperatorBase {
   std::vector<PrecomputeInstruction> leftPrecomputeInstructions_;
   std::vector<PrecomputeInstruction> rightPrecomputeInstructions_;
 
-  // Output column mapping resolved by name from the output type.
-  // Handles arbitrary column ordering (e.g., {"b0", "p0"}).
-  std::vector<cudf::size_type> probeColumnIndicesToGather_;
-  std::vector<cudf::size_type> buildColumnIndicesToGather_;
-  std::vector<size_t> probeColumnOutputIndices_;
-  std::vector<size_t> buildColumnOutputIndices_;
+  CudfJoinOutputLayout outputLayout_;
+
+  // False when the join condition has a non-AST-representable
+  // sub-expression spanning both sides (see crossJoinConditionalIndices).
+  // In that case tree_/scalars_/*PrecomputeInstructions_ above are unused
+  // (left empty) and filterEvaluator_ below evaluates the whole condition
+  // instead.
+  bool useAstFilter_{true};
+  std::shared_ptr<CudfExpression> filterEvaluator_;
 
   // Probe and build types (cached for null column creation in left joins).
   RowTypePtr probeType_;
@@ -338,6 +374,12 @@ class CudfNestedLoopJoinProbe : public CudfOperatorBase {
   // Safe to reuse across calls since each call finishes using the current
   // recording (via waitOn()) before the next call re-records it.
   std::unique_ptr<CudaEvent> cudaEvent_;
+
+  std::optional<SpatialEnvelopePrune> spatialPrune_;
+  cudf::size_type probeGeomChannel_{0};
+  cudf::size_type buildGeomChannel_{0};
+  std::optional<cudf::size_type> buildRadiusChannel_;
+  std::optional<GeometryEnvelopeGrid> buildEnvelopeGrid_;
 };
 
 /// Creates CUDF nested loop join operators and bridges.
@@ -354,5 +396,8 @@ class CudfNestedLoopJoinBridgeTranslator
   /// Returns a supplier that creates CudfNestedLoopJoinBuild operators.
   exec::OperatorSupplier toOperatorSupplier(const core::PlanNodePtr& node);
 };
+
+std::shared_ptr<const core::NestedLoopJoinNode> nestedLoopJoinFromSpatialJoin(
+    const std::shared_ptr<const core::SpatialJoinNode>& spatialJoin);
 
 } // namespace facebook::velox::cudf_velox
