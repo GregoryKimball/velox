@@ -16,6 +16,11 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/expression/GeometryKernels.h"
+
+#include <cudf/column/column_factories.hpp>
+#include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
@@ -30,7 +35,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
+#include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using namespace facebook::velox;
@@ -78,6 +86,69 @@ std::string makeWkbPolygon(const std::vector<std::pair<double, double>>& ring) {
         wkb.data() + 13 + i * 16 + 8, &ring[i].second, sizeof(double));
   }
   return wkb;
+}
+
+std::unique_ptr<cudf::column> makeDeviceDoubles(
+    const std::vector<double>& values,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  auto column = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::FLOAT64},
+      static_cast<cudf::size_type>(values.size()),
+      cudf::mask_state::UNALLOCATED,
+      stream,
+      mr);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      column->mutable_view().data<double>(),
+      values.data(),
+      values.size() * sizeof(double),
+      cudaMemcpyHostToDevice,
+      stream.value()));
+  return column;
+}
+
+cudf_velox::GeometryEnvelopes makeEnvelopes(
+    const std::vector<double>& minX,
+    const std::vector<double>& minY,
+    const std::vector<double>& maxX,
+    const std::vector<double>& maxY,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  VELOX_CHECK_EQ(minX.size(), minY.size());
+  VELOX_CHECK_EQ(minX.size(), maxX.size());
+  VELOX_CHECK_EQ(minX.size(), maxY.size());
+  return {
+      makeDeviceDoubles(minX, stream, mr),
+      makeDeviceDoubles(minY, stream, mr),
+      makeDeviceDoubles(maxX, stream, mr),
+      makeDeviceDoubles(maxY, stream, mr)};
+}
+
+std::set<std::pair<int32_t, int32_t>> copyCandidatePairs(
+    cudf::column_view probe,
+    cudf::column_view build,
+    rmm::cuda_stream_view stream) {
+  VELOX_CHECK_EQ(probe.size(), build.size());
+  std::vector<int32_t> probeHost(probe.size());
+  std::vector<int32_t> buildHost(build.size());
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      probeHost.data(),
+      probe.data<int32_t>(),
+      probeHost.size() * sizeof(int32_t),
+      cudaMemcpyDeviceToHost,
+      stream.value()));
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      buildHost.data(),
+      build.data<int32_t>(),
+      buildHost.size() * sizeof(int32_t),
+      cudaMemcpyDeviceToHost,
+      stream.value()));
+  stream.synchronize();
+  std::set<std::pair<int32_t, int32_t>> result;
+  for (size_t i = 0; i < probeHost.size(); ++i) {
+    result.emplace(probeHost[i], buildHost[i]);
+  }
+  return result;
 }
 
 class CudfGeospatialTest : public testing::Test,
@@ -441,6 +512,72 @@ TEST_F(CudfGeospatialTest, stLineStringAllowsDuplicatePoints) {
   auto lengths = result->childAt(0)->asFlatVector<double>();
   ASSERT_EQ(lengths->size(), 1);
   EXPECT_NEAR(lengths->valueAt(0), 0.0, 1e-12);
+}
+
+TEST_F(CudfGeospatialTest, adaptiveQuadtreePrunesDispersedPoints) {
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  std::vector<double> x(1'024);
+  std::vector<double> y(1'024);
+  for (size_t i = 0; i < x.size(); ++i) {
+    x[i] = static_cast<double>(i) * 100.0;
+    y[i] = static_cast<double>((i * 313) % x.size()) * 100.0;
+  }
+  auto probe = makeEnvelopes(x, y, x, y, stream, mr);
+
+  std::vector<double> minX{
+      x[3] - 0.1, x[777] - 0.1, -10'000.0};
+  std::vector<double> minY{
+      y[3] - 0.1, y[777] - 0.1, -10'000.0};
+  std::vector<double> maxX{x[3] + 0.1, x[777] + 0.1, -9'999.0};
+  std::vector<double> maxY{y[3] + 0.1, y[777] + 0.1, -9'999.0};
+  auto build = makeEnvelopes(minX, minY, maxX, maxY, stream, mr);
+  auto index =
+      cudf_velox::buildGeometryEnvelopeGrid(std::move(build), stream, mr);
+
+  auto [probeIndices, buildIndices] =
+      cudf_velox::queryGeometryEnvelopeGrid(index, probe, stream, mr);
+  EXPECT_EQ(
+      copyCandidatePairs(
+          probeIndices->view(), buildIndices->view(), stream),
+      (std::set<std::pair<int32_t, int32_t>>{{3, 0}, {777, 1}}));
+}
+
+TEST_F(CudfGeospatialTest, adaptiveQuadtreeRetainsClusteredPoints) {
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  std::vector<double> x(512);
+  std::vector<double> y(512);
+  for (size_t i = 0; i < 508; ++i) {
+    x[i] = static_cast<double>(i) * 1.0e-6;
+    y[i] = x[i];
+  }
+  x[508] = y[508] = 100.0;
+  x[509] = y[509] = 200.0;
+  x[510] = y[510] = 300.0;
+  x[511] = y[511] = 400.0;
+  auto probe = makeEnvelopes(x, y, x, y, stream, mr);
+
+  auto build = makeEnvelopes(
+      {-1.0e-9, 99.5},
+      {-1.0e-9, 99.5},
+      {10.0e-6, 100.5},
+      {10.0e-6, 100.5},
+      stream,
+      mr);
+  auto index =
+      cudf_velox::buildGeometryEnvelopeGrid(std::move(build), stream, mr);
+  auto [probeIndices, buildIndices] =
+      cudf_velox::queryGeometryEnvelopeGrid(index, probe, stream, mr);
+  auto pairs =
+      copyCandidatePairs(probeIndices->view(), buildIndices->view(), stream);
+
+  std::set<std::pair<int32_t, int32_t>> expected;
+  for (int32_t i = 0; i <= 10; ++i) {
+    expected.emplace(i, 0);
+  }
+  expected.emplace(508, 1);
+  EXPECT_EQ(pairs, expected);
 }
 
 } // namespace

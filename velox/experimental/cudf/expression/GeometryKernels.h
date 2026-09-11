@@ -116,12 +116,21 @@ std::unique_ptr<cudf::column> lineStringLength(
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr);
 
+/// Great-circle distance between (lat1, lon1) and (lat2, lon2), computed via
+/// cuSpatial's header-only `cuspatial::haversine_distance` kernel (see
+/// GeometryKernels.cu for why cuSpatial is vendored header-only). Matches
+/// BingTileType::greatCircleDistance's radius constant by default (pass the
+/// same `radiusKm` used there). Result is null wherever any input is null.
+std::unique_ptr<cudf::column> haversineGreatCircleDistance(
+    cudf::column_view const& lat1,
+    cudf::column_view const& lon1,
+    cudf::column_view const& lat2,
+    cudf::column_view const& lon2,
+    double radiusKm,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+
 /// Per-row axis-aligned envelopes from Velox geometry STRING blobs.
-/// POINT → (x,x,y,y); POLYGON/LINESTRING/MULTI_* → embedded envelope @ byte 5;
-/// ENVELOPE → 4 doubles @ byte 1. Empty/NaN → null row.
-/// If expandBy has size == geometry.size(), expands each envelope by that
-/// row's radius (CPU SpatialJoinBuild::readEnvelope semantics). If expandBy
-/// is empty, uses constantExpandBy.
 struct GeometryEnvelopes {
   std::unique_ptr<cudf::column> minX;
   std::unique_ptr<cudf::column> minY;
@@ -137,28 +146,10 @@ GeometryEnvelopes extractGeometryEnvelopes(
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr);
 
-/// Cross-product envelope intersection: returns compacted (probeIndex,
-/// buildIndex) pairs where probe and (already-expanded) build envelopes
-/// intersect. Mirrors CPU SpatialIndex pruning before ST_Distance.
-std::pair<std::unique_ptr<cudf::column>, std::unique_ptr<cudf::column>>
-geometryEnvelopeCrossIntersectIndices(
-    GeometryEnvelopes const& probe,
-    GeometryEnvelopes const& build,
-    rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr);
-
-/// Uniform grid over build envelopes for O(candidates) probe queries.
-/// Takes ownership of `buildEnvelopes`.
+/// Build-side state for adaptive spatial pruning. The point quadtree is built
+/// per probe batch so cuSpatial can choose density-aware Morton leaves.
 struct GeometryEnvelopeGrid {
-  double originX{0};
-  double originY{0};
-  double invCellW{0};
-  double invCellH{0};
-  int32_t nCols{0};
-  int32_t nRows{0};
   GeometryEnvelopes envelopes;
-  std::unique_ptr<cudf::column> cellOffsets; // int32, nCells + 1
-  std::unique_ptr<cudf::column> cellBuildIndices; // size_type
 };
 
 GeometryEnvelopeGrid buildGeometryEnvelopeGrid(
@@ -166,8 +157,8 @@ GeometryEnvelopeGrid buildGeometryEnvelopeGrid(
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr);
 
-/// Probe the grid with probe envelopes; returns compacted (probeIdx, buildIdx)
-/// pairs that pass AABB intersection (same contract as SpatialIndex::query).
+/// Builds cuSpatial's adaptive quadtree over probe points, traverses it
+/// top-down with build envelopes, and returns exact AABB candidate pairs.
 std::pair<std::unique_ptr<cudf::column>, std::unique_ptr<cudf::column>>
 queryGeometryEnvelopeGrid(
     GeometryEnvelopeGrid const& grid,
