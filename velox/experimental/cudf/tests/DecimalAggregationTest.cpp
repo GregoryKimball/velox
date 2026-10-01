@@ -48,6 +48,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <array>
 #include <cstdlib>
 #include <limits>
 #include <optional>
@@ -182,6 +183,50 @@ std::unique_ptr<cudf::column> makeInt64Column(
       cudf::data_type{cudf::type_id::INT64}, values, valid, stream);
 }
 
+std::unique_ptr<cudf::column> makeDecimalStateColumn(
+    const std::vector<std::vector<char>>& payloads,
+    const std::vector<bool>* valid,
+    cuda::stream_ref stream) {
+  if (valid) {
+    VELOX_CHECK_EQ(valid->size(), payloads.size());
+  }
+  std::vector<int32_t> offsets(payloads.size() + 1, 0);
+  std::vector<char> chars;
+  for (size_t i = 0; i < payloads.size(); ++i) {
+    chars.insert(chars.end(), payloads[i].begin(), payloads[i].end());
+    offsets[i + 1] = static_cast<int32_t>(chars.size());
+  }
+
+  auto offsetsCol = makeFixedWidthColumn<int32_t>(
+      cudf::data_type{cudf::type_id::INT32}, offsets, nullptr, stream);
+  rmm::device_buffer charsBuffer(chars.size(), stream);
+  if (!chars.empty()) {
+    auto status = cudaMemcpyAsync(
+        charsBuffer.data(),
+        chars.data(),
+        chars.size(),
+        cudaMemcpyHostToDevice,
+        stream.get());
+    VELOX_CHECK_EQ(0, static_cast<int>(status));
+    stream.sync();
+  }
+
+  auto [nullMask, nullCount] =
+      makeNullMask(valid ? *valid : std::vector<bool>{}, stream);
+  return cudf::make_strings_column(
+      static_cast<cudf::size_type>(payloads.size()),
+      std::move(offsetsCol),
+      std::move(charsBuffer),
+      nullCount,
+      std::move(nullMask));
+}
+
+template <typename T>
+std::vector<char> objectBytes(const T& value) {
+  auto const* begin = reinterpret_cast<const char*>(&value);
+  return {begin, begin + sizeof(T)};
+}
+
 template <typename T>
 std::vector<T> copyColumnData(
     const cudf::column_view& view,
@@ -242,7 +287,10 @@ class CudfDecimalTest : public exec::test::OperatorTestBase {
     config.compactAggregationStateEnabled = true;
     previousDecimalGroupbyNarrowAccumulation_ =
         config.decimalGroupbyNarrowAccumulation;
+    previousCompactDecimalIntermediateState_ =
+        config.compactDecimalIntermediateState;
     config.decimalGroupbyNarrowAccumulation = true;
+    config.compactDecimalIntermediateState = false;
     // Ensure a CUDA device is selected and initialized (RMM asserts otherwise).
     int deviceCount = 0;
     auto status = cudaGetDeviceCount(&deviceCount);
@@ -259,8 +307,11 @@ class CudfDecimalTest : public exec::test::OperatorTestBase {
   }
 
   void TearDown() override {
-    CudfConfig::getInstance().decimalGroupbyNarrowAccumulation =
+    auto& config = CudfConfig::getInstance();
+    config.decimalGroupbyNarrowAccumulation =
         previousDecimalGroupbyNarrowAccumulation_;
+    config.compactDecimalIntermediateState =
+        previousCompactDecimalIntermediateState_;
     unregisterCudf();
     CudfConfig::getInstance().allowCpuFallback = false;
     CudfConfig::getInstance().compactAggregationStateEnabled = false;
@@ -276,6 +327,7 @@ class CudfDecimalTest : public exec::test::OperatorTestBase {
 
  private:
   bool previousDecimalGroupbyNarrowAccumulation_{false};
+  bool previousCompactDecimalIntermediateState_{false};
 };
 
 TEST_F(CudfDecimalTest, mixedWidthDecimalDivision) {
@@ -1457,7 +1509,9 @@ TEST_F(CudfDecimalTest, decimalNarrowRequestsRespectSliceNullsAndFlag) {
 
   for (const bool enabled : {false, true}) {
     SCOPED_TRACE(enabled);
-    CudfConfig::getInstance().decimalGroupbyNarrowAccumulation = enabled;
+    auto& config = CudfConfig::getInstance();
+    config.decimalGroupbyNarrowAccumulation = enabled;
+    config.compactDecimalIntermediateState = enabled;
     auto aggregators = toGroupbyAggregators(
         *plan, plan->step(), plan->outputType(), {nullptr, nullptr}, {});
     GroupbyRequestContext context;
@@ -1496,10 +1550,14 @@ TEST_F(CudfDecimalTest, decimalNarrowRequestsRespectSliceNullsAndFlag) {
       ASSERT_EQ(flat->size(), 1);
       ASSERT_FALSE(flat->isNullAt(0));
       auto bytes = flat->valueAt(0);
-      // Use the actual CPU consumer, not a test-side decoder. Safe narrowing
-      // must still emit its original 32-byte interchange state.
+      // Use the actual CPU consumer, not a test-side decoder. Compact output
+      // is possible only when the safety proof selects DECIMAL64.
       functions::aggregate::LongDecimalWithOverflowState cpu;
-      EXPECT_EQ(bytes.size(), cpu.serializedSize());
+      EXPECT_EQ(
+          bytes.size(),
+          enabled
+              ? functions::aggregate::kCompactDecimalIntermediateStateSize
+              : cpu.serializedSize());
       cpu.mergeWith(bytes);
       EXPECT_EQ(cpu.sum, int128_t{250});
       EXPECT_EQ(cpu.count, 3);
@@ -2409,6 +2467,131 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateDecimal64) {
   }
 }
 
+TEST_F(CudfDecimalTest, decimalCompactStateSupportsCpuGpuInterchange) {
+  using functions::aggregate::CompactDecimalIntermediateState;
+  using functions::aggregate::kCompactDecimalIntermediateStateSize;
+  using functions::aggregate::kLegacyDecimalIntermediateStateSize;
+  using functions::aggregate::LongDecimalWithOverflowState;
+
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  std::vector<int64_t> compactSums = {-500, 300};
+  std::vector<int64_t> compactCounts = {3, std::numeric_limits<int64_t>::max()};
+  auto compactSumCol =
+      makeDecimalColumn<int64_t>(compactSums, 2, nullptr, stream);
+  auto compactCountCol = makeInt64Column(compactCounts, nullptr, stream);
+  auto compactState = serializeDecimalSumState(
+      compactSumCol->view(), compactCountCol->view(), stream, mr, true);
+
+  cudf::strings_column_view compactStrings(compactState->view());
+  EXPECT_EQ(
+      compactStrings.chars_size(stream),
+      static_cast<int64_t>(compactSums.size()) *
+          kCompactDecimalIntermediateStateSize);
+
+  auto veloxState = with_arrow::toVeloxColumn(
+      cudf::table_view{{compactState->view()}},
+      pool(),
+      ROW({{"s", VARBINARY()}}),
+      "s",
+      stream,
+      mr);
+  auto* compactVector = veloxState->childAt(0)->as<FlatVector<StringView>>();
+  ASSERT_NE(compactVector, nullptr);
+  for (size_t i = 0; i < compactSums.size(); ++i) {
+    LongDecimalWithOverflowState cpuState;
+    cpuState.mergeWith(compactVector->valueAt(i));
+    EXPECT_EQ(cpuState.sum, static_cast<int128_t>(compactSums[i]));
+    EXPECT_EQ(cpuState.count, compactCounts[i]);
+  }
+
+  LongDecimalWithOverflowState cpuLegacy;
+  cpuLegacy.sum = (static_cast<int128_t>(1) << 70) + 7;
+  cpuLegacy.count = 5;
+  std::array<char, kLegacyDecimalIntermediateStateSize> legacyBytes{};
+  StringView legacySerialized(legacyBytes.data(), legacyBytes.size());
+  cpuLegacy.serialize(legacySerialized);
+  auto legacyState = makeDecimalStateColumn(
+      {std::vector<char>(legacyBytes.begin(), legacyBytes.end())},
+      nullptr,
+      stream);
+
+  auto mixed = cudf::concatenate(
+      std::vector<cudf::column_view>{compactState->view(), legacyState->view()},
+      stream,
+      mr);
+  auto decoded = deserializeDecimalSumState(mixed->view(), 2, stream);
+  auto decodedSums = copyColumnData<__int128_t>(decoded.sum->view(), stream);
+  auto decodedCounts = copyColumnData<int64_t>(decoded.count->view(), stream);
+  ASSERT_EQ(decodedSums.size(), 3);
+  EXPECT_EQ(decodedSums[0], static_cast<int128_t>(compactSums[0]));
+  EXPECT_EQ(decodedSums[1], static_cast<int128_t>(compactSums[1]));
+  EXPECT_EQ(decodedSums[2], cpuLegacy.sum);
+  EXPECT_EQ(decodedCounts[0], compactCounts[0]);
+  EXPECT_EQ(decodedCounts[1], compactCounts[1]);
+  EXPECT_EQ(decodedCounts[2], cpuLegacy.count);
+}
+
+TEST_F(CudfDecimalTest, decimalCompactStateHandlesSlicesNullsAndInt64Offsets) {
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  ScopedEnvVar enableLargeStrings("LIBCUDF_LARGE_STRINGS_ENABLED", "1");
+  ScopedEnvVar threshold("LIBCUDF_LARGE_STRINGS_THRESHOLD", "1");
+
+  std::vector<int64_t> sums = {111, 200, 0, -300, 444};
+  std::vector<int64_t> counts = {1, 2, 0, 3, 4};
+  std::vector<bool> valid = {true, true, false, true, true};
+  auto sumCol = makeDecimalColumn<int64_t>(sums, 2, &valid, stream);
+  auto countCol = makeInt64Column(counts, nullptr, stream);
+  auto state = serializeDecimalSumState(
+      sumCol->view(), countCol->view(), stream, mr, true);
+  cudf::strings_column_view strings(state->view());
+  EXPECT_EQ(strings.offsets().type().id(), cudf::type_id::INT64);
+
+  auto slices = cudf::slice(state->view(), {1, 4});
+  ASSERT_EQ(slices.size(), 1);
+  ASSERT_EQ(slices.front().offset(), 1);
+  auto decoded = deserializeDecimalSumState(slices.front(), 2, stream);
+  auto decodedSums = copyColumnData<__int128_t>(decoded.sum->view(), stream);
+  auto decodedCounts = copyColumnData<int64_t>(decoded.count->view(), stream);
+  auto decodedMask = copyNullMask(decoded.sum->view(), stream);
+
+  ASSERT_EQ(decodedSums.size(), 3);
+  EXPECT_TRUE(isValidAt(decodedMask, 0));
+  EXPECT_FALSE(isValidAt(decodedMask, 1));
+  EXPECT_TRUE(isValidAt(decodedMask, 2));
+  EXPECT_EQ(decodedSums[0], static_cast<int128_t>(200));
+  EXPECT_EQ(decodedCounts[0], 2);
+  EXPECT_EQ(decodedSums[2], static_cast<int128_t>(-300));
+  EXPECT_EQ(decodedCounts[2], 3);
+}
+
+TEST_F(CudfDecimalTest, decimalCompactStateRejectsMalformedRowsInRelease) {
+  using functions::aggregate::CompactDecimalIntermediateState;
+
+  auto stream = cudf::get_default_stream();
+  CompactDecimalIntermediateState missingMarker{3, 10};
+  auto badMarker =
+      makeDecimalStateColumn({objectBytes(missingMarker)}, nullptr, stream);
+  VELOX_ASSERT_THROW(
+      deserializeDecimalSumState(badMarker->view(), 2, stream),
+      "requires every non-null row to be a 16-byte marked compact or 32-byte legacy state");
+
+  auto badWidth =
+      makeDecimalStateColumn({std::vector<char>(24, 0)}, nullptr, stream);
+  VELOX_ASSERT_THROW(
+      deserializeDecimalSumState(badWidth->view(), 2, stream),
+      "Decimal sum state has an invalid payload size");
+
+  // The total of 8 + 24 bytes passes the aggregate payload check, so only the
+  // per-row width check can reject it.
+  auto badRowWidths = makeDecimalStateColumn(
+      {std::vector<char>(8, 0), std::vector<char>(24, 0)}, nullptr, stream);
+  VELOX_ASSERT_THROW(
+      deserializeDecimalSumState(badRowWidths->view(), 2, stream),
+      "requires every non-null row to be a 16-byte marked compact or 32-byte legacy state");
+}
+
 TEST_F(CudfDecimalTest, decimalDeserializeSumStateDecimal128) {
   auto stream = cudf::get_default_stream();
   auto mr = cudf::get_current_device_resource_ref();
@@ -2440,11 +2623,10 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateDecimal128) {
   }
 }
 
-// Reproduces the Q18 failure scenario: serializes a decimal sum state with
-// partial nulls, round-trips through Arrow (which compacts null rows to 0-byte
-// payloads), then deserializes. Without the null-count fix in
-// deserializeDecimalSumState, the payload size check would fire because
-// chars_size == (numRows - nullCount) * 32, not numRows * 32.
+// Reproduces the Q18 failure scenario: a decimal sum state with partial nulls
+// round-trips through Arrow, which compacts null rows to zero-byte payloads.
+// The decoder must use each row offset and skip null payloads rather than
+// assuming a fixed stride.
 TEST_F(CudfDecimalTest, decimalDeserializeSumStatePartialNullCompact) {
   auto stream = cudf::get_default_stream();
   auto mr = cudf::get_current_device_resource_ref();
@@ -2472,11 +2654,11 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStatePartialNullCompact) {
   auto compactTable = with_arrow::toCudfTable(veloxRow, pool(), stream, mr);
   auto compactStateView = compactTable->view().column(0);
 
-  // Verify the column now has the compact layout.
+  // Verify Arrow removed the null row payload from the legacy layout.
   cudf::strings_column_view strings(compactStateView);
   EXPECT_LT(
       strings.chars_size(stream),
-      static_cast<int64_t>(sums.size()) * 32); // 32 == kDecimalSumStateSize
+      static_cast<int64_t>(sums.size()) * 32); // legacy state width
 
   auto result = deserializeDecimalSumState(compactStateView, 2, stream);
 
@@ -2588,8 +2770,7 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateArrowCompactedSlice) {
 // serializeDecimalSumState and so keeps a 32-byte payload for null rows -- with
 // each newly arrived batch, which was round tripped through velox and so has
 // its null rows compacted to 0 bytes. The concatenated state column mixes both
-// encodings, so its payload size is neither numRows * 32 nor
-// (numRows - nullCount) * 32 and a two-way equality check rejects it.
+// null encodings. The decoder must accept both payload widths per row.
 TEST_F(CudfDecimalTest, decimalDeserializeSumStateMixedNullEncodings) {
   auto stream = cudf::get_default_stream();
   auto mr = cudf::get_current_device_resource_ref();
@@ -2633,7 +2814,7 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateMixedNullEncodings) {
   EXPECT_EQ(nullCount, 2);
   EXPECT_GT(
       mixedStrings.chars_size(stream),
-      (numRows - nullCount) * 32); // 32 == kDecimalSumStateSize
+      (numRows - nullCount) * 32); // legacy state width
   EXPECT_LT(mixedStrings.chars_size(stream), numRows * 32);
 
   auto result = deserializeDecimalSumState(mixed->view(), 2, stream);
@@ -2794,8 +2975,9 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateRejectsInvalidRowWidth) {
   auto stream = cudf::get_default_stream();
   auto mr = cudf::get_current_device_resource_ref();
 
-  // The total payload size is valid, but neither row contains a complete
-  // serialized state. This exercises the per-row check rather than the
+  // The total payload size is valid, but neither row contains a valid
+  // serialized state: the 16-byte row lacks the compact marker and 48 bytes is
+  // not a state width. This exercises the per-row check rather than the
   // aggregate payload-size check.
   auto offsetsCol = makeFixedWidthColumn<int32_t>(
       cudf::data_type{cudf::type_id::INT32}, {0, 16, 64}, nullptr, stream);
@@ -2809,7 +2991,7 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateRejectsInvalidRowWidth) {
 
   VELOX_ASSERT_THROW(
       deserializeDecimalSumState(stateCol->view(), 2, stream),
-      "Decimal sum state requires every non-null row to be 32 bytes");
+      "Decimal sum state requires every non-null row to be a 16-byte marked compact or 32-byte legacy state");
 }
 
 TEST_F(CudfDecimalTest, decimalDeserializeSumStateRejectsMisalignedRow) {
@@ -2831,7 +3013,7 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateRejectsMisalignedRow) {
   auto status = cudaMemcpyAsync(
       static_cast<uint8_t*>(charsBuf.data()) + 4,
       alignedStrings.chars_begin(stream),
-      32, // kDecimalSumStateSize
+      32, // legacy state width
       cudaMemcpyDeviceToDevice,
       stream.get());
   VELOX_CHECK_EQ(0, static_cast<int>(status));
@@ -2846,7 +3028,7 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateRejectsMisalignedRow) {
 
   VELOX_ASSERT_THROW(
       deserializeDecimalSumState(stateCol->view(), 2, stream),
-      "Decimal sum state requires every non-null row to be 32 bytes and 8-byte aligned");
+      "Decimal sum state requires every non-null row to be a 16-byte marked compact or 32-byte legacy state, 8-byte aligned");
 }
 
 TEST_F(CudfDecimalTest, decimalSerializeSumStateUsesInt64OffsetsWhenEnabled) {

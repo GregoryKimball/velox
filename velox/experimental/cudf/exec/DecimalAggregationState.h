@@ -66,13 +66,16 @@ DecimalSumStateColumns deserializeDecimalSumState(
  * @param countCol per-row INT64 partial row counts.
  * @param stream CUDA stream for device work.
  * @param mr memory resource for allocated columns.
+ * @param compactDecimal64 emit the marked 16-byte form for DECIMAL64 sums;
+ *        DECIMAL128 sums always retain the historical 32-byte form.
  * @return STRING column of serialized state.
  */
 std::unique_ptr<cudf::column> serializeDecimalSumState(
     const cudf::column_view& sumCol,
     const cudf::column_view& countCol,
     cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr);
+    rmm::device_async_resource_ref mr,
+    bool compactDecimal64 = false);
 
 /**
  * Finalizes AVG from intermediate SUM state: divides each sum by its count on

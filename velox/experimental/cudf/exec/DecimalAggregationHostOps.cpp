@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationHostOps.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationState.h"
@@ -67,7 +68,12 @@ std::unique_ptr<cudf::column> serializeDecimalPartialOrIntermediateState(
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   count = castCountColumnToInt64(std::move(count), stream);
-  return serializeDecimalSumState(sum->view(), count->view(), stream, mr);
+  return serializeDecimalSumState(
+      sum->view(),
+      count->view(),
+      stream,
+      mr,
+      CudfConfig::getInstance().compactDecimalIntermediateState);
 }
 
 std::unique_ptr<cudf::column> finalizeDecimalAverage(

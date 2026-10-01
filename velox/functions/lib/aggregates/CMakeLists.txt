@@ -33,6 +33,7 @@ velox_add_library(
   Compare.h
   CovarianceAggregatesBase.h
   DecimalAggregate.h
+  DecimalIntermediateState.h
   MinMaxAggregateBase.h
   MinMaxByAggregatesBase.h
   SetBaseAggregate.h

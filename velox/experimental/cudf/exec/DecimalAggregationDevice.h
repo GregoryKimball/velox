@@ -15,6 +15,8 @@
  */
 #pragma once
 
+#include "velox/functions/lib/aggregates/DecimalIntermediateState.h"
+
 #include <cudf/column/column_view.hpp>
 #include <cudf/types.hpp>
 
@@ -30,10 +32,8 @@
 
 namespace facebook::velox::cudf_velox::detail {
 
-// Size in bytes of each row's packed decimal SUM intermediate state in the
-// strings payload (count, overflow placeholder, and 128-bit sum split into
-// words).
-constexpr size_t kDecimalSumStateSize = 32;
+using functions::aggregate::kCompactDecimalIntermediateStateSize;
+using functions::aggregate::kLegacyDecimalIntermediateStateSize;
 
 /**
  * Reduces a DECIMAL64 column directly into one DECIMAL128 sum and one INT64
@@ -47,18 +47,20 @@ void reduceDecimal64SumCount(
     rmm::device_async_resource_ref mr);
 
 /**
- * Writes strings-style prefix offsets: offset[i] == i * kDecimalSumStateSize.
+ * Writes strings-style prefix offsets: offset[i] == i * stateSize.
  *
  * @param offsetType INT32 or INT64; selects offset storage width via
  *        cudf::type_dispatcher.
  * @param offsetsView output offsets column of numRows + 1 elements.
  * @param numRows number of payload rows.
+ * @param stateSize fixed payload width for this output column.
  * @param stream CUDA stream for the launch.
  */
 void fillOffsetsForDecimalSumState(
     cudf::type_id offsetType,
     cudf::mutable_column_view offsetsView,
     cudf::size_type numRows,
+    size_t stateSize,
     cuda::stream_ref stream);
 
 /**
@@ -73,6 +75,8 @@ void fillOffsetsForDecimalSumState(
  * @param offsetsView per-row byte offsets into chars.
  * @param chars output payload buffer.
  * @param numRows number of rows.
+ * @param compactDecimal64 when true, DECIMAL64 sums use the marked 16-byte
+ *        representation. DECIMAL128 always uses the legacy representation.
  * @param stream CUDA stream for the launch.
  */
 void packDecimalSumState(
@@ -83,6 +87,7 @@ void packDecimalSumState(
     cudf::column_view offsetsView,
     uint8_t* chars,
     cudf::size_type numRows,
+    bool compactDecimal64,
     cuda::stream_ref stream);
 
 /**

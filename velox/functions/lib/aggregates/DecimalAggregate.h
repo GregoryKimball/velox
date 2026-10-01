@@ -18,6 +18,7 @@
 
 #include "velox/common/base/IOUtils.h"
 #include "velox/exec/Aggregate.h"
+#include "velox/functions/lib/aggregates/DecimalIntermediateState.h"
 #include "velox/type/HugeInt.h"
 #include "velox/vector/FlatVector.h"
 
@@ -32,6 +33,19 @@ namespace facebook::velox::functions::aggregate {
 struct LongDecimalWithOverflowState {
  public:
   void mergeWith(const StringView& serializedData) {
+    if (serializedData.size() == kCompactDecimalIntermediateStateSize) {
+      common::InputByteStream compactStream(serializedData.data());
+      auto const taggedCount = compactStream.read<uint64_t>();
+      VELOX_CHECK_EQ(
+          taggedCount & kCompactDecimalIntermediateStateTagMask,
+          kCompactDecimalIntermediateStateTag,
+          "Invalid compact decimal intermediate-state marker");
+      count += static_cast<int64_t>(
+          taggedCount & kCompactDecimalIntermediateStateCountMask);
+      overflow += DecimalUtil::addWithOverflow(
+          sum, static_cast<int128_t>(compactStream.read<int64_t>()), sum);
+      return;
+    }
     VELOX_CHECK_EQ(serializedData.size(), serializedSize());
     auto serialized = serializedData.data();
     common::InputByteStream stream(serialized);
@@ -60,7 +74,8 @@ struct LongDecimalWithOverflowState {
    *            = 8 + 8 + 16 = 32.
    */
   static constexpr size_t serializedSize() {
-    return sizeof(int64_t) * 4;
+    static_assert(sizeof(int64_t) * 4 == kLegacyDecimalIntermediateStateSize);
+    return kLegacyDecimalIntermediateStateSize;
   }
 
   int128_t sum{0};

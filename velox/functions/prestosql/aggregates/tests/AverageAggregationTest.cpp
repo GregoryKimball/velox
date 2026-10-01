@@ -22,6 +22,8 @@
 #include "velox/parse/TypeResolver.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
+#include <array>
+
 using namespace facebook::velox::exec::test;
 using namespace facebook::velox::functions::aggregate::test;
 
@@ -437,6 +439,56 @@ TEST_F(AverageAggregationTest, decimalAccumulator) {
   ASSERT_EQ(mergedAccumulator.count, accumulator.count * 2);
   ASSERT_EQ(mergedAccumulator.overflow, accumulator.overflow * 2);
   delete[] buffer;
+}
+
+TEST_F(AverageAggregationTest, decimalCompactAccumulatorCompatibility) {
+  using functions::aggregate::CompactDecimalIntermediateState;
+  using functions::aggregate::kCompactDecimalIntermediateStateTag;
+  using functions::aggregate::kLegacyDecimalIntermediateStateSize;
+
+  CompactDecimalIntermediateState compact{
+      kCompactDecimalIntermediateStateTag | uint64_t{3}, -500};
+  StringView compactSerialized(
+      reinterpret_cast<const char*>(&compact), sizeof(compact));
+
+  functions::aggregate::LongDecimalWithOverflowState merged;
+  merged.mergeWith(compactSerialized);
+  EXPECT_EQ(merged.sum, static_cast<int128_t>(-500));
+  EXPECT_EQ(merged.count, 3);
+  EXPECT_EQ(merged.overflow, 0);
+
+  functions::aggregate::LongDecimalWithOverflowState legacy;
+  legacy.sum = 1'000;
+  legacy.count = 4;
+  legacy.overflow = 1;
+  std::array<char, kLegacyDecimalIntermediateStateSize> legacyBytes{};
+  StringView legacySerialized(legacyBytes.data(), legacyBytes.size());
+  legacy.serialize(legacySerialized);
+  merged.mergeWith(legacySerialized);
+  EXPECT_EQ(merged.sum, static_cast<int128_t>(500));
+  EXPECT_EQ(merged.count, 7);
+  EXPECT_EQ(merged.overflow, 1);
+
+  std::array<char, kLegacyDecimalIntermediateStateSize> outputBytes{};
+  StringView output(outputBytes.data(), outputBytes.size());
+  merged.serialize(output);
+  functions::aggregate::LongDecimalWithOverflowState roundTrip;
+  roundTrip.mergeWith(output);
+  EXPECT_EQ(roundTrip.sum, merged.sum);
+  EXPECT_EQ(roundTrip.count, merged.count);
+  EXPECT_EQ(roundTrip.overflow, merged.overflow);
+
+  compact.taggedCount = 3;
+  VELOX_ASSERT_THROW(
+      functions::aggregate::LongDecimalWithOverflowState{}.mergeWith(
+          compactSerialized),
+      "Invalid compact decimal intermediate-state marker");
+
+  std::array<char, 24> malformedWidth{};
+  StringView malformed(malformedWidth.data(), malformedWidth.size());
+  VELOX_ASSERT_THROW(
+      functions::aggregate::LongDecimalWithOverflowState{}.mergeWith(malformed),
+      "serializedData.size()");
 }
 
 TEST_F(AverageAggregationTest, avgDecimal) {

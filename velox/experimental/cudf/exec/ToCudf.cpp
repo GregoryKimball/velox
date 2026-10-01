@@ -515,6 +515,10 @@ void CudfConfig::initialize(
     decimalGroupbyNarrowAccumulation =
         folly::to<bool>(config[kCudfDecimalGroupbyNarrowAccumulation]);
   }
+  if (config.find(kCudfCompactDecimalIntermediateState) != config.end()) {
+    compactDecimalIntermediateState =
+        folly::to<bool>(config[kCudfCompactDecimalIntermediateState]);
+  }
   if (config.find(kCudfFunctionNamePrefix) != config.end()) {
     functionNamePrefix = config[kCudfFunctionNamePrefix];
   }

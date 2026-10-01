@@ -60,6 +60,8 @@ struct CudfConfig {
       "cudf.compact_aggregation_state_enabled"};
   static constexpr const char* kCudfDecimalGroupbyNarrowAccumulation{
       "cudf.decimal_groupby_narrow_accumulation"};
+  static constexpr const char* kCudfCompactDecimalIntermediateState{
+      "cudf.compact_decimal_intermediate_state"};
   static constexpr const char* kCudfTimestampUnit{"cudf.timestamp_unit"};
   static constexpr const char* kUcxExchange{"cudf.exchange"};
   static constexpr const char* kUcxxErrorHandling{"ucxx.error_handling"};
@@ -200,6 +202,11 @@ struct CudfConfig {
   /// Narrow raw decimal groupby SUM/AVG accumulation only after proving every
   /// possible group sum fits INT64. Intermediate and final merges stay INT128.
   bool decimalGroupbyNarrowAccumulation{false};
+
+  /// Emit the marked 16-byte intermediate state for eligible DECIMAL64 SUM
+  /// and AVG partial results. The historical 32-byte state remains the default
+  /// and DECIMAL128 results always retain that representation.
+  bool compactDecimalIntermediateState{false};
 
   /// Minimum rows to accumulate before GPU-side concatenation (default 100k).
   /// Applies when batchSizeMinBytes is unset, and always to zero-column

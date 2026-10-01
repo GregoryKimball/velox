@@ -45,7 +45,7 @@ namespace {
 // is interchangeable between CPU and GPU aggregation.
 // TODO: Track int128 overflow as the CPU does (DecimalUtil::addWithOverflow);
 // the `overflow` field is reserved for that and is always 0 until then.
-struct DecimalSumState {
+struct LegacyDecimalSumState {
   int64_t count; // count of non-null input rows aggregated
   int64_t overflow; // net int128 carries (CPU parity); always 0 on GPU for now
   uint64_t lower; // lower 64 bits of the decimal sum
@@ -87,7 +87,14 @@ struct StoreDecimalSumCount {
   }
 };
 
-static_assert(sizeof(DecimalSumState) == detail::kDecimalSumStateSize);
+using functions::aggregate::CompactDecimalIntermediateState;
+using functions::aggregate::kCompactDecimalIntermediateStateCountMask;
+using functions::aggregate::kCompactDecimalIntermediateStateTag;
+using functions::aggregate::kCompactDecimalIntermediateStateTagMask;
+
+static_assert(
+    sizeof(LegacyDecimalSumState) ==
+    detail::kLegacyDecimalIntermediateStateSize);
 
 __device__ __forceinline__ void
 splitToWords(int64_t value, int64_t& upper, uint64_t& lower) {
@@ -104,9 +111,10 @@ splitToWords(__int128_t value, int64_t& upper, uint64_t& lower) {
 template <typename OffsetT>
 struct FillOffsetsFunctor {
   cuda::std::span<OffsetT> offsets;
+  size_t stateSize;
 
   __device__ void operator()(cudf::size_type idx) const {
-    int64_t offset = static_cast<int64_t>(idx) * detail::kDecimalSumStateSize;
+    int64_t offset = static_cast<int64_t>(idx) * stateSize;
     offsets[idx] = static_cast<OffsetT>(offset);
   }
 };
@@ -117,10 +125,23 @@ struct PackStateFunctor {
   cuda::std::span<const int64_t> counts;
   cuda::std::span<const OffsetT> offsets;
   uint8_t* chars;
+  bool compactDecimal64;
 
   __device__ void operator()(cudf::size_type idx) const {
     int64_t offset = static_cast<int64_t>(offsets[idx]);
-    auto* state = reinterpret_cast<DecimalSumState*>(chars + offset);
+    if constexpr (std::same_as<SumT, int64_t>) {
+      if (compactDecimal64) {
+        auto* state =
+            reinterpret_cast<CompactDecimalIntermediateState*>(chars + offset);
+        state->taggedCount = counts[idx] < 0
+            ? 0
+            : kCompactDecimalIntermediateStateTag |
+                static_cast<uint64_t>(counts[idx]);
+        state->sum = sums[idx];
+        return;
+      }
+    }
+    auto* state = reinterpret_cast<LegacyDecimalSumState*>(chars + offset);
     int64_t upper;
     uint64_t lower;
     splitToWords(sums[idx], upper, lower);
@@ -142,17 +163,34 @@ struct UnpackStateFunctor {
       return;
     }
     auto const serialized = state.element<cudf::string_view>(idx);
+    auto const width = static_cast<size_t>(serialized.size_bytes());
     auto const isAligned = reinterpret_cast<std::uintptr_t>(serialized.data()) %
-            alignof(DecimalSumState) ==
+            alignof(LegacyDecimalSumState) ==
         0;
-    if (serialized.size_bytes() !=
-            static_cast<cudf::size_type>(detail::kDecimalSumStateSize) ||
-        !isAligned) {
+    if (!isAligned) {
+      atomicOr(invalidStateFlag, 1);
+      return;
+    }
+    if (width == detail::kCompactDecimalIntermediateStateSize) {
+      auto const* packed =
+          reinterpret_cast<const CompactDecimalIntermediateState*>(
+              serialized.data());
+      if ((packed->taggedCount & kCompactDecimalIntermediateStateTagMask) !=
+          kCompactDecimalIntermediateStateTag) {
+        atomicOr(invalidStateFlag, 1);
+        return;
+      }
+      counts[idx] = static_cast<int64_t>(
+          packed->taggedCount & kCompactDecimalIntermediateStateCountMask);
+      sums[idx] = static_cast<__int128_t>(packed->sum);
+      return;
+    }
+    if (width != detail::kLegacyDecimalIntermediateStateSize) {
       atomicOr(invalidStateFlag, 1);
       return;
     }
     auto const* packed =
-        reinterpret_cast<const DecimalSumState*>(serialized.data());
+        reinterpret_cast<const LegacyDecimalSumState*>(serialized.data());
     counts[idx] = packed->count;
     sums[idx] = (static_cast<__int128_t>(packed->upper) << 64) | packed->lower;
   }
@@ -314,6 +352,7 @@ concept ValidDecimalPackStorageTypes =
 struct fillOffsetsForDecimalSumStateKernel {
   cudf::mutable_column_view offsetsView;
   cudf::size_type numRows;
+  size_t stateSize;
   cuda::stream_ref stream;
 
   template <typename OffsetT>
@@ -322,8 +361,11 @@ struct fillOffsetsForDecimalSumStateKernel {
     launchDeviceFor(
         numRows + 1,
         [&] {
-          return FillOffsetsFunctor<OffsetT>{cuda::std::span<OffsetT>{
-              offsetsView.data<OffsetT>(), static_cast<size_t>(numRows) + 1}};
+          return FillOffsetsFunctor<OffsetT>{
+              cuda::std::span<OffsetT>{
+                  offsetsView.data<OffsetT>(),
+                  static_cast<size_t>(numRows) + 1},
+              stateSize};
         },
         stream);
   }
@@ -370,6 +412,7 @@ struct packDecimalSumStateKernel {
   cudf::column_view offsetsView;
   uint8_t* chars;
   cudf::size_type numRows;
+  bool compactDecimal64;
   cuda::stream_ref stream;
 
   template <typename SumT, typename OffsetT>
@@ -384,7 +427,8 @@ struct packDecimalSumStateKernel {
               cuda::std::span<const SumT>{sums, n},
               cuda::std::span<const int64_t>{counts, n},
               cuda::std::span<const OffsetT>{offsetsView.data<OffsetT>(), n},
-              chars};
+              chars,
+              compactDecimal64};
         },
         stream);
   }
@@ -400,10 +444,12 @@ void fillOffsetsForDecimalSumState(
     cudf::type_id offsetType,
     cudf::mutable_column_view offsetsView,
     cudf::size_type numRows,
+    size_t stateSize,
     cuda::stream_ref stream) {
   cudf::type_dispatcher(
       cudf::data_type{offsetType},
-      fillOffsetsForDecimalSumStateKernel{offsetsView, numRows, stream});
+      fillOffsetsForDecimalSumStateKernel{
+          offsetsView, numRows, stateSize, stream});
 }
 
 bool unpackDecimalSumState(
@@ -449,12 +495,19 @@ void packDecimalSumState(
     cudf::column_view offsetsView,
     uint8_t* chars,
     cudf::size_type numRows,
+    bool compactDecimal64,
     cuda::stream_ref stream) {
   cudf::double_type_dispatcher<cudf::dispatch_storage_type>(
       cudf::data_type{sumType},
       cudf::data_type{offsetType},
       packDecimalSumStateKernel{
-          sumCol, counts, offsetsView, chars, numRows, stream});
+          sumCol,
+          counts,
+          offsetsView,
+          chars,
+          numRows,
+          compactDecimal64,
+          stream});
 }
 
 std::pair<cuda::device_buffer<std::byte>, cudf::size_type>

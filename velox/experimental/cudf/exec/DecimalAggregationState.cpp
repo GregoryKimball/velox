@@ -114,26 +114,27 @@ DecimalSumStateColumns deserializeDecimalSumState(
   auto const [payloadBegin, payloadEnd] =
       cudf::strings::detail::get_first_and_last_offset(strings, stream);
   auto const payloadSize = payloadEnd - payloadBegin;
-  // A null row's payload width is path dependent. serializeDecimalSumState
-  // writes kDecimalSumStateSize bytes for every row including nulls, while a
-  // velox/Arrow round trip compacts null rows to 0 bytes. Both encodings can
-  // occur in the same column: the streaming final aggregation concatenates its
-  // buffered (serialized) result with each newly arrived (round tripped) batch,
-  // so the payload size lands anywhere between the two extremes. Non-null rows
-  // are always kDecimalSumStateSize wide, and that is all
-  // unpackDecimalSumState requires -- it skips null rows and addresses payloads
-  // through the per-row offsets rather than a fixed stride.
-  auto const fullPayloadSize =
-      static_cast<int64_t>(numRows) * detail::kDecimalSumStateSize;
-  auto const compactPayloadSize =
-      static_cast<int64_t>(numRows - nullCount) * detail::kDecimalSumStateSize;
+  // Row widths are path dependent. serializeDecimalSumState writes either the
+  // marked compact state (DECIMAL64 with compactDecimalIntermediateState) or
+  // the legacy state for every row including nulls, while a velox/Arrow round
+  // trip compacts null rows to 0 bytes. Encodings can mix within one column:
+  // the streaming final aggregation concatenates its buffered (serialized)
+  // result with each newly arrived (round tripped) batch, and partial
+  // aggregations on different workers may emit different widths. This bounds
+  // the total; unpackDecimalSumState validates every non-null row's width and
+  // compact marker, skips null rows, and addresses payloads through the per-row
+  // offsets rather than a fixed stride.
+  auto const maxPayloadSize = static_cast<int64_t>(numRows) *
+      detail::kLegacyDecimalIntermediateStateSize;
+  auto const minPayloadSize = static_cast<int64_t>(numRows - nullCount) *
+      detail::kCompactDecimalIntermediateStateSize;
   VELOX_CHECK(
-      payloadSize >= compactPayloadSize && payloadSize <= fullPayloadSize &&
-          payloadSize % detail::kDecimalSumStateSize == 0,
+      payloadSize >= minPayloadSize && payloadSize <= maxPayloadSize &&
+          payloadSize % detail::kCompactDecimalIntermediateStateSize == 0,
       "Decimal sum state has an invalid payload size: expected a multiple of {} in [{}, {}], got {}",
-      detail::kDecimalSumStateSize,
-      compactPayloadSize,
-      fullPayloadSize,
+      detail::kCompactDecimalIntermediateStateSize,
+      minPayloadSize,
+      maxPayloadSize,
       payloadSize);
 
   auto sumCol = cudf::make_fixed_width_column(
@@ -154,8 +155,9 @@ DecimalSumStateColumns deserializeDecimalSumState(
 
   VELOX_CHECK(
       detail::unpackDecimalSumState(stateCol, sumView, countView, stream),
-      "Decimal sum state requires every non-null row to be {} bytes and {}-byte aligned",
-      detail::kDecimalSumStateSize,
+      "Decimal sum state requires every non-null row to be a {}-byte marked compact or {}-byte legacy state, {}-byte aligned",
+      detail::kCompactDecimalIntermediateStateSize,
+      detail::kLegacyDecimalIntermediateStateSize,
       alignof(int64_t));
 
   if (stateCol.nullable()) {
@@ -176,7 +178,8 @@ std::unique_ptr<cudf::column> serializeDecimalSumState(
     const cudf::column_view& sumCol,
     const cudf::column_view& countCol,
     cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr) {
+    rmm::device_async_resource_ref mr,
+    bool compactDecimal64) {
   VELOX_CHECK(
       countCol.type().id() == cudf::type_id::INT64,
       "Decimal sum state requires INT64 count column (type is {})",
@@ -198,10 +201,20 @@ std::unique_ptr<cudf::column> serializeDecimalSumState(
     return cudf::make_empty_column(cudf::type_id::STRING);
   }
 
+  const auto sumType = sumCol.type().id();
+  VELOX_CHECK(
+      sumType == cudf::type_id::DECIMAL64 ||
+          sumType == cudf::type_id::DECIMAL128,
+      "Unsupported decimal sum column type (type is {})",
+      cudf::type_to_name(sumCol.type()));
+  auto const useCompactDecimal64 =
+      compactDecimal64 && sumType == cudf::type_id::DECIMAL64;
+  auto const stateSize = useCompactDecimal64
+      ? detail::kCompactDecimalIntermediateStateSize
+      : detail::kLegacyDecimalIntermediateStateSize;
   auto const rowCount = static_cast<int32_t>(numRows);
 
-  auto const charsBytes =
-      static_cast<int64_t>(numRows) * detail::kDecimalSumStateSize;
+  auto const charsBytes = static_cast<int64_t>(numRows) * stateSize;
   auto const threshold = cudf::strings::get_offset64_threshold();
   auto const useLargeOffsets = charsBytes >= threshold;
   // Previously this guard threw std::overflow_error; Velox uses
@@ -223,18 +236,11 @@ std::unique_ptr<cudf::column> serializeDecimalSumState(
   auto offsetsView = offsetsCol->mutable_view();
 
   rmm::device_buffer charsBuf(
-      static_cast<size_t>(numRows) * detail::kDecimalSumStateSize, stream, mr);
+      static_cast<size_t>(numRows) * stateSize, stream, mr);
 
   auto charsPtr = reinterpret_cast<uint8_t*>(charsBuf.data());
   detail::fillOffsetsForDecimalSumState(
-      offsetsType, offsetsView, rowCount, stream);
-
-  const auto sumType = sumCol.type().id();
-  VELOX_CHECK(
-      sumType == cudf::type_id::DECIMAL64 ||
-          sumType == cudf::type_id::DECIMAL128,
-      "Unsupported decimal sum column type (type is {})",
-      cudf::type_to_name(sumCol.type()));
+      offsetsType, offsetsView, rowCount, stateSize, stream);
   detail::packDecimalSumState(
       sumType,
       offsetsType,
@@ -243,6 +249,7 @@ std::unique_ptr<cudf::column> serializeDecimalSumState(
       offsetsView,
       charsPtr,
       rowCount,
+      useCompactDecimal64,
       stream);
 
   auto [nullMask, nullCount] =

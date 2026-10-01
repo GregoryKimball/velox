@@ -39,6 +39,7 @@ TEST(ConfigTest, cudfConfig) {
       {CudfConfig::kCudfStreamingGroupbyEnabled, "true"},
       {CudfConfig::kCudfStreamingGroupbyCapacityMultiplier, "3.5"},
       {CudfConfig::kCudfDecimalGroupbyNarrowAccumulation, "true"},
+      {CudfConfig::kCudfCompactDecimalIntermediateState, "true"},
       {CudfConfig::kCudfAllowCpuFallback, "false"},
       {CudfConfig::kCudfBatchSizeMinThreshold, "123456"},
       {CudfConfig::kCudfBatchSizeMinBytes, "2147483648"}};
@@ -46,6 +47,7 @@ TEST(ConfigTest, cudfConfig) {
   CudfConfig config;
   ASSERT_FALSE(config.streamingGroupbyEnabled);
   ASSERT_FALSE(config.decimalGroupbyNarrowAccumulation);
+  ASSERT_FALSE(config.compactDecimalIntermediateState);
   ASSERT_EQ(config.streamingGroupbyCapacityMultiplier, 2.0);
   config.initialize(std::move(options));
   ASSERT_EQ(config.enabled, false);
@@ -56,6 +58,7 @@ TEST(ConfigTest, cudfConfig) {
   ASSERT_EQ(config.streamingGroupbyEnabled, true);
   ASSERT_EQ(config.streamingGroupbyCapacityMultiplier, 3.5);
   ASSERT_TRUE(config.decimalGroupbyNarrowAccumulation);
+  ASSERT_TRUE(config.compactDecimalIntermediateState);
   ASSERT_EQ(config.allowCpuFallback, false);
   ASSERT_EQ(config.batchSizeMinThreshold, 123'456);
   ASSERT_EQ(config.batchSizeMinBytes.value(), 2'147'483'648);
