@@ -58,6 +58,8 @@ struct CudfConfig {
       "cudf.streaming_groupby_capacity_multiplier"};
   static constexpr const char* kCudfCompactAggregationStateEnabled{
       "cudf.compact_aggregation_state_enabled"};
+  static constexpr const char* kCudfDecimalGroupbyNarrowAccumulation{
+      "cudf.decimal_groupby_narrow_accumulation"};
   static constexpr const char* kCudfTimestampUnit{"cudf.timestamp_unit"};
   static constexpr const char* kUcxExchange{"cudf.exchange"};
   static constexpr const char* kUcxxErrorHandling{"ucxx.error_handling"};
@@ -194,6 +196,10 @@ struct CudfConfig {
   /// DECIMAL(38, s) column instead of the VARBINARY state
   /// (CudfPlanRewriter). Every worker of a query must use the same setting.
   bool compactAggregationStateEnabled{false};
+
+  /// Narrow raw decimal groupby SUM/AVG accumulation only after proving every
+  /// possible group sum fits INT64. Intermediate and final merges stay INT128.
+  bool decimalGroupbyNarrowAccumulation{false};
 
   /// Minimum rows to accumulate before GPU-side concatenation (default 100k).
   /// Applies when batchSizeMinBytes is unset, and always to zero-column

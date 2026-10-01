@@ -20,8 +20,10 @@
 
 #include <cudf/groupby.hpp>
 
+#include <map>
 #include <optional>
 #include <string_view>
+#include <tuple>
 #include <utility>
 
 namespace facebook::velox::cudf_velox {
@@ -32,6 +34,26 @@ inline constexpr std::string_view kStreamingGroupbyUsedStat{
     "streamingGroupbyUsed"};
 inline constexpr std::string_view kStreamingGroupbyRebuildsStat{
     "streamingGroupbyRebuilds"};
+inline constexpr std::string_view kDecimal64NarrowRequestsStat{
+    "cudfDecimal64NarrowRequests"};
+inline constexpr std::string_view kDecimal64WideRequestsStat{
+    "cudfDecimal64WideRequests"};
+inline constexpr std::string_view kDecimal64SafetyProbesStat{
+    "cudfDecimal64SafetyProbes"};
+inline constexpr std::string_view kDecimal128NarrowRequestsStat{
+    "cudfDecimal128NarrowRequests"};
+inline constexpr std::string_view kDecimal128WideRequestsStat{
+    "cudfDecimal128WideRequests"};
+inline constexpr std::string_view kDecimal128SafetyProbesStat{
+    "cudfDecimal128SafetyProbes"};
+inline constexpr std::string_view kDecimal128InputCastsStat{
+    "cudfDecimal128InputCasts"};
+inline constexpr std::string_view kDecimal128InputCastReusesStat{
+    "cudfDecimal128InputCastReuses"};
+inline constexpr std::string_view kDecimal64InputCastsStat{
+    "cudfDecimal64InputCasts"};
+inline constexpr std::string_view kDecimal64InputCastReusesStat{
+    "cudfDecimal64InputCastReuses"};
 
 // Type-specific adapter between Velox final-aggregation state and libcudf's
 // flattened streaming_groupby request/result interface. prepareInput() must be
@@ -76,6 +98,34 @@ struct StreamingGroupbyAggregator {
       std::optional<column_index_t> childIndex = std::nullopt) const;
 };
 
+// Per-table state shared while regular groupby requests are assembled.
+// Decimal SUM and AVG can reference the same input, so this context avoids
+// duplicate safety probes and width-conversion columns within one groupby.
+struct GroupbyRequestContext {
+  // Sharing data alone does not imply equal values: validity, slice bounds and
+  // scale must also agree before reusing a proof or a width conversion.
+  using DecimalInputKey = std::tuple<
+      const void*,
+      const cudf::bitmask_type*,
+      cudf::size_type,
+      cudf::size_type,
+      int32_t>;
+  std::map<DecimalInputKey, std::unique_ptr<cudf::column>> decimal128Inputs;
+  std::map<DecimalInputKey, std::unique_ptr<cudf::column>> decimal64Inputs;
+  std::map<DecimalInputKey, bool> decimal64SumSafe;
+  std::map<DecimalInputKey, bool> decimal128SumSafe;
+  int64_t decimal64NarrowRequests{0};
+  int64_t decimal64WideRequests{0};
+  int64_t decimal64SafetyProbes{0};
+  int64_t decimal128NarrowRequests{0};
+  int64_t decimal128WideRequests{0};
+  int64_t decimal128SafetyProbes{0};
+  int64_t decimal128Casts{0};
+  int64_t decimal128CastReuses{0};
+  int64_t decimal64Casts{0};
+  int64_t decimal64CastReuses{0};
+};
+
 struct GroupbyAggregator {
   core::AggregationNode::Step step;
   uint32_t inputIndex;
@@ -87,7 +137,8 @@ struct GroupbyAggregator {
       cudf::table_view const& tbl,
       std::vector<cudf::groupby::aggregation_request>& requests,
       cuda::stream_ref stream,
-      rmm::device_async_resource_ref mr) = 0;
+      rmm::device_async_resource_ref mr,
+      GroupbyRequestContext& context) = 0;
 
   virtual std::unique_ptr<cudf::column> makeOutputColumn(
       std::vector<cudf::groupby::aggregation_result>& results,

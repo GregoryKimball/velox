@@ -80,6 +80,9 @@ struct ResolvedAggregateInfo {
   uint32_t inputIndex;
   VectorPtr constant;
   TypePtr resultType;
+  // Original raw input type remains available on intermediate/final steps
+  // and carries decimal precision that is absent from a cuDF column_view.
+  TypePtr rawInputType;
   std::optional<CountInputKind> countInputKind;
   // Post-permutation index of this aggregate's boolean mask column. Set only
   // for masked aggregates at raw-input steps; nullopt otherwise.

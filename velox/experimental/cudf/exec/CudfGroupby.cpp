@@ -39,15 +39,19 @@
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
 
 #include <cuda/std/numeric>
+#include <cuda_runtime_api.h>
 
 #include <folly/ScopeGuard.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 
 namespace {
@@ -55,10 +59,12 @@ namespace {
 using namespace facebook::velox;
 using cudf_velox::castDecimal64InputToDecimal128;
 using cudf_velox::CountInputKind;
+using cudf_velox::CudfConfig;
 using cudf_velox::finalizeDecimalAverage;
 using cudf_velox::get_output_mr;
 using cudf_velox::get_temp_mr;
 using cudf_velox::GroupbyAggregator;
+using cudf_velox::GroupbyRequestContext;
 using cudf_velox::ResolvedAggregateInfo;
 using cudf_velox::serializeDecimalPartialOrIntermediateState;
 using cudf_velox::StreamingGroupbyAggregator;
@@ -300,7 +306,8 @@ struct SimpleGroupbyAggregator final : GroupbyAggregator {
       cudf::table_view const& tbl,
       std::vector<cudf::groupby::aggregation_request>& requests,
       cuda::stream_ref stream,
-      rmm::device_async_resource_ref mr) override {
+      rmm::device_async_resource_ref mr,
+      GroupbyRequestContext& /*context*/) override {
     VELOX_CHECK(
         constant == nullptr,
         "Simple groupby aggregator does not yet support constant input");
@@ -418,14 +425,277 @@ void addDecimalFinalSumOnlyRequest(
       cudf::make_sum_aggregation<cudf::groupby_aggregation>());
 }
 
+GroupbyRequestContext::DecimalInputKey decimalInputKey(
+    cudf::column_view input) {
+  return {
+      input.head(),
+      input.null_mask(),
+      input.offset(),
+      input.size(),
+      input.type().scale()};
+}
+
+uint64_t decimal64Magnitude(int64_t value) {
+  // Avoid signed overflow for INT64_MIN.
+  return value < 0 ? static_cast<uint64_t>(-(value + 1)) + 1
+                   : static_cast<uint64_t>(value);
+}
+
+__uint128_t decimal128Magnitude(__int128_t value) {
+  // Avoid signed overflow for the most-negative 128-bit value.
+  return value < 0 ? static_cast<__uint128_t>(-(value + 1)) + 1
+                   : static_cast<__uint128_t>(value);
+}
+
+template <typename Rep>
+struct HostDecimalExtrema {
+  Rep minimum;
+  Rep maximum;
+  bool minimumValid;
+  bool maximumValid;
+};
+
+template <typename Rep>
+HostDecimalExtrema<Rep>& pinnedDecimalExtrema() {
+  // Each driver thread needs an independent stage because the four asynchronous
+  // scalar readbacks remain in flight until the one stream synchronization.
+  // Reuse pinned storage across batches, releasing it when the thread exits.
+  struct FreePinned {
+    void operator()(HostDecimalExtrema<Rep>* ptr) const {
+      cudaFreeHost(ptr);
+    }
+  };
+  static thread_local auto stage = [] {
+    HostDecimalExtrema<Rep>* result{nullptr};
+    CUDF_CUDA_TRY(cudaHostAlloc(
+        reinterpret_cast<void**>(&result),
+        sizeof(HostDecimalExtrema<Rep>),
+        cudaHostAllocPortable));
+    return std::unique_ptr<HostDecimalExtrema<Rep>, FreePinned>{result};
+  }();
+  return *stage;
+}
+
+template <typename Decimal>
+HostDecimalExtrema<typename Decimal::rep> readDecimalExtrema(
+    const cudf::fixed_point_scalar<Decimal>& minimum,
+    const cudf::fixed_point_scalar<Decimal>& maximum,
+    cuda::stream_ref stream) {
+  using Rep = typename Decimal::rep;
+  auto& host = pinnedDecimalExtrema<Rep>();
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      &host.minimum,
+      minimum.data(),
+      sizeof(Rep),
+      cudaMemcpyDeviceToHost,
+      stream.get()));
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      &host.maximum,
+      maximum.data(),
+      sizeof(Rep),
+      cudaMemcpyDeviceToHost,
+      stream.get()));
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      &host.minimumValid,
+      minimum.validity_data(),
+      sizeof(bool),
+      cudaMemcpyDeviceToHost,
+      stream.get()));
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      &host.maximumValid,
+      maximum.validity_data(),
+      sizeof(bool),
+      cudaMemcpyDeviceToHost,
+      stream.get()));
+  stream.sync();
+  return host;
+}
+
+// Bounds every subset sum, not just the final total: any group and any
+// accumulation order fit once rowCount * maxMagnitude <= INT64_MAX.
+// Only raw requests call this. A raw batch bound cannot prove a later merge.
+bool decimalTypeBoundFitsInt64(
+    const TypePtr& rawInputType,
+    cudf::size_type numRows,
+    bool sourceValuesFitInt64) {
+  if (numRows == 0) {
+    return true;
+  }
+  if (sourceValuesFitInt64 && numRows == 1) {
+    return true;
+  }
+  if (rawInputType == nullptr || !rawInputType->isDecimal()) {
+    return false;
+  }
+
+  const auto precision = getDecimalPrecisionScale(*rawInputType).first;
+  if (precision <= 0 || precision > 18) {
+    return false;
+  }
+
+  uint64_t maxMagnitude = 0;
+  for (int32_t digit = 0; digit < precision; ++digit) {
+    maxMagnitude = maxMagnitude * 10 + 9;
+  }
+  return maxMagnitude <=
+      static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) /
+      static_cast<uint64_t>(numRows);
+}
+
+bool decimal64SumFitsInt64(
+    cudf::column_view input,
+    const TypePtr& rawInputType,
+    cuda::stream_ref stream,
+    GroupbyRequestContext& context) {
+  const auto key = decimalInputKey(input);
+  if (const auto it = context.decimal64SumSafe.find(key);
+      it != context.decimal64SumSafe.end()) {
+    return it->second;
+  }
+
+  bool safe = decimalTypeBoundFitsInt64(rawInputType, input.size(), true);
+  if (!safe && input.size() > 0) {
+    ++context.decimal64SafetyProbes;
+    auto minAgg = cudf::make_min_aggregation<cudf::reduce_aggregation>();
+    auto maxAgg = cudf::make_max_aggregation<cudf::reduce_aggregation>();
+    auto minScalar =
+        cudf::reduce(input, *minAgg, input.type(), stream, get_temp_mr());
+    auto maxScalar =
+        cudf::reduce(input, *maxAgg, input.type(), stream, get_temp_mr());
+    const auto& minValue =
+        static_cast<const cudf::fixed_point_scalar<numeric::decimal64>&>(
+            *minScalar);
+    const auto& maxValue =
+        static_cast<const cudf::fixed_point_scalar<numeric::decimal64>&>(
+            *maxScalar);
+    const auto extrema =
+        readDecimalExtrema<numeric::decimal64>(minValue, maxValue, stream);
+    if (!extrema.minimumValid || !extrema.maximumValid) {
+      // Both invalid means an all-null column, whose sum cannot overflow.
+      safe = !extrema.minimumValid && !extrema.maximumValid;
+    } else {
+      const auto maxMagnitude = std::max(
+          decimal64Magnitude(extrema.minimum),
+          decimal64Magnitude(extrema.maximum));
+      safe = maxMagnitude <=
+          static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) /
+              static_cast<uint64_t>(input.size());
+    }
+  }
+
+  context.decimal64SumSafe.emplace(key, safe);
+  return safe;
+}
+
+bool decimal128SumFitsInt64(
+    cudf::column_view input,
+    const TypePtr& rawInputType,
+    cuda::stream_ref stream,
+    GroupbyRequestContext& context) {
+  const auto key = decimalInputKey(input);
+  if (const auto it = context.decimal128SumSafe.find(key);
+      it != context.decimal128SumSafe.end()) {
+    return it->second;
+  }
+
+  bool safe = decimalTypeBoundFitsInt64(rawInputType, input.size(), false);
+  if (!safe && input.size() > 0) {
+    ++context.decimal128SafetyProbes;
+    auto minAgg = cudf::make_min_aggregation<cudf::reduce_aggregation>();
+    auto maxAgg = cudf::make_max_aggregation<cudf::reduce_aggregation>();
+    auto minScalar =
+        cudf::reduce(input, *minAgg, input.type(), stream, get_temp_mr());
+    auto maxScalar =
+        cudf::reduce(input, *maxAgg, input.type(), stream, get_temp_mr());
+    const auto& minValue =
+        static_cast<const cudf::fixed_point_scalar<numeric::decimal128>&>(
+            *minScalar);
+    const auto& maxValue =
+        static_cast<const cudf::fixed_point_scalar<numeric::decimal128>&>(
+            *maxScalar);
+    const auto extrema =
+        readDecimalExtrema<numeric::decimal128>(minValue, maxValue, stream);
+    if (!extrema.minimumValid || !extrema.maximumValid) {
+      safe = !extrema.minimumValid && !extrema.maximumValid;
+    } else {
+      const auto maxMagnitude = std::max(
+          decimal128Magnitude(extrema.minimum),
+          decimal128Magnitude(extrema.maximum));
+      const auto int64GroupLimit =
+          static_cast<__uint128_t>(std::numeric_limits<int64_t>::max()) /
+          static_cast<uint64_t>(input.size());
+      safe = maxMagnitude <= int64GroupLimit;
+    }
+  }
+
+  context.decimal128SumSafe.emplace(key, safe);
+  return safe;
+}
+
+cudf::column_view narrowDecimal128Input(
+    cudf::column_view input,
+    cuda::stream_ref stream,
+    GroupbyRequestContext& context) {
+  const auto key = decimalInputKey(input);
+  auto [it, inserted] = context.decimal64Inputs.try_emplace(key);
+  if (inserted) {
+    ++context.decimal64Casts;
+    it->second = cudf::cast(
+        input,
+        cudf::data_type{cudf::type_id::DECIMAL64, input.type().scale()},
+        stream,
+        get_temp_mr());
+  } else {
+    ++context.decimal64CastReuses;
+  }
+  return it->second->view();
+}
+
 void addDecimalRawPartialSingleSumRequest(
     cudf::column_view input,
+    const TypePtr& rawInputType,
     std::vector<cudf::groupby::aggregation_request>& requests,
     bool includeCountAggregation,
     cuda::stream_ref stream,
     uint32_t& sumIdx,
-    std::unique_ptr<cudf::column>& castedInput) {
-  auto inputView = castDecimal64InputToDecimal128(input, castedInput, stream);
+    std::unique_ptr<cudf::column>& castedInput,
+    GroupbyRequestContext& context,
+    bool narrowable) {
+  auto inputView = input;
+  // The narrowing proof bounds one raw batch; merges of partial sums (the
+  // compact state's intermediate and final steps) keep the 128-bit path.
+  if (!narrowable ||
+      !CudfConfig::getInstance().decimalGroupbyNarrowAccumulation) {
+    // Preserve the existing request and ownership path when disabled.
+    inputView = castDecimal64InputToDecimal128(input, castedInput, stream);
+  } else if (input.type().id() == cudf::type_id::DECIMAL64) {
+    const auto useNarrow =
+        decimal64SumFitsInt64(input, rawInputType, stream, context);
+    if (useNarrow) {
+      ++context.decimal64NarrowRequests;
+    } else {
+      ++context.decimal64WideRequests;
+      const auto key = decimalInputKey(input);
+      auto [it, inserted] = context.decimal128Inputs.try_emplace(key);
+      if (inserted) {
+        ++context.decimal128Casts;
+        inputView = castDecimal64InputToDecimal128(input, it->second, stream);
+      } else {
+        ++context.decimal128CastReuses;
+        inputView = it->second->view();
+      }
+    }
+  } else if (input.type().id() == cudf::type_id::DECIMAL128) {
+    const auto useNarrow =
+        decimal128SumFitsInt64(input, rawInputType, stream, context);
+    if (useNarrow) {
+      ++context.decimal128NarrowRequests;
+      inputView = narrowDecimal128Input(input, stream, context);
+    } else {
+      ++context.decimal128WideRequests;
+    }
+  }
+
   auto& request = requests.emplace_back();
   sumIdx = requests.size() - 1;
   request.values = inputView;
@@ -444,16 +714,19 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
       uint32_t inputIndex,
       VectorPtr constant,
       const TypePtr& resultType,
+      TypePtr rawInputType,
       std::optional<uint32_t> maskIndex,
       bool compactDecimalSum)
       : GroupbyAggregator(step, inputIndex, constant, resultType, maskIndex),
+        rawInputType_(std::move(rawInputType)),
         compactDecimalSum_(compactDecimalSum) {}
 
   void addGroupbyRequest(
       cudf::table_view const& tbl,
       std::vector<cudf::groupby::aggregation_request>& requests,
       cuda::stream_ref stream,
-      rmm::device_async_resource_ref mr) override {
+      rmm::device_async_resource_ref mr,
+      GroupbyRequestContext& context) override {
     if (compactDecimalSum_) {
       auto input = materializeMaskedInput(tbl, inputIndex, stream, mr);
       if (!exec::isRawInput(step)) {
@@ -461,7 +734,15 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
             input.type() == cudf_velox::veloxToCudfDataType(resultType));
       }
       addDecimalRawPartialSingleSumRequest(
-          input, requests, false, stream, sumIdx_, castedInput_);
+          input,
+          rawInputType_,
+          requests,
+          false,
+          stream,
+          sumIdx_,
+          castedInput_,
+          context,
+          exec::isRawInput(step));
     } else if (step == core::AggregationNode::Step::kIntermediate) {
       addDecimalDecodedSumCountRequests(
           tbl,
@@ -483,11 +764,14 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
       // no mask.
       addDecimalRawPartialSingleSumRequest(
           materializeMaskedInput(tbl, inputIndex, stream, mr),
+          rawInputType_,
           requests,
           step == core::AggregationNode::Step::kPartial,
           stream,
           sumIdx_,
-          castedInput_);
+          castedInput_,
+          context,
+          true);
     }
   }
 
@@ -497,6 +781,12 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
       rmm::device_async_resource_ref mr) override {
     auto col = std::move(results[sumIdx_].results[0]);
     if (compactDecimalSum_) {
+      // A narrowed raw sum comes back as DECIMAL64; the compact state is
+      // DECIMAL(38, s).
+      auto const stateType = cudf_velox::veloxToCudfDataType(resultType);
+      if (col->type() != stateType) {
+        col = cudf::cast(*col, stateType, stream, mr);
+      }
       return col;
     }
     if (step == core::AggregationNode::Step::kPartial) {
@@ -528,8 +818,8 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
   uint32_t countIdx_{0};
   std::unique_ptr<cudf::column> decodedSum_;
   std::unique_ptr<cudf::column> decodedCount_;
-  // Holds the DECIMAL64->DECIMAL128 cast of raw input (kPartial/kSingle), kept
-  // alive while the groupby request references its view.
+  TypePtr rawInputType_;
+  // Owns the existing DECIMAL64-to-128 cast when narrowing is disabled.
   std::unique_ptr<cudf::column> castedInput_;
   const bool compactDecimalSum_;
 };
@@ -539,13 +829,10 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
       core::AggregationNode::Step step,
       uint32_t inputIndex,
       VectorPtr constant,
-      const TypePtr& resultType)
-      : GroupbyAggregator(
-            step,
-            inputIndex,
-            constant,
-            resultType,
-            std::nullopt) {}
+      const TypePtr& resultType,
+      TypePtr rawInputType)
+      : GroupbyAggregator(step, inputIndex, constant, resultType, std::nullopt),
+        rawInputType_(std::move(rawInputType)) {}
 
   // Decimal avg uses a dedicated path that does not honor masks; masked avg
   // already falls back to CPU (see canGroupbyBeEvaluatedByCudf).
@@ -553,7 +840,8 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
       cudf::table_view const& tbl,
       std::vector<cudf::groupby::aggregation_request>& requests,
       cuda::stream_ref stream,
-      rmm::device_async_resource_ref /*mr*/) override {
+      rmm::device_async_resource_ref /*mr*/,
+      GroupbyRequestContext& context) override {
     VELOX_CHECK(!maskIndex.has_value(), "decimal avg does not support masks");
     if (step == core::AggregationNode::Step::kIntermediate ||
         step == core::AggregationNode::Step::kFinal) {
@@ -570,12 +858,15 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
     } else {
       addDecimalRawPartialSingleSumRequest(
           tbl.column(inputIndex),
+          rawInputType_,
           requests,
           step == core::AggregationNode::Step::kPartial ||
               step == core::AggregationNode::Step::kSingle,
           stream,
           sumIdx_,
-          castedInput_);
+          castedInput_,
+          context,
+          true);
     }
   }
 
@@ -620,8 +911,8 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
   uint32_t countIdx_{0};
   std::unique_ptr<cudf::column> decodedSum_;
   std::unique_ptr<cudf::column> decodedCount_;
-  // Holds the DECIMAL64->DECIMAL128 cast of raw input (kPartial/kSingle), kept
-  // alive while the groupby request references its view.
+  TypePtr rawInputType_;
+  // Owns the existing DECIMAL64-to-128 cast when narrowing is disabled.
   std::unique_ptr<cudf::column> castedInput_;
 };
 
@@ -639,7 +930,8 @@ struct GroupbyCountAggregator : GroupbyAggregator {
       cudf::table_view const& tbl,
       std::vector<cudf::groupby::aggregation_request>& requests,
       cuda::stream_ref stream,
-      rmm::device_async_resource_ref mr) override {
+      rmm::device_async_resource_ref mr,
+      GroupbyRequestContext& /*context*/) override {
     // kCountAll and kNullConstant both submit a count-all-rows request;
     // kNullConstant overrides the result with zeros in makeOutputColumn.
     const bool countAll = (inputKind_ != CountInputKind::kColumn);
@@ -721,7 +1013,8 @@ struct GroupbyMeanAggregator : GroupbyAggregator {
       cudf::table_view const& tbl,
       std::vector<cudf::groupby::aggregation_request>& requests,
       cuda::stream_ref /*stream*/,
-      rmm::device_async_resource_ref /*mr*/) override {
+      rmm::device_async_resource_ref /*mr*/,
+      GroupbyRequestContext& /*context*/) override {
     VELOX_CHECK(!maskIndex.has_value(), "avg does not support masks");
     switch (step) {
       case core::AggregationNode::Step::kSingle: {
@@ -898,7 +1191,8 @@ struct GroupbyStddevSampAggregator : GroupbyAggregator {
       cudf::table_view const& tbl,
       std::vector<cudf::groupby::aggregation_request>& requests,
       cuda::stream_ref /*stream*/,
-      rmm::device_async_resource_ref /*mr*/) override {
+      rmm::device_async_resource_ref /*mr*/,
+      GroupbyRequestContext& /*context*/) override {
     VELOX_CHECK(!maskIndex.has_value(), "stddev does not support masks");
     auto& request = requests.emplace_back();
     outputIdx_ = requests.size() - 1;
@@ -1083,6 +1377,7 @@ std::unique_ptr<GroupbyAggregator> createGroupbyAggregator(
           p.inputIndex,
           p.constant,
           p.resultType,
+          p.rawInputType,
           p.maskIndex,
           p.compactDecimalSum);
     }
@@ -1105,7 +1400,11 @@ std::unique_ptr<GroupbyAggregator> createGroupbyAggregator(
   } else if (kind.rfind(prefix + "avg", 0) == 0) {
     if (p.isDecimalAggregate) {
       return std::make_unique<GroupbyDecimalAvgAggregator>(
-          p.companionStep, p.inputIndex, p.constant, p.resultType);
+          p.companionStep,
+          p.inputIndex,
+          p.constant,
+          p.resultType,
+          p.rawInputType);
     }
     return std::make_unique<GroupbyMeanAggregator>(
         p.companionStep, p.inputIndex, p.constant, p.resultType, p.maskIndex);
@@ -1897,14 +2196,56 @@ CudfVectorPtr CudfGroupby::doGroupByAggregation(
   };
   auto releaseInputsGuard = folly::makeGuard(releaseInputs);
   std::vector<cudf::groupby::aggregation_request> requests;
+  GroupbyRequestContext requestContext;
   for (auto& aggregator : aggregators) {
-    aggregator->addGroupbyRequest(tableView, requests, stream, get_temp_mr());
+    aggregator->addGroupbyRequest(
+        tableView, requests, stream, get_temp_mr(), requestContext);
   }
 
   auto [groupKeys, results] = groupByOwner.aggregate(requests, stream, mr);
   requests.clear();
+  // aggregate() has consumed the request views: release the decimal width
+  // conversions together with the inputs, before output materialization.
+  requestContext.decimal128Inputs.clear();
+  requestContext.decimal64Inputs.clear();
   releaseInputs();
   releaseInputsGuard.dismiss();
+  if (requestContext.decimal64NarrowRequests > 0 ||
+      requestContext.decimal64WideRequests > 0 ||
+      requestContext.decimal128NarrowRequests > 0 ||
+      requestContext.decimal128WideRequests > 0) {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        std::string{kDecimal64NarrowRequestsStat},
+        RuntimeCounter(requestContext.decimal64NarrowRequests));
+    lockedStats->addRuntimeStat(
+        std::string{kDecimal64WideRequestsStat},
+        RuntimeCounter(requestContext.decimal64WideRequests));
+    lockedStats->addRuntimeStat(
+        std::string{kDecimal64SafetyProbesStat},
+        RuntimeCounter(requestContext.decimal64SafetyProbes));
+    lockedStats->addRuntimeStat(
+        std::string{kDecimal128NarrowRequestsStat},
+        RuntimeCounter(requestContext.decimal128NarrowRequests));
+    lockedStats->addRuntimeStat(
+        std::string{kDecimal128WideRequestsStat},
+        RuntimeCounter(requestContext.decimal128WideRequests));
+    lockedStats->addRuntimeStat(
+        std::string{kDecimal128SafetyProbesStat},
+        RuntimeCounter(requestContext.decimal128SafetyProbes));
+    lockedStats->addRuntimeStat(
+        std::string{kDecimal128InputCastsStat},
+        RuntimeCounter(requestContext.decimal128Casts));
+    lockedStats->addRuntimeStat(
+        std::string{kDecimal128InputCastReusesStat},
+        RuntimeCounter(requestContext.decimal128CastReuses));
+    lockedStats->addRuntimeStat(
+        std::string{kDecimal64InputCastsStat},
+        RuntimeCounter(requestContext.decimal64Casts));
+    lockedStats->addRuntimeStat(
+        std::string{kDecimal64InputCastReusesStat},
+        RuntimeCounter(requestContext.decimal64CastReuses));
+  }
   // flatten the results
   std::vector<std::unique_ptr<cudf::column>> resultColumns;
 
