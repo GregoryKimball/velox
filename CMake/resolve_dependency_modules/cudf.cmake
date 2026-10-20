@@ -53,12 +53,13 @@ set(
 )
 velox_resolve_dependency_url(kvikio)
 
-# cudf commit 568a24b from 2026-10-06 (main branch)
+# cudf commit 7c64cfbda6 from 2026-10-19: rapidsai/cudf#24542 (fused FOR, with the decode_fused_for
+# ownership fix) on #24261 16a249ca06, which sits directly on the previous pin 568a24b (main 2026-10-06).
 set(VELOX_cudf_VERSION 26.12 CACHE STRING "cudf version")
-set(VELOX_cudf_COMMIT 568a24bfb10c08622a17a487d3702c192b538c8f)
+set(VELOX_cudf_COMMIT 7c64cfbda69a96cae485c80badd1cf34f2f9d56f)
 set(
   VELOX_cudf_BUILD_SHA256_CHECKSUM
-  30d1ff88fe535b68456ac13f5898d9699a859489a56d1f6f9c5cf7814305a806
+  f503139d001b64b9a52d76844679ca00c2886569dd101167c74f0d3a48280060
 )
 set(VELOX_cudf_SOURCE_URL "https://github.com/rapidsai/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
 velox_resolve_dependency_url(cudf)
