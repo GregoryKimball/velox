@@ -67,6 +67,9 @@ struct CudfConfig {
       "cudf.partitioned_output_batch_rows"};
   static constexpr const char* kCudfKvikioCacheCopyThreads{
       "cudf.kvikio_cache_copy_threads"};
+  /// Query configuration key for selecting UCX exchange compression.
+  static constexpr const char* kUcxExchangeCompression{
+      "cudf.exchange_compression"};
   /// Query session configs for the cuDF Operators.
   static constexpr const char* kCudfTopNBatchSize{"cudf.topk_batch_size"};
 
@@ -126,6 +129,10 @@ struct CudfConfig {
   /// Threads that copy KvikIO data from the async data cache to the GPU. One
   /// pool for the whole process, created by the first cached GPU read.
   int32_t kvikioCacheCopyThreads{16};
+
+  /// Compression mode used by UCX exchange output unless a query overrides it
+  /// with kUcxExchangeCompression.
+  std::string exchangeCompression{"none"};
 
   /// Memory resource for cuDF.
   /// Possible values are (cuda, pool, async, arena, managed, managed_pool).

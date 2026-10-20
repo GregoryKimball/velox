@@ -29,6 +29,7 @@
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/expression/JitExpression.h"
 #ifdef VELOX_ENABLE_UCX_EXCHANGE
+#include "velox/experimental/ucx-exchange/ExchangeCompression.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeRegistration.h"
 #endif
 
@@ -524,6 +525,13 @@ void CudfConfig::initialize(
     kvikioCacheCopyThreads =
         folly::to<int32_t>(config[kCudfKvikioCacheCopyThreads]);
   }
+#ifdef VELOX_ENABLE_UCX_EXCHANGE
+  if (config.find(kUcxExchangeCompression) != config.end()) {
+    const auto& value = config.at(kUcxExchangeCompression);
+    ucx_exchange::parseExchangeCompression(value);
+    exchangeCompression = value;
+  }
+#endif
   if (config.find(kCudfLogFallback) != config.end()) {
     logFallback = folly::to<bool>(config[kCudfLogFallback]);
   }

@@ -28,6 +28,8 @@ set(
   EndpointRef.cpp
   NetUtil.cpp
   IntraNodeTransferRegistry.cpp
+  ExchangeCompressionWire.cpp
+  ExchangeCompression.cpp
 )
 
 # Generate a header containing the module basenames (without .cpp extension)
