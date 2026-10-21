@@ -235,6 +235,7 @@ class CudfDecimalTest : public exec::test::OperatorTestBase {
     functions::prestosql::registerAllScalarFunctions();
     aggregate::prestosql::registerAllAggregateFunctions();
     CudfConfig::getInstance().allowCpuFallback = false;
+    CudfConfig::getInstance().compactAggregationStateEnabled = true;
     // Ensure a CUDA device is selected and initialized (RMM asserts otherwise).
     int deviceCount = 0;
     auto status = cudaGetDeviceCount(&deviceCount);
@@ -253,6 +254,7 @@ class CudfDecimalTest : public exec::test::OperatorTestBase {
   void TearDown() override {
     unregisterCudf();
     CudfConfig::getInstance().allowCpuFallback = false;
+    CudfConfig::getInstance().compactAggregationStateEnabled = false;
     exec::test::OperatorTestBase::TearDown();
   }
 

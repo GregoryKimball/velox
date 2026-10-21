@@ -56,6 +56,8 @@ struct CudfConfig {
       "cudf.streaming_groupby_enabled"};
   static constexpr const char* kCudfStreamingGroupbyCapacityMultiplier{
       "cudf.streaming_groupby_capacity_multiplier"};
+  static constexpr const char* kCudfCompactAggregationStateEnabled{
+      "cudf.compact_aggregation_state_enabled"};
   static constexpr const char* kCudfTimestampUnit{"cudf.timestamp_unit"};
   static constexpr const char* kUcxExchange{"cudf.exchange"};
   static constexpr const char* kUcxxErrorHandling{"ucxx.error_handling"};
@@ -187,6 +189,11 @@ struct CudfConfig {
   /// Multiplier used to derive streaming_groupby's initial logical capacity
   /// from the first batch and to grow capacity when it is exhausted.
   double streamingGroupbyCapacityMultiplier{2.0};
+
+  /// Rewrite Decimal64 SUM partial and intermediate states to a compact
+  /// DECIMAL(38, s) column instead of the VARBINARY state
+  /// (CudfPlanRewriter). Every worker of a query must use the same setting.
+  bool compactAggregationStateEnabled{false};
 
   /// Minimum rows to accumulate before GPU-side concatenation (default 100k).
   /// Applies when batchSizeMinBytes is unset, and always to zero-column

@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfAggregationNode.h"
 #include "velox/experimental/cudf/exec/CudfPlanRewriter.h"
 
@@ -401,6 +402,9 @@ PlanNodePtr rewriteNode(
 
 core::PlanNodePtr CudfPlanRewriter::rewrite(const core::PlanNodePtr& root) {
   VELOX_USER_CHECK_NOT_NULL(root);
+  if (!CudfConfig::getInstance().compactAggregationStateEnabled) {
+    return root;
+  }
   auto rewritten = rewriteNode(root, nullptr);
   // An unconsumed PARTIAL is not a valid fragment result. Only an explicit UCX
   // output may change the external schema of a fragment.

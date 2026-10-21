@@ -317,6 +317,13 @@ class UcxExchangeTestBase : public testing::Test {
     VLOG(0) << "creating pool";
     pool_ = facebook::velox::memory::memoryManager()->addLeafPool(
         "UcxTestMemoryPool");
+    cudf_velox::CudfConfig::getInstance().compactAggregationStateEnabled =
+        true;
+  }
+
+  void TearDown() override {
+    cudf_velox::CudfConfig::getInstance().compactAggregationStateEnabled =
+        false;
   }
 
   exec::Split remoteSplit(std::string_view taskId, int partitionId) {

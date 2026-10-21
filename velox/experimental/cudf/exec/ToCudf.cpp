@@ -507,6 +507,10 @@ void CudfConfig::initialize(
     streamingGroupbyCapacityMultiplier =
         folly::to<double>(config[kCudfStreamingGroupbyCapacityMultiplier]);
   }
+  if (config.find(kCudfCompactAggregationStateEnabled) != config.end()) {
+    compactAggregationStateEnabled =
+        folly::to<bool>(config[kCudfCompactAggregationStateEnabled]);
+  }
   if (config.find(kCudfFunctionNamePrefix) != config.end()) {
     functionNamePrefix = config[kCudfFunctionNamePrefix];
   }
