@@ -703,9 +703,10 @@ TEST_F(ExchangeCompressionTest, splitsFixedWidthStringsIntoLanes) {
 
 TEST_F(ExchangeCompressionTest, keepsVariableWidthStringsWithLanes) {
   const auto memoryResource = cudf::get_current_device_resource_ref();
-  // Rows of 8 and 24 bytes average 16 bytes, but have no common width.
+  // Rows of 8 and 24 bytes average 16 bytes, but have no common width. Enough
+  // rows that the width check runs (columns below 1024 rows keep strings).
   std::vector<std::vector<int64_t>> values;
-  for (int i = 0; i < 1'000; ++i) {
+  for (int i = 0; i < 2'000; ++i) {
     values.push_back(
         i % 2 == 0 ? std::vector<int64_t>{i}
                    : std::vector<int64_t>{i, i + 1, i + 2});

@@ -29,7 +29,9 @@
 #include <cudf/strings/attributes.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table.hpp>
+#include <cudf/utilities/error.hpp>
 
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <span>
@@ -70,40 +72,56 @@ cudf::detail::fused_for_options fusedForOptions(
 // states are four lanes wide.
 constexpr uint32_t kMaxLanes = 16;
 
+// Columns with fewer rows are sent as strings: they fill less than one fused
+// FOR tile of 32-byte rows, so lanes save little and the check below costs a
+// synchronization per column.
+constexpr cudf::size_type kMinLaneRows = 1024;
+
 // Returns the number of eight-byte lanes in each row of `column`, or zero when
 // the column cannot be split into lanes. That is the case unless it is an
-// unsliced strings column without nulls whose rows all have the same width, a
-// multiple of eight bytes.
+// unsliced strings column without nulls, of at least kMinLaneRows rows, whose
+// rows all have the same width, a multiple of eight bytes.
 uint32_t laneCount(
     cudf::column_view column,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref memoryResource) {
-  if (column.type().id() != cudf::type_id::STRING || column.is_empty() ||
-      column.has_nulls() || column.offset() != 0) {
+  if (column.type().id() != cudf::type_id::STRING ||
+      column.size() < kMinLaneRows || column.has_nulls() ||
+      column.offset() != 0) {
     return 0;
   }
   const cudf::strings_column_view strings{column};
-  if (strings.offsets().type().id() != cudf::type_id::INT32) {
-    return 0;
-  }
-  const auto charsSize = strings.chars_size(stream);
-  const auto rowBytes = charsSize / column.size();
-  if (charsSize % column.size() != 0 || rowBytes == 0 ||
-      rowBytes % sizeof(int64_t) != 0 ||
-      rowBytes / sizeof(int64_t) > kMaxLanes ||
+  if (strings.offsets().type().id() != cudf::type_id::INT32 ||
       reinterpret_cast<std::uintptr_t>(strings.chars_begin(stream)) %
               alignof(int64_t) !=
           0) {
     return 0;
   }
 
-  // The average width says nothing about the width of each row.
+  // Every row has the same width when the narrowest equals the widest. Read
+  // both with one synchronization.
   using SizeScalar = cudf::numeric_scalar<cudf::size_type>;
   auto widths = cudf::strings::count_bytes(strings, stream, memoryResource);
   auto [minWidth, maxWidth] =
       cudf::minmax(widths->view(), stream, memoryResource);
-  if (static_cast<SizeScalar&>(*minWidth).value(stream) != rowBytes ||
-      static_cast<SizeScalar&>(*maxWidth).value(stream) != rowBytes) {
+  std::array<cudf::size_type, 2> bounds;
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      &bounds[0],
+      static_cast<SizeScalar&>(*minWidth).data(),
+      sizeof(cudf::size_type),
+      cudaMemcpyDeviceToHost,
+      stream.get()));
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      &bounds[1],
+      static_cast<SizeScalar&>(*maxWidth).data(),
+      sizeof(cudf::size_type),
+      cudaMemcpyDeviceToHost,
+      stream.get()));
+  stream.sync();
+  const auto rowBytes = bounds[0];
+  if (rowBytes != bounds[1] || rowBytes <= 0 ||
+      rowBytes % sizeof(int64_t) != 0 ||
+      rowBytes / sizeof(int64_t) > kMaxLanes) {
     return 0;
   }
   return static_cast<uint32_t>(rowBytes / sizeof(int64_t));
