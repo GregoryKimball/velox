@@ -1828,6 +1828,66 @@ TEST_F(CudfDecimalTest, compactSumUcxFragmentSchemasAndSerde) {
   EXPECT_EQ(copy->serialize(), gpuConsumer->serialize());
 }
 
+TEST_F(CudfDecimalTest, compactSumPassesThroughLocalExchangeProjects) {
+  // Prestissimo puts a Project that renames and reorders columns on each source
+  // of a local exchange, here between the UCX exchange and the FINAL
+  // aggregation, and between the PARTIAL aggregation and the UCX output.
+  auto input = makeRowVector(
+      {"k", "d"},
+      {makeFlatVector<int32_t>({1}),
+       makeFlatVector<int64_t>({100}, DECIMAL(12, 2))});
+  auto producer = exec::test::PlanBuilder()
+                      .values({input})
+                      .partialAggregation({"k"}, {"sum(d) AS s", "avg(d) AS a"})
+                      .project({"s AS s2", "k AS k2", "a AS a2"})
+                      .localPartition({"k2"})
+                      .partitionedOutput(
+                          {"k2"},
+                          2,
+                          false,
+                          {},
+                          "Presto",
+                          std::string{core::TransportKind::kUcx})
+                      .planNode();
+  auto consumer = exec::test::PlanBuilder()
+                      .exchange(
+                          producer->outputType(),
+                          "Presto",
+                          std::string{core::TransportKind::kUcx})
+                      .project({"k2 AS k", "s2 AS s", "a2 AS a"})
+                      .localPartition({"k"})
+                      .finalAggregation(
+                          {"k"},
+                          {"sum(s) AS s", "avg(a) AS a"},
+                          {{DECIMAL(12, 2)}, {DECIMAL(12, 2)}})
+                      .planNode();
+  auto gpuProducer = CudfPlanRewriter::rewrite(producer);
+  auto gpuConsumer = CudfPlanRewriter::rewrite(consumer);
+
+  auto* output =
+      dynamic_cast<const core::PartitionedOutputNode*>(gpuProducer.get());
+  ASSERT_NE(output, nullptr);
+  EXPECT_EQ(*output->outputType()->childAt(0), *DECIMAL(38, 2));
+  EXPECT_EQ(*output->outputType()->childAt(1), *INTEGER());
+  EXPECT_EQ(*output->outputType()->childAt(2), *VARBINARY());
+  EXPECT_EQ(*producer->outputType()->childAt(0), *VARBINARY());
+
+  auto* aggregation =
+      dynamic_cast<const CudfAggregationNode*>(gpuConsumer.get());
+  ASSERT_NE(aggregation, nullptr);
+  EXPECT_TRUE(aggregation->usesCompactDecimalSum(0));
+  EXPECT_EQ(*gpuConsumer->outputType(), *consumer->outputType());
+  const auto& local = gpuConsumer->sources()[0];
+  const auto& project = local->sources()[0];
+  auto* exchange =
+      dynamic_cast<const core::ExchangeNode*>(project->sources()[0].get());
+  ASSERT_NE(exchange, nullptr);
+  EXPECT_EQ(*exchange->outputType(), *output->outputType());
+  EXPECT_EQ(*project->outputType()->findChild("s"), *DECIMAL(38, 2));
+  EXPECT_EQ(*local->outputType()->findChild("s"), *DECIMAL(38, 2));
+  EXPECT_EQ(*local->outputType()->findChild("a"), *VARBINARY());
+}
+
 TEST_F(CudfDecimalTest, compactSumRejectsGpuDisabledWithCpuFallback) {
   enableCpuFallback();
   auto input =

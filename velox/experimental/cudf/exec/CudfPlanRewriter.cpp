@@ -81,6 +81,23 @@ void checkFields(const core::TypedExprPtr& expr, const RowTypePtr& inputType) {
   }
 }
 
+// Prestissimo puts a Project that only renames and reorders columns on each
+// source of a local exchange.
+const core::ProjectNode* asPassThroughProject(const PlanNodePtr& node) {
+  const auto* project = dynamic_cast<const core::ProjectNode*>(node.get());
+  if (!project || node->name() != "Project") {
+    return nullptr;
+  }
+  for (const auto& projection : project->projections()) {
+    const auto* field =
+        dynamic_cast<const core::FieldAccessTypedExpr*>(projection.get());
+    if (!field || !field->isInputColumn()) {
+      return nullptr;
+    }
+  }
+  return project;
+}
+
 bool hasCompactOutput(const PlanNodePtr& node) {
   if (const auto* aggregation =
           dynamic_cast<const CudfAggregationNode*>(node.get())) {
@@ -94,7 +111,62 @@ bool hasCompactOutput(const PlanNodePtr& node) {
       }
     }
   }
+  if (asPassThroughProject(node)) {
+    return hasCompactOutput(node->sources()[0]);
+  }
   return false;
+}
+
+PlanNodePtr rewriteNode(
+    const PlanNodePtr& node,
+    const RowTypePtr& expected,
+    bool compactInput = false);
+
+// Rewrites a pass-through Project on a source of a local exchange. Compact
+// state passes through it: each output column has the type of the source
+// column it forwards. `expected` applies to the Project's output.
+PlanNodePtr rewritePassThroughProject(
+    const PlanNodePtr& node,
+    const core::ProjectNode& project,
+    const RowTypePtr& expected,
+    bool compactInput) {
+  const auto& source = project.sources()[0];
+  const auto& sourceType = source->outputType();
+  auto fieldName = [](const core::TypedExprPtr& projection) {
+    return static_cast<const core::FieldAccessTypedExpr&>(*projection).name();
+  };
+
+  RowTypePtr sourceExpected;
+  if (expected) {
+    auto types = sourceType->children();
+    std::vector<bool> assigned(types.size(), false);
+    for (size_t i = 0; i < project.projections().size(); ++i) {
+      const auto name = fieldName(project.projections()[i]);
+      const auto channel = sourceType->getChildIdx(name);
+      VELOX_USER_CHECK(
+          !assigned[channel] || *types[channel] == *expected->childAt(i),
+          "Conflicting compact state requirements for {}",
+          name);
+      types[channel] = expected->childAt(i);
+      assigned[channel] = true;
+    }
+    sourceExpected = ROW(sourceType->names(), std::move(types));
+  }
+
+  auto rewritten = rewriteNode(source, sourceExpected, compactInput);
+  if (rewritten == source) {
+    return node;
+  }
+  std::vector<core::TypedExprPtr> projections;
+  for (const auto& projection : project.projections()) {
+    const auto name = fieldName(projection);
+    projections.push_back(std::make_shared<core::FieldAccessTypedExpr>(
+        rewritten->outputType()->findChild(name), name));
+  }
+  return core::ProjectNode::Builder(project)
+      .projections(std::move(projections))
+      .source(rewritten)
+      .build();
 }
 
 // expected is supplied by a consumer, never inferred from a VARBINARY exchange
@@ -102,7 +174,7 @@ bool hasCompactOutput(const PlanNodePtr& node) {
 PlanNodePtr rewriteNode(
     const PlanNodePtr& node,
     const RowTypePtr& expected,
-    bool compactInput = false) {
+    bool compactInput) {
   if (compactInput) {
     VELOX_USER_CHECK(
         dynamic_cast<const AggregationNode*>(node.get()) ||
@@ -250,7 +322,10 @@ PlanNodePtr rewriteNode(
     std::vector<PlanNodePtr> sources;
     bool changed = false;
     for (const auto& source : local->sources()) {
-      auto rewritten = rewriteNode(source, expected, compactInput);
+      const auto* project = asPassThroughProject(source);
+      auto rewritten = project
+          ? rewritePassThroughProject(source, *project, expected, compactInput)
+          : rewriteNode(source, expected, compactInput);
       changed |= rewritten != source;
       sources.push_back(std::move(rewritten));
     }
