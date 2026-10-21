@@ -28,6 +28,20 @@ enum class ExchangePayloadCodec : uint8_t {
   kNone = 0,
   kFusedFor = 1,
   kCascaded = 2,
+  /// Fused FOR of a table in which fixed-width string columns were replaced by
+  /// 64-bit lane columns. The lane columns are listed after the cuDF metadata.
+  kFusedForLanes = 3,
+};
+
+/// A string column whose rows all have the same width, a multiple of eight
+/// bytes. The sender replaced it with `lanes` INT64 columns, where lane `l` of
+/// row `r` holds bytes [8 * l, 8 * l + 8) of the row. `column` is the position
+/// of the string column in the original table.
+struct ExchangeLaneColumn {
+  uint32_t column;
+  uint32_t lanes;
+
+  bool operator==(const ExchangeLaneColumn&) const = default;
 };
 
 /// Metadata needed to reconstruct a received exchange payload. `cudfMetadata`
@@ -39,16 +53,21 @@ struct ExchangePayloadMetadata {
   std::size_t logicalDataSize{0};
   /// Number of fused FOR segments. Zero for other codecs.
   std::size_t auxiliaryCount{0};
+  /// Columns split into lanes, in increasing column order. Empty unless the
+  /// codec is kFusedForLanes.
+  std::vector<ExchangeLaneColumn> laneColumns;
 };
 
 /// Prepends the codec, uncompressed byte count, and number of fused FOR
 /// segments to serialized cuDF metadata. The segment count is zero for
-/// Cascaded. This is used only for compressed payloads.
+/// Cascaded. kFusedForLanes also appends `laneColumns`, which must be empty for
+/// other codecs. This is used only for compressed payloads.
 std::unique_ptr<std::vector<uint8_t>> wrapExchangePayloadMetadata(
     std::unique_ptr<std::vector<uint8_t>> cudfMetadata,
     ExchangePayloadCodec codec,
     std::size_t logicalDataSize,
-    std::size_t auxiliaryCount);
+    std::size_t auxiliaryCount,
+    const std::vector<ExchangeLaneColumn>& laneColumns = {});
 
 /// Removes and parses the compression header. If `metadata` has no compression
 /// header, returns it unchanged with codec kNone.

@@ -33,6 +33,7 @@ constexpr std::size_t kHeaderSize = kMagic.size() + sizeof(kVersion) +
     sizeof(uint16_t) + sizeof(uint8_t) + 3 * sizeof(uint64_t);
 
 static_assert(kHeaderSize == 37);
+static_assert(sizeof(ExchangeLaneColumn) == 2 * sizeof(uint32_t));
 
 template <typename T>
 void appendScalar(std::vector<uint8_t>& output, T value) {
@@ -56,7 +57,8 @@ T readScalar(const uint8_t*& current) {
 void checkEnvelopeCodec(ExchangePayloadCodec codec, uint64_t auxiliaryCount) {
   VELOX_CHECK(
       codec == ExchangePayloadCodec::kFusedFor ||
-          codec == ExchangePayloadCodec::kCascaded,
+          codec == ExchangePayloadCodec::kCascaded ||
+          codec == ExchangePayloadCodec::kFusedForLanes,
       "Unsupported exchange payload codec: {}",
       static_cast<uint8_t>(codec));
   VELOX_CHECK(
@@ -65,18 +67,42 @@ void checkEnvelopeCodec(ExchangePayloadCodec codec, uint64_t auxiliaryCount) {
       auxiliaryCount);
 }
 
+// Only kFusedForLanes lists lane columns, and it lists at least one. Columns
+// are in increasing order and each is split into at least one lane.
+void checkLaneColumns(
+    ExchangePayloadCodec codec,
+    const std::vector<ExchangeLaneColumn>& laneColumns) {
+  VELOX_CHECK_EQ(
+      codec == ExchangePayloadCodec::kFusedForLanes,
+      !laneColumns.empty(),
+      "Lane columns must be present exactly for the fused FOR lanes codec");
+  for (size_t i = 0; i < laneColumns.size(); ++i) {
+    VELOX_CHECK_GT(laneColumns[i].lanes, 0, "Lane column without lanes");
+    VELOX_CHECK(
+        i == 0 || laneColumns[i - 1].column < laneColumns[i].column,
+        "Lane columns are not in increasing column order");
+  }
+}
+
 } // namespace
 
 std::unique_ptr<std::vector<uint8_t>> wrapExchangePayloadMetadata(
     std::unique_ptr<std::vector<uint8_t>> cudfMetadata,
     ExchangePayloadCodec codec,
     std::size_t logicalDataSize,
-    std::size_t auxiliaryCount) {
+    std::size_t auxiliaryCount,
+    const std::vector<ExchangeLaneColumn>& laneColumns) {
   VELOX_CHECK_NOT_NULL(cudfMetadata);
   checkEnvelopeCodec(codec, auxiliaryCount);
+  checkLaneColumns(codec, laneColumns);
 
   auto output = std::make_unique<std::vector<uint8_t>>();
-  output->reserve(kHeaderSize + cudfMetadata->size());
+  output->reserve(
+      kHeaderSize + cudfMetadata->size() +
+      (laneColumns.empty()
+           ? 0
+           : sizeof(uint32_t) +
+               laneColumns.size() * sizeof(ExchangeLaneColumn)));
   output->insert(output->end(), kMagic.begin(), kMagic.end());
   appendScalar(*output, kVersion);
   appendScalar(*output, static_cast<uint16_t>(kHeaderSize));
@@ -85,6 +111,13 @@ std::unique_ptr<std::vector<uint8_t>> wrapExchangePayloadMetadata(
   appendScalar(*output, static_cast<uint64_t>(auxiliaryCount));
   appendScalar(*output, static_cast<uint64_t>(cudfMetadata->size()));
   output->insert(output->end(), cudfMetadata->begin(), cudfMetadata->end());
+  if (!laneColumns.empty()) {
+    appendScalar(*output, static_cast<uint32_t>(laneColumns.size()));
+    for (const auto& laneColumn : laneColumns) {
+      appendScalar(*output, laneColumn.column);
+      appendScalar(*output, laneColumn.lanes);
+    }
+  }
   return output;
 }
 
@@ -115,18 +148,46 @@ ExchangePayloadMetadata unwrapExchangePayloadMetadata(
       headerSize, kHeaderSize, "Invalid exchange compression header size");
   const auto codec = static_cast<ExchangePayloadCodec>(codecValue);
   checkEnvelopeCodec(codec, auxiliaryCount);
-  VELOX_CHECK_EQ(
-      cudfMetadataSize,
-      static_cast<uint64_t>(end - current),
-      "Invalid exchange cuDF metadata size");
+  const auto remaining = static_cast<uint64_t>(end - current);
+  if (codec != ExchangePayloadCodec::kFusedForLanes) {
+    VELOX_CHECK_EQ(
+        cudfMetadataSize, remaining, "Invalid exchange cuDF metadata size");
+  } else {
+    VELOX_CHECK_LE(
+        cudfMetadataSize, remaining, "Invalid exchange cuDF metadata size");
+    VELOX_CHECK_GE(
+        remaining - cudfMetadataSize,
+        sizeof(uint32_t),
+        "Truncated exchange lane column list");
+  }
+  const auto* cudfMetadataBegin = current;
+  current += cudfMetadataSize;
+
+  std::vector<ExchangeLaneColumn> laneColumns;
+  if (codec == ExchangePayloadCodec::kFusedForLanes) {
+    const auto count = readScalar<uint32_t>(current);
+    VELOX_CHECK_EQ(
+        static_cast<uint64_t>(end - current),
+        static_cast<uint64_t>(count) * sizeof(ExchangeLaneColumn),
+        "Invalid exchange lane column list size");
+    laneColumns.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+      const auto column = readScalar<uint32_t>(current);
+      const auto lanes = readScalar<uint32_t>(current);
+      laneColumns.push_back(ExchangeLaneColumn{column, lanes});
+    }
+  }
+  checkLaneColumns(codec, laneColumns);
 
   auto cudfMetadata = std::make_unique<std::vector<uint8_t>>(
-      current, current + static_cast<std::size_t>(cudfMetadataSize));
+      cudfMetadataBegin,
+      cudfMetadataBegin + static_cast<std::size_t>(cudfMetadataSize));
   return ExchangePayloadMetadata{
       std::move(cudfMetadata),
       codec,
       static_cast<std::size_t>(logicalDataSize),
-      static_cast<std::size_t>(auxiliaryCount)};
+      static_cast<std::size_t>(auxiliaryCount),
+      std::move(laneColumns)};
 }
 
 } // namespace facebook::velox::ucx_exchange

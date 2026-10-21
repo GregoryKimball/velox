@@ -20,6 +20,7 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/contiguous_split.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #if __has_include(<cudf/detail/fused_for.hpp>)
 #define VELOX_UCX_TEST_HAS_FUSED_FOR 1
 #include <cudf/detail/fused_for.hpp>
@@ -174,6 +175,69 @@ class ExchangeCompressionTest : public testing::Test {
     return column;
   }
 
+  // Makes a strings column whose row `i` has the bytes of `rows[i]`.
+  static std::unique_ptr<cudf::column> makeStringsColumn(
+      const std::vector<std::vector<int64_t>>& rows,
+      cuda::stream_ref stream) {
+    std::vector<int32_t> offsets{0};
+    std::vector<int64_t> chars;
+    for (const auto& row : rows) {
+      chars.insert(chars.end(), row.begin(), row.end());
+      offsets.push_back(static_cast<int32_t>(chars.size() * sizeof(int64_t)));
+    }
+    auto offsetsColumn = makeColumn(offsets, stream);
+    rmm::device_buffer charsBuffer(
+        chars.data(),
+        chars.size() * sizeof(int64_t),
+        stream,
+        cudf::get_current_device_resource_ref());
+    CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+    return cudf::make_strings_column(
+        static_cast<cudf::size_type>(rows.size()),
+        std::move(offsetsColumn),
+        std::move(charsBuffer),
+        0,
+        cudf::create_null_mask(
+            static_cast<cudf::size_type>(rows.size()),
+            cudf::mask_state::UNALLOCATED,
+            stream));
+  }
+
+  // Returns the bytes of each row of a strings column as INT64 values. Every
+  // row must be a multiple of eight bytes long.
+  static std::vector<std::vector<int64_t>> readStringsColumn(
+      const cudf::column_view& column,
+      cuda::stream_ref stream) {
+    const cudf::strings_column_view strings{column};
+    EXPECT_EQ(column.offset(), 0);
+    const auto offsets = readColumn(strings.offsets(), stream);
+    std::vector<int64_t> chars(strings.chars_size(stream) / sizeof(int64_t));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        chars.data(),
+        strings.chars_begin(stream),
+        chars.size() * sizeof(int64_t),
+        cudaMemcpyDeviceToHost,
+        stream.get()));
+    CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+    std::vector<std::vector<int64_t>> rows;
+    for (cudf::size_type i = 0; i < column.size(); ++i) {
+      EXPECT_EQ(offsets[i] % static_cast<int32_t>(sizeof(int64_t)), 0);
+      rows.emplace_back(
+          chars.begin() + offsets[i] / sizeof(int64_t),
+          chars.begin() + offsets[i + 1] / sizeof(int64_t));
+    }
+    return rows;
+  }
+
+  // 32-byte rows {count, 0, sum, 0} like the decimal aggregation states.
+  static std::vector<std::vector<int64_t>> stateRows(int rows) {
+    std::vector<std::vector<int64_t>> result;
+    for (int i = 0; i < rows; ++i) {
+      result.push_back({i % 7 + 1, 0, int64_t{1'000'000} + i * 3, 0});
+    }
+    return result;
+  }
+
   static std::vector<int32_t> readColumn(
       const cudf::column_view& column,
       cuda::stream_ref stream) {
@@ -325,6 +389,8 @@ TEST(ExchangeCompressionConfigTest, parsesSupportedSelectorNames) {
       "fused-for-bitpacked", ExchangeCompression::kFusedForBitpacked);
   modes.emplace_back(
       "fused-for-byte-aligned", ExchangeCompression::kFusedForByteAligned);
+  modes.emplace_back(
+      "fused-for-bitpacked-lanes", ExchangeCompression::kFusedForBitpackedLanes);
 #endif
   for (const auto& [name, mode] : modes) {
     EXPECT_EQ(parseExchangeCompression(name), mode);
@@ -333,6 +399,8 @@ TEST(ExchangeCompressionConfigTest, parsesSupportedSelectorNames) {
   EXPECT_THROW(parseExchangeCompression("fused-for-bitpacked"), VeloxUserError);
   EXPECT_THROW(
       parseExchangeCompression("fused-for-byte-aligned"), VeloxUserError);
+  EXPECT_THROW(
+      parseExchangeCompression("fused-for-bitpacked-lanes"), VeloxUserError);
 #endif
 }
 
@@ -548,6 +616,110 @@ TEST_F(
     EXPECT_THAT(
         error.what(), testing::HasSubstr("fused FOR descriptor size overflow"));
   }
+}
+#endif
+
+#if VELOX_UCX_TEST_HAS_FUSED_FOR
+TEST_F(ExchangeCompressionTest, splitsFixedWidthStringsIntoLanes) {
+  constexpr int kRows = 30'000;
+  const auto memoryResource = cudf::get_current_device_resource_ref();
+  std::vector<int32_t> keys(kRows);
+  for (int i = 0; i < kRows; ++i) {
+    keys[i] = 5 * i;
+  }
+  const auto states = stateRows(kRows);
+  auto keyColumn = makeColumn(keys, stream_);
+  auto stateColumn = makeStringsColumn(states, stream_);
+  const cudf::table_view input{
+      std::vector<cudf::column_view>{keyColumn->view(), stateColumn->view()}};
+  const std::vector<cudf::size_type> splits{10'000, 20'001};
+
+  auto plain = splitExchangePayloads(
+      input,
+      splits,
+      ExchangeCompression::kFusedForBitpacked,
+      stream_,
+      memoryResource,
+      memoryResource);
+  auto lanes = splitExchangePayloads(
+      input,
+      splits,
+      ExchangeCompression::kFusedForBitpackedLanes,
+      stream_,
+      memoryResource,
+      memoryResource);
+  stream_.synchronize();
+  ASSERT_EQ(lanes.size(), splits.size() + 1);
+
+  rmm::cuda_stream consumer;
+  cudf::size_type rowStart = 0;
+  for (size_t i = 0; i < lanes.size(); ++i) {
+    const auto rowEnd = i < splits.size() ? splits[i] : kRows;
+    const auto rows = rowEnd - rowStart;
+    ASSERT_EQ(plain[i].codec, ExchangePayloadCodec::kFusedFor);
+    ASSERT_EQ(lanes[i].codec, ExchangePayloadCodec::kFusedForLanes);
+    // Strings are sent uncompressed without lanes. With lanes, each lane needs
+    // at most 20 bits per row here.
+    const auto rowCount = static_cast<size_t>(rows);
+    EXPECT_GT(plain[i].packed->gpu_data->size(), rowCount * 32);
+    EXPECT_LT(lanes[i].packed->gpu_data->size(), rowCount * 12);
+    // The logical size is that of the key and the four lanes.
+    EXPECT_GE(
+        lanes[i].logicalDataSize,
+        rowCount * (sizeof(int32_t) + 4 * sizeof(int64_t)));
+    auto metadata = unwrapExchangePayloadMetadata(
+        std::make_unique<std::vector<uint8_t>>(*lanes[i].packed->metadata));
+    EXPECT_EQ(
+        metadata.laneColumns, (std::vector<ExchangeLaneColumn>{{1, 4}}));
+
+    auto received = restoreExchangePayload(
+        std::move(lanes[i].packed->metadata),
+        std::move(lanes[i].packed->gpu_data),
+        consumer,
+        rows);
+    ASSERT_TRUE(received->table);
+    EXPECT_FALSE(received->packedTable);
+    EXPECT_EQ(received->numRows, rows);
+    const auto view = received->tableView();
+    ASSERT_EQ(view.num_columns(), 2);
+    EXPECT_EQ(
+        readColumn(view.column(0), consumer),
+        std::vector<int32_t>(keys.begin() + rowStart, keys.begin() + rowEnd));
+    ASSERT_EQ(view.column(1).type(), cudf::data_type{cudf::type_id::STRING});
+    EXPECT_FALSE(view.column(1).has_nulls());
+    EXPECT_EQ(
+        readStringsColumn(view.column(1), consumer),
+        std::vector<std::vector<int64_t>>(
+            states.begin() + rowStart, states.begin() + rowEnd));
+    rowStart = rowEnd;
+  }
+}
+
+TEST_F(ExchangeCompressionTest, keepsVariableWidthStringsWithLanes) {
+  const auto memoryResource = cudf::get_current_device_resource_ref();
+  // Rows of 8 and 24 bytes average 16 bytes, but have no common width.
+  std::vector<std::vector<int64_t>> values;
+  for (int i = 0; i < 1'000; ++i) {
+    values.push_back(
+        i % 2 == 0 ? std::vector<int64_t>{i}
+                   : std::vector<int64_t>{i, i + 1, i + 2});
+  }
+  auto column = makeStringsColumn(values, stream_);
+  auto payload = packExchangePayload(
+      cudf::table_view{std::vector<cudf::column_view>{column->view()}},
+      ExchangeCompression::kFusedForBitpackedLanes,
+      stream_,
+      memoryResource,
+      memoryResource);
+  stream_.synchronize();
+  ASSERT_EQ(payload.codec, ExchangePayloadCodec::kFusedFor);
+  auto received = restoreExchangePayload(
+      std::move(payload.packed->metadata),
+      std::move(payload.packed->gpu_data),
+      stream_,
+      static_cast<vector_size_t>(values.size()));
+  ASSERT_TRUE(received->packedTable);
+  EXPECT_EQ(readStringsColumn(received->tableView().column(0), stream_), values);
 }
 #endif
 
