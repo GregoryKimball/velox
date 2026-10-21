@@ -1131,6 +1131,17 @@ std::unique_ptr<StreamingGroupbyAggregator> createStreamingGroupbyAggregator(
   }
 
   const auto prefix = cudf_velox::CudfConfig::getInstance().functionNamePrefix;
+  if (aggregate.compactDecimalSum) {
+    // The compact Decimal64 SUM state is a plain DECIMAL128 sum, not the
+    // VARBINARY state StreamingGroupbyDecimalAggregator decodes.
+    if (!cudf::groupby::is_streaming_groupby_supported(
+            cudf_velox::veloxToCudfDataType(inputType),
+            cudf::aggregation::SUM)) {
+      return nullptr;
+    }
+    return std::make_unique<StreamingGroupbySumAggregator>(
+        inputIndex, resultType);
+  }
   if (aggregate.isDecimalAggregate) {
     const bool average = aggregate.kind == prefix + "avg";
     if (aggregate.kind != prefix + "sum" && !average) {
