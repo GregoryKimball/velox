@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 #include "velox/experimental/ucx-exchange/UcxExchange.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/ucx-exchange/ExchangeCompression.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 using facebook::velox::exec::Operator;
@@ -175,6 +177,8 @@ RowVectorPtr UcxExchange::getOutputFromPackedTable() {
   // Get the received table and the CUDA stream that was used to allocate its
   // memory.
   PackedTableWithStream& data = *currentData_;
+  // Lanes are joined here, on the driver thread, not in the receive callback.
+  joinExchangeLanes(data, get_output_mr());
   // The producer's count, not table.num_rows(): a packed table with no columns
   // reports zero rows however many it holds, which is what an exchange
   // fragment with an empty output layout sends.

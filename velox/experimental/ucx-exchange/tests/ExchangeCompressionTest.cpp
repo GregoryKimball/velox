@@ -677,8 +677,14 @@ TEST_F(ExchangeCompressionTest, splitsFixedWidthStringsIntoLanes) {
         std::move(lanes[i].packed->gpu_data),
         consumer,
         rows);
+    // The receive path leaves the lanes packed; the consumer joins them.
+    ASSERT_TRUE(received->packedTable);
+    EXPECT_EQ(
+        received->laneColumns, (std::vector<ExchangeLaneColumn>{{1, 4}}));
+    joinExchangeLanes(*received, memoryResource);
     ASSERT_TRUE(received->table);
     EXPECT_FALSE(received->packedTable);
+    EXPECT_TRUE(received->laneColumns.empty());
     EXPECT_EQ(received->numRows, rows);
     const auto view = received->tableView();
     ASSERT_EQ(view.num_columns(), 2);
@@ -718,6 +724,9 @@ TEST_F(ExchangeCompressionTest, keepsVariableWidthStringsWithLanes) {
       std::move(payload.packed->gpu_data),
       stream_,
       static_cast<vector_size_t>(values.size()));
+  ASSERT_TRUE(received->packedTable);
+  EXPECT_TRUE(received->laneColumns.empty());
+  joinExchangeLanes(*received, memoryResource);
   ASSERT_TRUE(received->packedTable);
   EXPECT_EQ(readStringsColumn(received->tableView().column(0), stream_), values);
 }

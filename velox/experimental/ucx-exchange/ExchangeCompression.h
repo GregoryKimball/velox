@@ -93,12 +93,21 @@ std::vector<PackedExchangePayload> splitExchangePayloads(
 
 /// Reconstructs a received table using the codec stored in `metadata`.
 /// Uncompressed and fused FOR data remain in packed cuDF storage. Cascaded
-/// decompression and fused FOR with lanes return an owning cudf::table. The result retains `stream`
-/// and the row count reported by the producer.
+/// decompression returns an owning cudf::table. Fused FOR with lanes stays
+/// packed with its lane columns listed; joinExchangeLanes() finishes it. The
+/// result retains `stream` and the row count reported by the producer.
 std::unique_ptr<PackedTableWithStream> restoreExchangePayload(
     std::unique_ptr<std::vector<uint8_t>> metadata,
     std::unique_ptr<rmm::device_buffer> data,
     cuda::stream_ref stream,
     vector_size_t numRows);
+
+/// Joins the lane columns of a received fused FOR lanes payload back into its
+/// strings columns, leaving an owning table. restoreExchangePayload() runs in
+/// the UCX receive callback, so this is left to the consumer. Does nothing for
+/// other payloads.
+void joinExchangeLanes(
+    PackedTableWithStream& data,
+    rmm::device_async_resource_ref memoryResource);
 
 } // namespace facebook::velox::ucx_exchange

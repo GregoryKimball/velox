@@ -527,24 +527,38 @@ std::unique_ptr<PackedTableWithStream> restoreExchangePayload(
               envelope.logicalDataSize},
           stream,
           memoryResource);
-      if (envelope.laneColumns.empty()) {
-        return retainPackedPayload(
-            std::move(decoded.metadata),
-            std::move(decoded.gpu_data),
-            stream,
-            numRows);
-      }
-      // The decoded buffer is freed on 'stream' after joinLanes() copies it.
-      auto table = joinLanes(
-          cudf::unpack(decoded), envelope.laneColumns, stream, memoryResource);
-      return std::make_unique<PackedTableWithStream>(
-          std::move(table), stream, envelope.logicalDataSize, numRows);
+      auto result = retainPackedPayload(
+          std::move(decoded.metadata),
+          std::move(decoded.gpu_data),
+          stream,
+          numRows);
+      result->laneColumns = std::move(envelope.laneColumns);
+      return result;
     }
 #else
       fusedForUnavailable();
 #endif
   }
   VELOX_UNREACHABLE();
+}
+
+void joinExchangeLanes(
+    PackedTableWithStream& data,
+    rmm::device_async_resource_ref memoryResource) {
+  if (data.laneColumns.empty()) {
+    return;
+  }
+#if VELOX_UCX_HAS_FUSED_FOR
+  VELOX_CHECK_NOT_NULL(data.packedTable);
+  data.table = joinLanes(
+      data.packedTable->table, data.laneColumns, data.stream, memoryResource);
+  // The packed buffer was allocated on data.stream, so it is freed after the
+  // join has read it.
+  data.packedTable.reset();
+  data.laneColumns.clear();
+#else
+  fusedForUnavailable();
+#endif
 }
 
 } // namespace facebook::velox::ucx_exchange
