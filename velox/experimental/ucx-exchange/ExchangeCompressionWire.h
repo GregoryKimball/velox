@@ -55,7 +55,7 @@ struct ExchangePayloadMetadata {
   std::size_t auxiliaryCount{0};
   /// Columns split into lanes, in increasing column order. Empty unless the
   /// codec is kFusedForLanes.
-  std::vector<ExchangeLaneColumn> laneColumns;
+  std::vector<ExchangeLaneColumn> laneColumns{};
 };
 
 /// Prepends the codec, uncompressed byte count, and number of fused FOR
