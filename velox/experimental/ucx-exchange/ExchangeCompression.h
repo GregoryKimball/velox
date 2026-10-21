@@ -39,16 +39,24 @@ struct PackedTableWithStream;
 /// Compression mode used by one exchange output operator. The two fused
 /// frame-of-reference (FOR) modes store transformed integers differently, but
 /// both are identified as kFusedFor in the metadata sent to the receiver.
+/// kFusedForBitpackedLanes is kFusedForBitpacked after each string column whose
+/// rows all have the same width, a multiple of eight bytes, is split into one
+/// INT64 column per eight bytes (lane). Fused FOR sends strings uncompressed,
+/// but encodes each lane with its own frame of reference. This compresses
+/// fixed-width binary values made of integers, such as the 32-byte decimal
+/// aggregation states.
 enum class ExchangeCompression {
   kNone,
   kFusedForBitpacked,
   kFusedForByteAligned,
   kCascaded,
+  kFusedForBitpackedLanes,
 };
 
 /// Contains the cuDF metadata and GPU data to send, together with the codec the
 /// receiver must use. If Cascaded does not make the data smaller, `codec` is
-/// kNone and `packed` contains the original uncompressed data.
+/// kNone and `packed` contains the original uncompressed data. With
+/// kFusedForBitpackedLanes, `codec` is kFusedFor when no column was split.
 struct PackedExchangePayload {
   std::unique_ptr<cudf::packed_columns> packed;
   ExchangePayloadCodec codec{ExchangePayloadCodec::kNone};
@@ -85,12 +93,21 @@ std::vector<PackedExchangePayload> splitExchangePayloads(
 
 /// Reconstructs a received table using the codec stored in `metadata`.
 /// Uncompressed and fused FOR data remain in packed cuDF storage. Cascaded
-/// decompression returns an owning cudf::table. The result retains `stream`
-/// and the row count reported by the producer.
+/// decompression returns an owning cudf::table. Fused FOR with lanes stays
+/// packed with its lane columns listed; joinExchangeLanes() finishes it. The
+/// result retains `stream` and the row count reported by the producer.
 std::unique_ptr<PackedTableWithStream> restoreExchangePayload(
     std::unique_ptr<std::vector<uint8_t>> metadata,
     std::unique_ptr<rmm::device_buffer> data,
     cuda::stream_ref stream,
     vector_size_t numRows);
+
+/// Joins the lane columns of a received fused FOR lanes payload back into its
+/// strings columns, leaving an owning table. restoreExchangePayload() runs in
+/// the UCX receive callback, so this is left to the consumer. Does nothing for
+/// other payloads.
+void joinExchangeLanes(
+    PackedTableWithStream& data,
+    rmm::device_async_resource_ref memoryResource);
 
 } // namespace facebook::velox::ucx_exchange

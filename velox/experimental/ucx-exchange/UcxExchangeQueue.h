@@ -23,6 +23,7 @@
 #include <memory>
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/future/VeloxPromise.h"
+#include "velox/experimental/ucx-exchange/ExchangeCompressionWire.h"
 #include "velox/vector/TypeAliases.h"
 
 namespace facebook::velox::ucx_exchange {
@@ -45,6 +46,11 @@ struct PackedTableWithStream {
   /// an empty output layout sends. 32-bit because a cuDF table cannot hold more
   /// rows than a cudf::size_type can index.
   vector_size_t numRows{0};
+
+  /// Columns of a fused FOR lanes payload that `packedTable` still holds as
+  /// INT64 lanes. The consumer joins them with joinExchangeLanes() before it
+  /// uses the table.
+  std::vector<ExchangeLaneColumn> laneColumns{};
 
   PackedTableWithStream() = default;
   PackedTableWithStream(

@@ -123,7 +123,7 @@ TEST(ExchangeCompressionWireTest, leavesRawMetadataUnchanged) {
 TEST(
     ExchangeCompressionWireTest,
     rejectsOtherCodecsInsteadOfTreatingThemAsRaw) {
-  for (uint8_t codec : {0, 3, 255}) {
+  for (uint8_t codec : {0, 4, 255}) {
     auto wrapped = cascadedEnvelope();
     putScalar(*wrapped, kCodecOffset, codec);
     EXPECT_THROW(
@@ -153,6 +153,72 @@ TEST(ExchangeCompressionWireTest, rejectsMalformedHeader) {
     EXPECT_THROW(
         unwrapExchangePayloadMetadata(std::move(wrapped)), VeloxRuntimeError);
   }
+}
+
+auto lanesEnvelope(const std::vector<ExchangeLaneColumn>& laneColumns) {
+  return wrapExchangePayloadMetadata(
+      std::make_unique<std::vector<uint8_t>>(
+          std::initializer_list<uint8_t>{9, 7, 5}),
+      ExchangePayloadCodec::kFusedForLanes,
+      1234,
+      17,
+      laneColumns);
+}
+
+TEST(ExchangeCompressionWireTest, roundTripsLaneColumns) {
+  const std::vector<ExchangeLaneColumn> laneColumns{{1, 4}, {3, 2}};
+  auto wrapped = lanesEnvelope(laneColumns);
+
+  // The lane list follows the cuDF metadata: a count, then column and lane
+  // count of each entry.
+  auto expected = referenceEnvelope(3, 17);
+  for (uint32_t value : {2, 1, 4, 3, 2}) {
+    expected.resize(expected.size() + sizeof(value));
+    putScalar(expected, expected.size() - sizeof(value), value);
+  }
+  EXPECT_EQ(*wrapped, expected);
+
+  auto decoded = unwrapExchangePayloadMetadata(std::move(wrapped));
+  EXPECT_EQ(decoded.codec, ExchangePayloadCodec::kFusedForLanes);
+  EXPECT_EQ(decoded.logicalDataSize, 1234);
+  EXPECT_EQ(decoded.auxiliaryCount, 17);
+  EXPECT_EQ(*decoded.cudfMetadata, (std::vector<uint8_t>{9, 7, 5}));
+  EXPECT_EQ(decoded.laneColumns, laneColumns);
+}
+
+TEST(ExchangeCompressionWireTest, rejectsInvalidLaneColumns) {
+  const std::vector<ExchangeLaneColumn> laneColumns{{1, 4}};
+  // Lane columns belong only to the lanes codec, which needs at least one.
+  EXPECT_THROW(
+      wrapExchangePayloadMetadata(
+          std::make_unique<std::vector<uint8_t>>(),
+          ExchangePayloadCodec::kFusedFor,
+          10,
+          1,
+          laneColumns),
+      VeloxRuntimeError);
+  EXPECT_THROW(lanesEnvelope({}), VeloxRuntimeError);
+  EXPECT_THROW(lanesEnvelope({{1, 0}}), VeloxRuntimeError);
+  EXPECT_THROW(lanesEnvelope({{3, 4}, {1, 4}}), VeloxRuntimeError);
+  EXPECT_THROW(lanesEnvelope({{1, 4}, {1, 4}}), VeloxRuntimeError);
+
+  // A truncated or overlong lane list, and a lanes codec without a list.
+  auto wrapped = lanesEnvelope(laneColumns);
+  wrapped->pop_back();
+  EXPECT_THROW(
+      unwrapExchangePayloadMetadata(std::move(wrapped)), VeloxRuntimeError);
+  wrapped = lanesEnvelope(laneColumns);
+  wrapped->push_back(0);
+  EXPECT_THROW(
+      unwrapExchangePayloadMetadata(std::move(wrapped)), VeloxRuntimeError);
+  wrapped = cascadedEnvelope();
+  putScalar(*wrapped, kCodecOffset, uint8_t{3});
+  EXPECT_THROW(
+      unwrapExchangePayloadMetadata(std::move(wrapped)), VeloxRuntimeError);
+  wrapped = lanesEnvelope(laneColumns);
+  putScalar(*wrapped, kMetadataSizeOffset, std::numeric_limits<uint64_t>::max());
+  EXPECT_THROW(
+      unwrapExchangePayloadMetadata(std::move(wrapped)), VeloxRuntimeError);
 }
 
 TEST(ExchangeCompressionWireTest, rejectsTruncatedEnvelope) {
