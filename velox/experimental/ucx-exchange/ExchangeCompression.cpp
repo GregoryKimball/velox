@@ -518,6 +518,8 @@ std::unique_ptr<PackedTableWithStream> restoreExchangePayload(
     case ExchangePayloadCodec::kFusedForLanes:
 #if VELOX_UCX_HAS_FUSED_FOR
     {
+      // 'memoryResource' refers to the resource owned by 'data', which
+      // decode_fused_for() consumes and frees. Do not use it after the call.
       auto memoryResource = data->memory_resource();
       auto decoded = cudf::detail::decode_fused_for(
           cudf::detail::fused_for_packed_columns{
