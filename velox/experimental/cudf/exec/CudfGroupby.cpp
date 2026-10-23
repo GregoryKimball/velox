@@ -1958,8 +1958,12 @@ CudfVectorPtr CudfGroupby::finalizeStreamingGroupby() {
 
     VELOX_CHECK(streamingGroupbyStream_.has_value());
     const auto stream = *streamingGroupbyStream_;
+    // Input has ended, so finalization is terminal: libcudf releases the
+    // lookup structures before allocating the output.
     auto [groupKeys, results] =
-        partition.groupby->finalize(stream, get_output_mr());
+        std::move(*partition.groupby)
+            .finalize_and_release(
+                stream, cudf::memory_resources{get_output_mr(), get_temp_mr()});
 
     std::vector<std::unique_ptr<cudf::column>> outputColumns;
     auto keyColumns = groupKeys->release();
@@ -1982,8 +1986,8 @@ CudfVectorPtr CudfGroupby::finalizeStreamingGroupby() {
           pool(), outputType_, numRows, std::move(resultTable), stream);
     }
 
-    // libcudf finalization reads persistent state asynchronously. Its
-    // destructor has no stream parameter, so wait before releasing that state.
+    // libcudf orders the release of the remaining state after output
+    // construction on 'stream'. Wait before dropping the consumed object.
     stream.sync();
     partition.groupby.reset();
     partition.capacity = 0;
