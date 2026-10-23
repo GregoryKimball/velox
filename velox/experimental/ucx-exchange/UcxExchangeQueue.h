@@ -145,9 +145,10 @@ class UcxExchangeQueue {
     return size_.load(std::memory_order_relaxed);
   }
 
-  /// Returns the total bytes held by packed tables in 'this'.
+  /// Returns the total bytes held by packed tables in 'this'. Safe to call
+  /// without 'mutex_'.
   int64_t totalBytes() const {
-    return totalBytes_;
+    return totalBytes_.load(std::memory_order_relaxed);
   }
 
   /// Returns the maximum value of total bytes.
@@ -251,8 +252,9 @@ class UcxExchangeQueue {
   // When set, all promises will be realized and the next dequeue will
   // throw an exception with this message.
   std::string error_;
-  // Total size of packed tables in queue.
-  int64_t totalBytes_{0};
+  // Total size of packed tables in queue. Updated under 'mutex_' and atomic for
+  // the same unlocked backpressure reads as 'size_'.
+  std::atomic<int64_t> totalBytes_{0};
   // Number of packed tables received.
   int64_t receivedTables_{0};
   // Total size of packed tables received. Used to calculate an average

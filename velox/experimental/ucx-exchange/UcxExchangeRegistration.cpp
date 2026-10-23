@@ -77,7 +77,8 @@ void registerUcxTransports() {
             // 'context.maxExchangeBufferSize' /
             // 'context.minExchangeOutputBatchBytes' have no meaning here.
             // UcxExchangeClient bounds its queue by the number of packed
-            // tables instead.
+            // tables instead, and optionally by the GPU bytes they hold
+            // (CudfConfig::exchangeMaxQueuedBytes).
             checkCudfEnabledForUcx(context.queryConfig);
             return std::make_shared<UcxExchangeClient>(
                 context.taskId, context.destination, context.numberOfConsumers);

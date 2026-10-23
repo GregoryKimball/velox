@@ -60,8 +60,8 @@ void UcxExchangeQueue::enqueueLocked(
 
   auto dataSize = data->gpuDataSize();
   totalBytes_ += dataSize;
-  if (peakBytes_ < totalBytes_) {
-    peakBytes_ = totalBytes_;
+  if (peakBytes_ < totalBytes_.load(std::memory_order_relaxed)) {
+    peakBytes_ = totalBytes_.load(std::memory_order_relaxed);
   }
 
   ++receivedTables_;

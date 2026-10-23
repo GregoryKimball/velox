@@ -39,6 +39,7 @@ TEST(ConfigTest, cudfConfig) {
       {CudfConfig::kCudfStreamingGroupbyEnabled, "true"},
       {CudfConfig::kCudfStreamingGroupbyCapacityMultiplier, "3.5"},
       {CudfConfig::kCudfStreamingGroupbyPartitions, "8"},
+      {CudfConfig::kUcxExchangeMaxQueuedBytes, "2147483648"},
       {CudfConfig::kCudfDecimalGroupbyNarrowAccumulation, "true"},
       {CudfConfig::kCudfCompactDecimalIntermediateState, "true"},
       {CudfConfig::kCudfAllowCpuFallback, "false"},
@@ -51,6 +52,7 @@ TEST(ConfigTest, cudfConfig) {
   ASSERT_FALSE(config.compactDecimalIntermediateState);
   ASSERT_EQ(config.streamingGroupbyCapacityMultiplier, 2.0);
   ASSERT_EQ(config.streamingGroupbyPartitions, 1);
+  ASSERT_EQ(config.exchangeMaxQueuedBytes, 0);
   config.initialize(std::move(options));
   ASSERT_EQ(config.enabled, false);
   ASSERT_EQ(config.debugEnabled, true);
@@ -60,6 +62,7 @@ TEST(ConfigTest, cudfConfig) {
   ASSERT_EQ(config.streamingGroupbyEnabled, true);
   ASSERT_EQ(config.streamingGroupbyCapacityMultiplier, 3.5);
   ASSERT_EQ(config.streamingGroupbyPartitions, 8);
+  ASSERT_EQ(config.exchangeMaxQueuedBytes, 2'147'483'648);
   ASSERT_TRUE(config.decimalGroupbyNarrowAccumulation);
   ASSERT_TRUE(config.compactDecimalIntermediateState);
   ASSERT_EQ(config.allowCpuFallback, false);
@@ -85,6 +88,13 @@ TEST(ConfigTest, rejectsNonPositiveBatchConcatTargets) {
   VELOX_ASSERT_USER_THROW(
       initialize(CudfConfig::kCudfBatchSizeMinBytes, "-1"),
       "cuDF BatchConcat minimum byte target must be a positive integer: -1");
+}
+
+TEST(ConfigTest, rejectsNegativeExchangeMaxQueuedBytes) {
+  CudfConfig config;
+  VELOX_ASSERT_USER_THROW(
+      config.initialize({{CudfConfig::kUcxExchangeMaxQueuedBytes, "-1"}}),
+      "UCX exchange maximum queued bytes must be a non-negative integer: -1");
 }
 
 TEST(ConfigTest, rejectsNonPositiveStreamingGroupbyPartitions) {

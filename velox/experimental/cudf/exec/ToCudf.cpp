@@ -561,6 +561,15 @@ void CudfConfig::initialize(
     partitionedOutputBatchRows =
         folly::to<int64_t>(config[kUcxPartitionedOutputBatchRows]);
   }
+  if (config.find(kUcxExchangeMaxQueuedBytes) != config.end()) {
+    const auto& value = config[kUcxExchangeMaxQueuedBytes];
+    const auto maxBytes = folly::tryTo<int64_t>(value);
+    VELOX_USER_CHECK(
+        maxBytes.hasValue() && maxBytes.value() >= 0,
+        "UCX exchange maximum queued bytes must be a non-negative integer: {}",
+        value);
+    exchangeMaxQueuedBytes = maxBytes.value();
+  }
   if (config.find(kCudfKvikioCacheCopyThreads) != config.end()) {
     kvikioCacheCopyThreads =
         folly::to<int32_t>(config[kCudfKvikioCacheCopyThreads]);

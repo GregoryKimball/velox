@@ -73,6 +73,8 @@ struct CudfConfig {
   static constexpr const char* kUcxExchangeLogLevel{"cudf.exchange_log_level"};
   static constexpr const char* kUcxPartitionedOutputBatchRows{
       "cudf.partitioned_output_batch_rows"};
+  static constexpr const char* kUcxExchangeMaxQueuedBytes{
+      "cudf.exchange_max_queued_bytes"};
   static constexpr const char* kCudfKvikioCacheCopyThreads{
       "cudf.kvikio_cache_copy_threads"};
   /// Query configuration key for selecting UCX exchange compression.
@@ -133,6 +135,12 @@ struct CudfConfig {
   /// is reached, avoiding pathologically small exchange chunks. Set to 0 to
   /// disable accumulation.
   int64_t partitionedOutputBatchRows{10'000};
+
+  /// Bytes of received, not yet consumed GPU data one UCX exchange client may
+  /// queue before its sources stop posting receives; they resume once the
+  /// queue drains to half of it. Applies in addition to the bound on queued
+  /// tables (UcxExchangeSource::kBackpressureHighWaterMark). Zero disables it.
+  int64_t exchangeMaxQueuedBytes{0};
 
   /// Threads that copy KvikIO data from the async data cache to the GPU. One
   /// pool for the whole process, created by the first cached GPU read.

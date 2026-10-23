@@ -116,6 +116,14 @@ class UcxExchangeSource
   static constexpr int32_t kBackpressureHighWaterMark = 32;
   static constexpr int32_t kBackpressureLowWaterMark = 16;
 
+  /// True when 'queue' holds more than kBackpressureHighWaterMark tables or,
+  /// if CudfConfig::exchangeMaxQueuedBytes is set, more than that many bytes.
+  static bool aboveBackpressureHighWaterMark(const UcxExchangeQueue& queue);
+
+  /// True when 'queue' holds at most kBackpressureLowWaterMark tables and, if
+  /// CudfConfig::exchangeMaxQueuedBytes is set, at most half of it in bytes.
+  static bool atOrBelowBackpressureLowWaterMark(const UcxExchangeQueue& queue);
+
   // Returns runtime statistics. ExchangeSource is expected to report
   // background CPU time by including a runtime metric named
   // ExchangeClient::kBackgroundCpuTimeMs.
@@ -284,9 +292,9 @@ class UcxExchangeSource
   /// When true, intra-node transfer optimizations bypass UCXX transfers.
   bool isIntraNodeTransfer_{false};
 
-  // Backpressure: when queue exceeds kBackpressureHighWaterMark, the source
-  // goes dormant. The consumer thread wakes it via resumeFromBackpressure()
-  // when the queue drains to kBackpressureLowWaterMark.
+  // Backpressure: when the queue is above its high water mark (tables, and
+  // optionally bytes), the source goes dormant. The consumer thread wakes it
+  // via resumeFromBackpressure() when the queue drains to its low water mark.
   std::atomic<bool> backpressureActive_{false};
 
   // Some metrics/counters:

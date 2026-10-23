@@ -156,7 +156,7 @@ UcxExchangeClient::next(int consumerId, bool* atEnd, ContinueFuture* future) {
     // addToWorkQueue(), and holding queue_->mutex_ here would impose
     // queue_->mutex_ → WorkQueue::mutex_ ordering.
     if (data != nullptr &&
-        queue_->size() <= UcxExchangeSource::kBackpressureLowWaterMark) {
+        UcxExchangeSource::atOrBelowBackpressureLowWaterMark(*queue_)) {
       sourcesToResume.assign(sources_.begin(), sources_.end());
     }
   }

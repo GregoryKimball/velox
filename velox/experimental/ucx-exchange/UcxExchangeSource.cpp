@@ -19,6 +19,7 @@
 #include <cudf/contiguous_split.hpp>
 #include <folly/String.h>
 #include <folly/Uri.h>
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/ucx-exchange/ExchangeCompression.h"
@@ -148,12 +149,12 @@ void UcxExchangeSource::process() {
       // This creates natural backpressure: the server's tagSend for data
       // will block at rendezvous until we post a matching tagRecv. For
       // intra-node: the server's publish future won't resolve until we poll.
-      int32_t queueSize = queue_->size();
-      if (queueSize > kBackpressureHighWaterMark) {
+      if (aboveBackpressureHighWaterMark(*queue_)) {
         if (!backpressureActive_.exchange(true, std::memory_order_acq_rel)) {
           VLOG(1) << "[BACKPRESSURE] [ExSrc " << toString()
-                  << "] pausing, queueSize=" << queueSize
-                  << " > highWater=" << kBackpressureHighWaterMark;
+                  << "] pausing, queueSize=" << queue_->size()
+                  << " queueBytes=" << queue_->totalBytes()
+                  << " highWater=" << kBackpressureHighWaterMark;
         }
         // Go dormant — do NOT re-enqueue into work queue.
         // UcxExchangeClient::next() will call resumeFromBackpressure().
@@ -249,6 +250,22 @@ void UcxExchangeSource::close() {
   // Let the Communicator progress thread do the actual clean-up.
   setState(ReceiverState::Done);
   communicator_->addToWorkQueue(getSelfPtr());
+}
+
+bool UcxExchangeSource::aboveBackpressureHighWaterMark(
+    const UcxExchangeQueue& queue) {
+  const auto maxBytes =
+      cudf_velox::CudfConfig::getInstance().exchangeMaxQueuedBytes;
+  return queue.size() > kBackpressureHighWaterMark ||
+      (maxBytes > 0 && queue.totalBytes() > maxBytes);
+}
+
+bool UcxExchangeSource::atOrBelowBackpressureLowWaterMark(
+    const UcxExchangeQueue& queue) {
+  const auto maxBytes =
+      cudf_velox::CudfConfig::getInstance().exchangeMaxQueuedBytes;
+  return queue.size() <= kBackpressureLowWaterMark &&
+      (maxBytes == 0 || queue.totalBytes() <= maxBytes / 2);
 }
 
 void UcxExchangeSource::resumeFromBackpressure() {
