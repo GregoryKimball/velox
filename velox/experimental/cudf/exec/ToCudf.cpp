@@ -507,6 +507,13 @@ void CudfConfig::initialize(
     streamingGroupbyCapacityMultiplier =
         folly::to<double>(config[kCudfStreamingGroupbyCapacityMultiplier]);
   }
+  if (config.find(kCudfStreamingGroupbyPartitions) != config.end()) {
+    const auto partitions =
+        folly::to<int32_t>(config[kCudfStreamingGroupbyPartitions]);
+    VELOX_USER_CHECK_GT(
+        partitions, 0, "streaming_groupby partition count must be positive");
+    streamingGroupbyPartitions = partitions;
+  }
   if (config.find(kCudfCompactAggregationStateEnabled) != config.end()) {
     compactAggregationStateEnabled =
         folly::to<bool>(config[kCudfCompactAggregationStateEnabled]);

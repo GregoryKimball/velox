@@ -240,6 +240,7 @@ class StreamingGroupbyAggregationTest : public AggregationTest {
     auto& config = cudf_velox::CudfConfig::getInstance();
     savedOutputMemoryResource_ = config.outputMemoryResource;
     savedCapacityMultiplier_ = config.streamingGroupbyCapacityMultiplier;
+    savedPartitions_ = config.streamingGroupbyPartitions;
     config.streamingGroupbyEnabled = true;
   }
 
@@ -248,6 +249,8 @@ class StreamingGroupbyAggregationTest : public AggregationTest {
         savedOutputMemoryResource_;
     cudf_velox::CudfConfig::getInstance().streamingGroupbyCapacityMultiplier =
         savedCapacityMultiplier_;
+    cudf_velox::CudfConfig::getInstance().streamingGroupbyPartitions =
+        savedPartitions_;
     AggregationTest::TearDown();
   }
 
@@ -270,6 +273,7 @@ class StreamingGroupbyAggregationTest : public AggregationTest {
  private:
   std::string savedOutputMemoryResource_;
   double savedCapacityMultiplier_{2.0};
+  int32_t savedPartitions_{1};
 };
 
 bool hasStreamingGroupbyStat(
@@ -1351,6 +1355,44 @@ TEST_F(
       streamingGroupbyStatSum(
           task, finalAggId, cudf_velox::kStreamingGroupbyRebuildsStat),
       1);
+}
+
+TEST_F(StreamingGroupbyAggregationTest, partitionedTablesMatchSingleTable) {
+  // Keys repeat across batches and outnumber the rows of any one batch, so
+  // every table receives, grows and merges keys from several batches.
+  constexpr int32_t kBatchRows = 64;
+  constexpr int32_t kNumBatches = 6;
+  std::vector<RowVectorPtr> vectors;
+  for (int32_t batch = 0; batch < kNumBatches; ++batch) {
+    vectors.push_back(makeRowVector({
+        makeFlatVector<int64_t>(
+            kBatchRows, [batch](auto row) { return (row * 7 + batch) % 150; }),
+        makeFlatVector<int64_t>(
+            kBatchRows, [batch](auto row) { return row + batch; }),
+    }));
+  }
+  createDuckDbTable(vectors);
+  cudf_velox::CudfConfig::getInstance().streamingGroupbyPartitions = 8;
+
+  core::PlanNodeId finalAggId;
+  auto task =
+      AssertQueryBuilder(duckDbQueryRunner_)
+          .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, kBatchRows)
+          .config(QueryConfig::kMaxPartialAggregationMemory, 1)
+          .plan(
+              PlanBuilder()
+                  .values(vectors)
+                  .partialAggregation({"c0"}, {"sum(c1)", "count(c1)"})
+                  .finalAggregation()
+                  .capturePlanNodeId(finalAggId)
+                  .planNode())
+          .assertResults(
+              "SELECT c0, sum(c1), count(c1) FROM tmp GROUP BY c0");
+
+  EXPECT_EQ(
+      streamingGroupbyStatSum(
+          task, finalAggId, cudf_velox::kStreamingGroupbyPartitionsStat),
+      8);
 }
 
 TEST_F(

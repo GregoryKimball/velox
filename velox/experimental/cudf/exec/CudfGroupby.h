@@ -34,6 +34,10 @@ inline constexpr std::string_view kStreamingGroupbyUsedStat{
     "streamingGroupbyUsed"};
 inline constexpr std::string_view kStreamingGroupbyRebuildsStat{
     "streamingGroupbyRebuilds"};
+inline constexpr std::string_view kStreamingGroupbyPartitionsStat{
+    "streamingGroupbyPartitions"};
+inline constexpr std::string_view kStreamingGroupbyPartitionKeysStat{
+    "streamingGroupbyPartitionKeys"};
 inline constexpr std::string_view kDecimal64NarrowRequestsStat{
     "cudfDecimal64NarrowRequests"};
 inline constexpr std::string_view kDecimal64WideRequestsStat{
@@ -260,8 +264,23 @@ class CudfGroupby : public CudfOperatorBase {
       cudf::table_view input,
       cuda::stream_ref stream);
 
+  /// One persistent streaming_groupby and its logical capacity.
+  struct StreamingGroupbyPartition {
+    std::unique_ptr<cudf::groupby::streaming_groupby> groupby;
+    size_t capacity{0};
+  };
+
+  std::vector<cudf::size_type> streamingGroupbyKeyIndices() const;
+
   std::unique_ptr<cudf::groupby::streaming_groupby> createStreamingGroupby(
       size_t capacity);
+
+  /// Creates, grows and aggregates into one partition's table.
+  void aggregateStreamingGroupbyPartition(
+      StreamingGroupbyPartition& partition,
+      cudf::table_view input,
+      double capacityMultiplier,
+      cuda::stream_ref stream);
 
   void computeFinalGroupbyStreaming(CudfVectorPtr input);
 
@@ -302,10 +321,12 @@ class CudfGroupby : public CudfOperatorBase {
 
   std::vector<std::unique_ptr<StreamingGroupbyAggregator>>
       streamingGroupbyAggregators_;
-  std::unique_ptr<cudf::groupby::streaming_groupby> streamingGroupby_;
+  // Key-disjoint tables (CudfConfig::streamingGroupbyPartitions), created on
+  // the first input and emitted one per getOutput call.
+  std::vector<StreamingGroupbyPartition> streamingGroupbyPartitions_;
+  size_t nextStreamingGroupbyPartition_{0};
   std::optional<cuda::stream_ref> streamingGroupbyStream_;
   std::unique_ptr<CudaEvent> streamingGroupbyEvent_;
-  size_t streamingGroupbyCapacity_{0};
 };
 
 } // namespace facebook::velox::cudf_velox

@@ -38,6 +38,7 @@
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/partitioning.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
@@ -53,6 +54,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <numeric>
 
 namespace {
 
@@ -76,6 +78,14 @@ size_t streamingGroupbySafeCapacity() {
   // maximum also bounds the physical cuco table used by streaming_groupby.
   return static_cast<size_t>(std::numeric_limits<cudf::size_type>::max()) / 2;
 }
+
+// Seed for splitting a final streaming groupby into key-disjoint tables. Rows
+// reach a final aggregation through the remote UCX exchange (DEFAULT_HASH_SEED)
+// and the local exchange (DEFAULT_HASH_SEED ^ 0x9e3779b9), both MURMUR3 over
+// the same keys, which fixes their hash's low bits. Reusing either seed would
+// leave most tables empty (e.g. four workers and eight tables use two).
+constexpr auto kStreamingGroupbyPartitionSeed =
+    cudf::DEFAULT_HASH_SEED ^ 0x85ebca6bU;
 
 size_t scaleStreamingGroupbyCapacity(
     size_t capacity,
@@ -1742,16 +1752,20 @@ cudf::table_view CudfGroupby::makeStreamingGroupbyInputView(
   return cudf::table_view{columns};
 }
 
+std::vector<cudf::size_type> CudfGroupby::streamingGroupbyKeyIndices() const {
+  // Keys are the first columns of the prepared input (see
+  // makeStreamingGroupbyInputView).
+  std::vector<cudf::size_type> keyIndices(groupingKeyInputChannels_.size());
+  std::iota(keyIndices.begin(), keyIndices.end(), 0);
+  return keyIndices;
+}
+
 std::unique_ptr<cudf::groupby::streaming_groupby>
 CudfGroupby::createStreamingGroupby(size_t capacity) {
   VELOX_CHECK_GT(capacity, 0);
   VELOX_CHECK_LE(capacity, streamingGroupbySafeCapacity());
 
-  std::vector<cudf::size_type> keyIndices;
-  keyIndices.reserve(groupingKeyInputChannels_.size());
-  for (cudf::size_type i = 0; i < groupingKeyInputChannels_.size(); ++i) {
-    keyIndices.push_back(i);
-  }
+  const auto keyIndices = streamingGroupbyKeyIndices();
 
   std::vector<cudf::groupby::streaming_aggregation_request> requests;
   requests.reserve(streamingGroupbyAggregators_.size() * 2);
@@ -1767,6 +1781,66 @@ CudfGroupby::createStreamingGroupby(size_t capacity) {
       get_temp_mr());
 }
 
+void CudfGroupby::aggregateStreamingGroupbyPartition(
+    StreamingGroupbyPartition& partition,
+    cudf::table_view input,
+    double capacityMultiplier,
+    cuda::stream_ref stream) {
+  const auto inputRows = static_cast<size_t>(input.num_rows());
+  const auto safeCapacity = streamingGroupbySafeCapacity();
+  if (!partition.groupby) {
+    // max_distinct_keys is a logical capacity. libcudf's 0.5 cuco load
+    // factor allocates roughly two physical hash slots per logical key. The
+    // configured multiplier controls both this initial logical headroom and
+    // subsequent geometric growth.
+    partition.capacity = scaleStreamingGroupbyCapacity(
+        inputRows, capacityMultiplier, safeCapacity);
+    partition.groupby = createStreamingGroupby(partition.capacity);
+    partition.groupby->aggregate(input, stream);
+    return;
+  }
+
+  const auto distinctKeys =
+      static_cast<size_t>(partition.groupby->distinct_keys());
+  const auto requiredCapacity =
+      cuda::std::saturating_add(distinctKeys, inputRows);
+  VELOX_USER_CHECK_LE(
+      requiredCapacity,
+      safeCapacity,
+      "streaming_groupby cannot safely hold the existing keys plus the "
+      "input batch. Reduce the upstream GPU batch size. Keys: {}, batch "
+      "rows: {}",
+      distinctKeys,
+      inputRows);
+
+  if (requiredCapacity <= partition.capacity) {
+    partition.groupby->aggregate(input, stream);
+    return;
+  }
+  const auto geometricCapacity = scaleStreamingGroupbyCapacity(
+      partition.capacity, capacityMultiplier, safeCapacity);
+  const auto newCapacity =
+      std::min(std::max(requiredCapacity, geometricCapacity), safeCapacity);
+
+  // Overflow invalidates streaming_groupby. Grow transactionally before
+  // insertion, aggregate the new batch into the replacement, then merge
+  // the old valid state. The conservative distinct+rows bound guarantees
+  // that neither operation can overflow the replacement.
+  auto replacement = createStreamingGroupby(newCapacity);
+  replacement->aggregate(input, stream);
+  replacement->merge(*partition.groupby, stream);
+  // streaming_groupby's destructor has no stream parameter. Ensure the
+  // merge has finished reading the old persistent state before dropping
+  // it.
+  stream.sync();
+  partition.groupby = std::move(replacement);
+  partition.capacity = newCapacity;
+
+  auto lockedStats = stats_.wlock();
+  lockedStats->addRuntimeStat(
+      std::string{kStreamingGroupbyRebuildsStat}, RuntimeCounter(1));
+}
+
 void CudfGroupby::computeFinalGroupbyStreaming(CudfVectorPtr input) {
   const auto inputRows = static_cast<size_t>(input->size());
   const auto safeCapacity = streamingGroupbySafeCapacity();
@@ -1780,7 +1854,7 @@ void CudfGroupby::computeFinalGroupbyStreaming(CudfVectorPtr input) {
 
   // If the first batch cannot satisfy libcudf's signed size_type encoding
   // bound, use the existing groupby path before creating any persistent state.
-  if (!streamingGroupby_ && inputRows > safeCapacity) {
+  if (streamingGroupbyPartitions_.empty() && inputRows > safeCapacity) {
     streamingGroupbyEnabled_ = false;
     computeFinalGroupbyIncrementally(std::move(input));
     return;
@@ -1814,57 +1888,46 @@ void CudfGroupby::computeFinalGroupbyStreaming(CudfVectorPtr input) {
   try {
     auto preparedInput =
         makeStreamingGroupbyInputView(input->getTableView(), stateStream);
-    if (!streamingGroupby_) {
-      // max_distinct_keys is a logical capacity. libcudf's 0.5 cuco load
-      // factor allocates roughly two physical hash slots per logical key. The
-      // configured multiplier controls both this initial logical headroom and
-      // subsequent geometric growth.
-      streamingGroupbyCapacity_ = scaleStreamingGroupbyCapacity(
-          inputRows, capacityMultiplier, safeCapacity);
-      streamingGroupby_ = createStreamingGroupby(streamingGroupbyCapacity_);
-      streamingGroupby_->aggregate(preparedInput, stateStream);
+    if (streamingGroupbyPartitions_.empty()) {
+      const auto numPartitions =
+          CudfConfig::getInstance().streamingGroupbyPartitions;
+      streamingGroupbyPartitions_.resize(numPartitions);
       auto lockedStats = stats_.wlock();
       lockedStats->addRuntimeStat(
           std::string{kStreamingGroupbyUsedStat}, RuntimeCounter(1));
+      lockedStats->addRuntimeStat(
+          std::string{kStreamingGroupbyPartitionsStat},
+          RuntimeCounter(numPartitions));
+    }
+    if (streamingGroupbyPartitions_.size() == 1) {
+      aggregateStreamingGroupbyPartition(
+          streamingGroupbyPartitions_.front(),
+          preparedInput,
+          capacityMultiplier,
+          stateStream);
     } else {
-      const auto distinctKeys =
-          static_cast<size_t>(streamingGroupby_->distinct_keys());
-      const auto requiredCapacity =
-          cuda::std::saturating_add(distinctKeys, inputRows);
-      VELOX_USER_CHECK_LE(
-          requiredCapacity,
-          safeCapacity,
-          "streaming_groupby cannot safely hold the existing keys plus the "
-          "input batch. Reduce the upstream GPU batch size. Keys: {}, batch "
-          "rows: {}",
-          distinctKeys,
-          inputRows);
-
-      if (requiredCapacity > streamingGroupbyCapacity_) {
-        const auto geometricCapacity = scaleStreamingGroupbyCapacity(
-            streamingGroupbyCapacity_, capacityMultiplier, safeCapacity);
-        const auto newCapacity = std::min(
-            std::max(requiredCapacity, geometricCapacity), safeCapacity);
-
-        // Overflow invalidates streaming_groupby. Grow transactionally before
-        // insertion, aggregate the new batch into the replacement, then merge
-        // the old valid state. The conservative distinct+rows bound guarantees
-        // that neither operation can overflow the replacement.
-        auto replacement = createStreamingGroupby(newCapacity);
-        replacement->aggregate(preparedInput, stateStream);
-        replacement->merge(*streamingGroupby_, stateStream);
-        // streaming_groupby's destructor has no stream parameter. Ensure the
-        // merge has finished reading the old persistent state before dropping
-        // it.
-        stateStream.sync();
-        streamingGroupby_ = std::move(replacement);
-        streamingGroupbyCapacity_ = newCapacity;
-
-        auto lockedStats = stats_.wlock();
-        lockedStats->addRuntimeStat(
-            std::string{kStreamingGroupbyRebuildsStat}, RuntimeCounter(1));
-      } else {
-        streamingGroupby_->aggregate(preparedInput, stateStream);
+      // A fixed hash function and seed over every grouping key send each key
+      // to the same table in every batch, so the tables are key-disjoint.
+      auto [partitioned, offsets] = cudf::hash_partition(
+          preparedInput,
+          streamingGroupbyKeyIndices(),
+          static_cast<int>(streamingGroupbyPartitions_.size()),
+          cudf::hash_id::HASH_MURMUR3,
+          kStreamingGroupbyPartitionSeed,
+          stateStream,
+          get_temp_mr());
+      VELOX_CHECK_EQ(offsets.size(), streamingGroupbyPartitions_.size() + 1);
+      for (size_t i = 0; i < streamingGroupbyPartitions_.size(); ++i) {
+        if (offsets[i] == offsets[i + 1]) {
+          continue;
+        }
+        aggregateStreamingGroupbyPartition(
+            streamingGroupbyPartitions_[i],
+            cudf::slice(
+                partitioned->view(), {offsets[i], offsets[i + 1]}, stateStream)
+                .front(),
+            capacityMultiplier,
+            stateStream);
       }
     }
   } catch (...) {
@@ -1877,43 +1940,58 @@ void CudfGroupby::computeFinalGroupbyStreaming(CudfVectorPtr input) {
 }
 
 CudfVectorPtr CudfGroupby::finalizeStreamingGroupby() {
-  if (!streamingGroupby_) {
-    return nullptr;
+  // Emits one table per call and releases it before the next, so only one
+  // table's output is materialized at a time. Empty tables are skipped.
+  CudfVectorPtr result;
+  while (!result &&
+         nextStreamingGroupbyPartition_ < streamingGroupbyPartitions_.size()) {
+    auto& partition =
+        streamingGroupbyPartitions_[nextStreamingGroupbyPartition_++];
+    if (!partition.groupby) {
+      continue;
+    }
+
+    // One sample per table; min / max / avg show how evenly keys split.
+    addRuntimeStat(
+        std::string{kStreamingGroupbyPartitionKeysStat},
+        RuntimeCounter(partition.groupby->distinct_keys()));
+
+    VELOX_CHECK(streamingGroupbyStream_.has_value());
+    const auto stream = *streamingGroupbyStream_;
+    auto [groupKeys, results] =
+        partition.groupby->finalize(stream, get_output_mr());
+
+    std::vector<std::unique_ptr<cudf::column>> outputColumns;
+    auto keyColumns = groupKeys->release();
+    outputColumns.reserve(
+        keyColumns.size() + streamingGroupbyAggregators_.size());
+    outputColumns.insert(
+        outputColumns.end(),
+        std::make_move_iterator(keyColumns.begin()),
+        std::make_move_iterator(keyColumns.end()));
+
+    for (const auto& aggregator : streamingGroupbyAggregators_) {
+      outputColumns.push_back(
+          aggregator->makeOutputColumn(results, stream, get_output_mr()));
+    }
+
+    auto resultTable = std::make_unique<cudf::table>(std::move(outputColumns));
+    const auto numRows = resultTable->num_rows();
+    if (numRows > 0) {
+      result = std::make_shared<cudf_velox::CudfVector>(
+          pool(), outputType_, numRows, std::move(resultTable), stream);
+    }
+
+    // libcudf finalization reads persistent state asynchronously. Its
+    // destructor has no stream parameter, so wait before releasing that state.
+    stream.sync();
+    partition.groupby.reset();
+    partition.capacity = 0;
   }
-
-  VELOX_CHECK(streamingGroupbyStream_.has_value());
-  const auto stream = *streamingGroupbyStream_;
-  auto [groupKeys, results] =
-      streamingGroupby_->finalize(stream, get_output_mr());
-
-  std::vector<std::unique_ptr<cudf::column>> outputColumns;
-  auto keyColumns = groupKeys->release();
-  outputColumns.reserve(
-      keyColumns.size() + streamingGroupbyAggregators_.size());
-  outputColumns.insert(
-      outputColumns.end(),
-      std::make_move_iterator(keyColumns.begin()),
-      std::make_move_iterator(keyColumns.end()));
-
-  for (const auto& aggregator : streamingGroupbyAggregators_) {
-    outputColumns.push_back(
-        aggregator->makeOutputColumn(results, stream, get_output_mr()));
+  if (nextStreamingGroupbyPartition_ == streamingGroupbyPartitions_.size()) {
+    streamingGroupbyStream_.reset();
+    streamingGroupbyEvent_.reset();
   }
-
-  auto resultTable = std::make_unique<cudf::table>(std::move(outputColumns));
-  const auto numRows = resultTable->num_rows();
-  auto result = numRows == 0
-      ? nullptr
-      : std::make_shared<cudf_velox::CudfVector>(
-            pool(), outputType_, numRows, std::move(resultTable), stream);
-
-  // libcudf finalization reads persistent state asynchronously. Its destructor
-  // has no stream parameter, so wait before releasing that state.
-  stream.sync();
-  streamingGroupby_.reset();
-  streamingGroupbyStream_.reset();
-  streamingGroupbyEvent_.reset();
-  streamingGroupbyCapacity_ = 0;
   return result;
 }
 
@@ -2327,8 +2405,10 @@ RowVectorPtr CudfGroupby::doGetOutput() {
   }
 
   if (streamingGroupbyEnabled_) {
-    finished_ = true;
-    return finalizeStreamingGroupby();
+    auto result = finalizeStreamingGroupby();
+    finished_ =
+        nextStreamingGroupbyPartition_ == streamingGroupbyPartitions_.size();
+    return result;
   }
 
   // Streaming finalization: single step uses finalAggregators_ to convert
@@ -2392,15 +2472,14 @@ void CudfGroupby::doNoMoreInput() {
 }
 
 void CudfGroupby::doClose() {
-  if (streamingGroupby_ && streamingGroupbyStream_.has_value()) {
+  if (streamingGroupbyStream_.has_value()) {
     // Match rebuild and finalization: wait before dropping persistent state
     // that an asynchronous aggregate or merge may still reference.
     streamingGroupbyStream_->sync();
   }
-  streamingGroupby_.reset();
+  streamingGroupbyPartitions_.clear();
   streamingGroupbyEvent_.reset();
   streamingGroupbyStream_.reset();
-  streamingGroupbyCapacity_ = 0;
   streamingGroupbyAggregators_.clear();
   inputs_.clear();
   bufferedResult_.reset();

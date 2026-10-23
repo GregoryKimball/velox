@@ -56,6 +56,8 @@ struct CudfConfig {
       "cudf.streaming_groupby_enabled"};
   static constexpr const char* kCudfStreamingGroupbyCapacityMultiplier{
       "cudf.streaming_groupby_capacity_multiplier"};
+  static constexpr const char* kCudfStreamingGroupbyPartitions{
+      "cudf.streaming_groupby_partitions"};
   static constexpr const char* kCudfCompactAggregationStateEnabled{
       "cudf.compact_aggregation_state_enabled"};
   static constexpr const char* kCudfDecimalGroupbyNarrowAccumulation{
@@ -193,6 +195,12 @@ struct CudfConfig {
   /// Multiplier used to derive streaming_groupby's initial logical capacity
   /// from the first batch and to grow capacity when it is exhausted.
   double streamingGroupbyCapacityMultiplier{2.0};
+
+  /// Number of streaming_groupby tables per final aggregation, split by a hash
+  /// of the grouping keys. Total state is unchanged, but growing rebuilds one
+  /// table and output materializes one table at a time, so their transient
+  /// memory is about 1/N of a single table's. One keeps a single table.
+  int32_t streamingGroupbyPartitions{1};
 
   /// Rewrite Decimal64 SUM partial and intermediate states to a compact
   /// DECIMAL(38, s) column instead of the VARBINARY state
