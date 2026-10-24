@@ -40,7 +40,46 @@
 #include <folly/fibers/FiberManager.h> // @manual
 #endif
 
+#ifdef __aarch64__
+#include <unwind.h>
+#endif
+
 namespace facebook::velox::process {
+
+namespace {
+#ifdef __aarch64__
+struct UnwindState {
+  uintptr_t* addresses;
+  size_t maxAddresses;
+  size_t count;
+};
+
+_Unwind_Reason_Code recordFrame(_Unwind_Context* context, void* arg) {
+  auto* state = static_cast<UnwindState*>(arg);
+  if (state->count == state->maxAddresses) {
+    return _URC_END_OF_STACK;
+  }
+  state->addresses[state->count++] = _Unwind_GetIP(context);
+  return _URC_NO_REASON;
+}
+#endif
+} // namespace
+
+ssize_t StackTrace::capture(uintptr_t* addresses, size_t maxAddresses) {
+#ifdef __aarch64__
+  // folly::symbolizer::getStackTrace() uses libunwind, which segfaults on
+  // aarch64 when stepping through a frame whose CFI refers to the SVE vector
+  // granule register (DWARF register 46). GCC emits such CFI for functions that
+  // save SVE registers, which is common when building with SVE enabled, e.g.
+  // -mcpu=neoverse-v2. libgcc's unwinder handles it. backtrace() is not an
+  // alternative because libunwind overrides it when linked.
+  UnwindState state{addresses, maxAddresses, 0};
+  _Unwind_Backtrace(recordFrame, &state);
+  return state.count == 0 ? -1 : static_cast<ssize_t>(state.count);
+#else
+  return folly::symbolizer::getStackTrace(addresses, maxAddresses);
+#endif
+}
 
 StackTrace::StackTrace(int32_t skipFrames) {
   create(skipFrames);
@@ -72,7 +111,7 @@ void StackTrace::create(int32_t skipFrames) {
 
   btPtrs_.clear();
   uintptr_t btPtrs[kMaxFrames];
-  ssize_t framecount = folly::symbolizer::getStackTrace(btPtrs, kMaxFrames);
+  ssize_t framecount = capture(btPtrs, kMaxFrames);
   if (framecount <= 0) {
     return;
   }

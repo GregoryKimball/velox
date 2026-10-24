@@ -20,6 +20,8 @@
 #include <folly/debugging/symbolizer/Symbolizer.h>
 #include <glog/logging.h>
 
+#include "velox/common/process/StackTrace.h"
+
 namespace facebook::nimble {
 
 namespace {
@@ -83,7 +85,7 @@ void NimbleException::captureStackTraceFrames() {
     constexpr size_t skipFrames = 2;
     constexpr size_t maxFrames = 200;
     uintptr_t addresses[maxFrames];
-    ssize_t n = folly::symbolizer::getStackTrace(addresses, maxFrames);
+    ssize_t n = velox::process::StackTrace::capture(addresses, maxFrames);
 
     if (n < skipFrames) {
       return;

@@ -45,7 +45,14 @@ add_library(
   BitEncoder.h
 )
 
-target_link_libraries(nimble_common velox_common_base velox_memory velox_exception Folly::folly)
+target_link_libraries(
+  nimble_common
+  velox_common_base
+  velox_memory
+  velox_exception
+  velox_process
+  Folly::folly
+)
 
 # Moved from velox/CMakeLists.txt when the nimble/velox/ folder was flattened.
 

@@ -18,6 +18,8 @@
 
 #include <folly/synchronization/CallOnce.h>
 
+#include <sys/types.h>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -33,6 +35,11 @@ class StackTrace {
 
   /// Demangle a function name.
   static std::string demangle(const char* mangled);
+
+  /// Writes the return addresses of the current call stack, innermost first,
+  /// into 'addresses'. Returns the number of addresses written (at most
+  /// 'maxAddresses'), or -1 on error.
+  static ssize_t capture(uintptr_t* addresses, size_t maxAddresses);
 
   /// Constructor -- saves the current stack trace. By default, we skip the
   /// frames for StackTrace::StackTrace.  If you want those, you can pass '-2'
