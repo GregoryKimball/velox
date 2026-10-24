@@ -53,14 +53,16 @@ set(
 )
 velox_resolve_dependency_url(kvikio)
 
+# cudf commit bf22904 (2026-10-23, experiment): the Parquet reader returns the decoded columns when the read filter
+# keeps every row (mattgara/cudf local/parquet-reader-skip-copy-when-all-rows-pass-20261023) on 76fc8c0602.
 # cudf commit 76fc8c0602 (2026-10-23, experiment): rapidsai/cudf#24494 (streaming_groupby
 # finalize_and_release) cherry-picked onto 7c64cfbda6, which is rapidsai/cudf#24542 (fused FOR, with the
 # decode_fused_for ownership fix) on #24261 16a249ca06, directly on the previous pin 568a24b (main 2026-10-06).
 set(VELOX_cudf_VERSION 26.12 CACHE STRING "cudf version")
-set(VELOX_cudf_COMMIT 76fc8c0602ae5f74902637b7f51d39d5042c3916)
+set(VELOX_cudf_COMMIT bf2290463ceefe369238e04e166b899c88bfa377)
 set(
   VELOX_cudf_BUILD_SHA256_CHECKSUM
-  9725821a601a027ddd9a228fdcfa852964d3da596569e3682a1e7d6d9caf7d45
+  a175db579718bbcc58db3153f43a620c0f047a723227a750c8841f7d0aad25fe
 )
 set(VELOX_cudf_SOURCE_URL "https://github.com/rapidsai/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
 velox_resolve_dependency_url(cudf)
