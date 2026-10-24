@@ -492,6 +492,15 @@ void CudfSplitReader::setupChunkingForCurrentPass(
   passState_->isChunkingSetup = true;
 }
 
+void CudfSplitReader::setupFirstPassChunking() {
+  if (noColumnsToRead_ or passState_ == nullptr or
+      passState_->currentPass >= passState_->passes.size() or
+      passState_->isChunkingSetup) {
+    return;
+  }
+  setupChunkingForCurrentPass(determineCudfMemoryResource());
+}
+
 void CudfSplitReader::releaseCurrentPassData() {
   // Queued or active reads can still write into the buffers being released.
   passState_->fetch.wait();

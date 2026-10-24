@@ -90,6 +90,14 @@ class CudfHiveConfig {
   static constexpr const char* kPreloadColumnChunksSession =
       "cudf.hive.preload_column_chunks";
 
+  // Whether background split preparation also waits for the first column-chunk
+  // pass and sets up its chunked read, so that the driver adopting the split
+  // starts decoding at once. Applies only when column chunks are preloaded.
+  static constexpr const char* kPreloadChunkingSetup =
+      "cudf.hive.preload-chunking-setup";
+  static constexpr const char* kPreloadChunkingSetupSession =
+      "cudf.hive.preload_chunking_setup";
+
   // Whether to serialize concurrent I/O request submission batches.
   static constexpr const char* kSerializeIoRequests =
       "cudf.hive.serialize-io-requests";
@@ -165,6 +173,9 @@ class CudfHiveConfig {
 
   bool preloadColumnChunks() const;
   bool preloadColumnChunksSession(const config::ConfigBase* session) const;
+
+  bool preloadChunkingSetup() const;
+  bool preloadChunkingSetupSession(const config::ConfigBase* session) const;
 
   bool serializeIoRequests() const;
   bool serializeIoRequestsSession(const config::ConfigBase* session) const;

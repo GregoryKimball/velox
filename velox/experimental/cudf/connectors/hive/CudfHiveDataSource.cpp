@@ -268,6 +268,10 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
       cudfHiveConfig_->preloadColumnChunksSession(
           connectorQueryCtx_->sessionProperties())) {
     cudfSplitReader_->startColumnChunkFetch();
+    if (cudfHiveConfig_->preloadChunkingSetupSession(
+            connectorQueryCtx_->sessionProperties())) {
+      cudfSplitReader_->setupFirstPassChunking();
+    }
   }
 
   // TODO: `completedBytes_` should be updated in `next()` as we read more and

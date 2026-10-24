@@ -143,6 +143,17 @@ bool CudfHiveConfig::preloadColumnChunksSession(
       config_->get<bool>(kPreloadColumnChunks, false));
 }
 
+bool CudfHiveConfig::preloadChunkingSetup() const {
+  return config_->get<bool>(kPreloadChunkingSetup, false);
+}
+
+bool CudfHiveConfig::preloadChunkingSetupSession(
+    const config::ConfigBase* session) const {
+  return session->get<bool>(
+      kPreloadChunkingSetupSession,
+      config_->get<bool>(kPreloadChunkingSetup, false));
+}
+
 bool CudfHiveConfig::serializeIoRequests() const {
   return config_->get<bool>(kSerializeIoRequests, false);
 }

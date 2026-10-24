@@ -110,6 +110,12 @@ class CudfSplitReader : public NvtxHelper {
   /// for them. Does nothing when they are already in flight or complete.
   void startColumnChunkFetch();
 
+  /// Waits for the column chunks of the first pass and sets up its chunked
+  /// read, so that background split preparation can do this work and the
+  /// driver adopting the split starts decoding at once. Does nothing when
+  /// there is nothing to read or the chunked read is already set up.
+  void setupFirstPassChunking();
+
   /// Get the stream.
   cuda::stream_ref stream() const {
     return stream_;
