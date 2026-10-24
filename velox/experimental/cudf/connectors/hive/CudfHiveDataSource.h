@@ -56,6 +56,15 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
       const ConnectorQueryCtx* connectorQueryCtx,
       const std::shared_ptr<CudfHiveConfig>& CudfHiveConfig);
 
+  /// Returns whether the data source can evaluate the subfield filters of
+  /// 'tableHandle' on the GPU, including the filters it extracts from the
+  /// remaining filter using 'evaluator'. Filters on partition keys are tested
+  /// per split on the CPU, so they are not checked.
+  static bool canEvaluateFilters(
+      const ConnectorTableHandlePtr& tableHandle,
+      const ColumnHandleMap& columnHandles,
+      core::ExpressionEvaluator* evaluator);
+
   void addSplit(std::shared_ptr<ConnectorSplit> split) override;
 
   void setFromDataSource(std::unique_ptr<DataSource> source) override;

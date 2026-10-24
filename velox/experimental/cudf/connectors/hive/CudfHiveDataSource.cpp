@@ -254,6 +254,50 @@ CudfHiveDataSource::CudfHiveDataSource(
           cudfHiveConfig,
           PartitionKeySource::kDataSource) {}
 
+bool CudfHiveDataSource::canEvaluateFilters(
+    const ConnectorTableHandlePtr& tableHandle,
+    const ColumnHandleMap& columnHandles,
+    core::ExpressionEvaluator* evaluator) {
+  const auto hiveTableHandle =
+      std::dynamic_pointer_cast<const hive::HiveTableHandle>(tableHandle);
+  VELOX_CHECK_NOT_NULL(
+      hiveTableHandle, "TableHandle must be an instance of HiveTableHandle");
+
+  std::unordered_set<std::string> partitionKeys;
+  for (const auto& [_, handle] : columnHandles) {
+    const auto* fileColumnHandle =
+        checkedPointerCast<const FileColumnHandle>(handle).get();
+    if (fileColumnHandle->isPartitionKey()) {
+      partitionKeys.insert(fileColumnHandle->name());
+    }
+  }
+  for (const auto& handle : hiveTableHandle->hiveFilterColumnHandles()) {
+    if (handle->isPartitionKey()) {
+      partitionKeys.insert(handle->name());
+    }
+  }
+
+  common::SubfieldFilters filters;
+  for (const auto& [subfield, filter] : hiveTableHandle->subfieldFilters()) {
+    filters.emplace(subfield.clone(), filter->clone());
+  }
+  double sampleRate = hiveTableHandle->sampleRate();
+  extractFiltersFromRemainingFilter(
+      hiveTableHandle->remainingFilter(), evaluator, filters, sampleRate);
+
+  for (const auto& [subfield, filter] : filters) {
+    if (!filter ||
+        (subfield.path().size() == 1 &&
+         partitionKeys.count(subfield.baseName()) > 0)) {
+      continue;
+    }
+    if (!isSubfieldFilterSupported(subfield, *filter)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 CudfHiveDataSource::CudfHiveDataSource(
     const RowTypePtr& outputType,
     const ConnectorTableHandlePtr& tableHandle,

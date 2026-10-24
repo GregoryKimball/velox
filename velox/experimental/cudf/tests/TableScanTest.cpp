@@ -748,6 +748,63 @@ TEST_F(TableScanTest, filterPrunesAllRowGroups) {
   EXPECT_EQ(planStats.at(plan->id()).outputRows, 0);
 }
 
+// cuDF cannot evaluate a TIMESTAMP range filter, so with CPU fallback allowed
+// the scan reads on the CPU and the operators after it still run on the GPU.
+// Without fallback the query fails before reading.
+TEST_F(TableScanTest, unsupportedFilterFallsBackToCpuScan) {
+  auto rowType = ROW({"c0", "c1"}, {BIGINT(), TIMESTAMP()});
+  auto vector = makeRowVector(
+      {"c0", "c1"},
+      {makeFlatVector<int64_t>({1, 2, 3, 4}),
+       makeFlatVector<Timestamp>(
+           {Timestamp(100, 0),
+            Timestamp(200, 0),
+            Timestamp(300, 0),
+            Timestamp(400, 0)})});
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), {vector});
+
+  const std::string filter = "c1 > cast('1970-01-01 00:02:00' as timestamp)";
+  const auto expected = makeRowVector({makeFlatVector<int64_t>({20, 30, 40})});
+  for (const bool remaining : {false, true}) {
+    SCOPED_TRACE(fmt::format("remaining filter: {}", remaining));
+    PlanBuilder builder(pool_.get());
+    auto& scan = builder.startTableScan()
+                     .connectorId(kCudfHiveConnectorId)
+                     .outputType(ROW({"c0"}, {BIGINT()}))
+                     .dataColumns(rowType);
+    if (remaining) {
+      scan.remainingFilter(filter);
+    } else {
+      scan.subfieldFilter(filter);
+    }
+    auto plan = scan.endTableScan().project({"c0 * 10 AS c0"}).planNode();
+
+    std::shared_ptr<Task> task;
+    auto result =
+        AssertQueryBuilder(plan)
+            .config(cudf_velox::CudfConfig::kCudfAllowCpuFallback, true)
+            .splits(makeCudfHiveConnectorSplits({filePath}))
+            .copyResults(pool_.get(), task);
+    assertEqualResults({expected}, {result});
+
+    bool gpuInputConverted = false;
+    for (const auto& pipeline : task->taskStats().pipelineStats) {
+      for (const auto& op : pipeline.operatorStats) {
+        gpuInputConverted |= op.operatorType == "CudfFromVelox";
+      }
+    }
+    EXPECT_TRUE(gpuInputConverted);
+
+    VELOX_ASSERT_THROW(
+        AssertQueryBuilder(plan)
+            .config(cudf_velox::CudfConfig::kCudfAllowCpuFallback, false)
+            .splits(makeCudfHiveConnectorSplits({filePath}))
+            .copyResults(pool_.get()),
+        "TableScan filter is not supported by cuDF and CPU fallback is disabled");
+  }
+}
+
 // Table schemas use lowercase names while the file keeps mixed-case names. The
 // filter-only column must still be read so the pushed-down filter can find it.
 TEST_F(TableScanTest, mixedCaseFileColumnNames) {

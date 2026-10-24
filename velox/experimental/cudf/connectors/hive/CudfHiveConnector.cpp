@@ -45,7 +45,13 @@ std::unique_ptr<DataSource> CudfHiveConnector::createDataSource(
   // TODO (dm): Make this ^^^ happen
   // Problem: this information is in split, not table handle
 
-  if (cudfIsRegistered() && isTypeSupportedByCudf(outputType)) {
+  // Keep in sync with TableScanAdapter::canRunOnGPU(), which decides whether
+  // the scan output is on the GPU.
+  if (cudfIsRegistered() && isTypeSupportedByCudf(outputType) &&
+      CudfHiveDataSource::canEvaluateFilters(
+          tableHandle,
+          columnHandles,
+          connectorQueryCtx->expressionEvaluator())) {
     return std::make_unique<CudfHiveDataSource>(
         outputType,
         tableHandle,
