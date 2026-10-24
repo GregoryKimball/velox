@@ -774,6 +774,48 @@ cudf::ast::expression const& createAstFromSubfieldFilterImpl(
 
 } // namespace
 
+bool isSubfieldFilterSupported(
+    const common::Subfield& subfield,
+    const common::Filter& filter) {
+  if (subfield.path().empty() ||
+      subfield.path()[0]->kind() != common::SubfieldKind::kNestedField) {
+    return false;
+  }
+  switch (filter.kind()) {
+    case common::FilterKind::kBigintRange:
+    case common::FilterKind::kHugeintRange:
+    case common::FilterKind::kBigintValuesUsingHashTable:
+    case common::FilterKind::kBigintValuesUsingBitmask:
+    case common::FilterKind::kHugeintValuesUsingHashTable:
+    case common::FilterKind::kBytesValues:
+    case common::FilterKind::kNegatedBytesValues:
+    case common::FilterKind::kDoubleRange:
+    case common::FilterKind::kFloatRange:
+    case common::FilterKind::kBytesRange:
+    case common::FilterKind::kBoolValue:
+    case common::FilterKind::kIsNull:
+    case common::FilterKind::kIsNotNull:
+    case common::FilterKind::kNegatedBigintRange:
+      return true;
+    case common::FilterKind::kBigintMultiRange: {
+      const auto& ranges =
+          static_cast<const common::BigintMultiRange&>(filter).ranges();
+      return std::all_of(ranges.begin(), ranges.end(), [&](const auto& range) {
+        return isSubfieldFilterSupported(subfield, *range);
+      });
+    }
+    case common::FilterKind::kMultiRange: {
+      const auto& filters =
+          static_cast<const common::MultiRange&>(filter).filters();
+      return std::all_of(filters.begin(), filters.end(), [&](const auto& f) {
+        return isSubfieldFilterSupported(subfield, *f);
+      });
+    }
+    default:
+      return false;
+  }
+}
+
 bool hasDecimalSubfieldFilter(
     const common::SubfieldFilters& subfieldFilters,
     const RowTypePtr& inputRowSchema) {

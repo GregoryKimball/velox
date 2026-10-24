@@ -1661,4 +1661,32 @@ TEST_F(SubfieldFilterAstTest, negatedBigintRangeWithNulls) {
   testFilterExecution(rowType, columnName, *filter, vec, expr);
 }
 
+TEST_F(SubfieldFilterAstTest, isSubfieldFilterSupported) {
+  const common::Subfield subfield("c0");
+  EXPECT_TRUE(isSubfieldFilterSupported(
+      subfield, common::BigintRange(1, 10, /*nullAllowed*/ false)));
+  EXPECT_FALSE(isSubfieldFilterSupported(
+      subfield,
+      common::TimestampRange(
+          Timestamp(1, 0), Timestamp(2, 0), /*nullAllowed*/ false)));
+
+  std::vector<std::unique_ptr<common::Filter>> filters;
+  filters.push_back(
+      std::make_unique<common::DoubleRange>(
+          1.0, false, false, 2.0, false, false, /*nullAllowed*/ false));
+  filters.push_back(std::make_unique<common::IsNull>());
+  EXPECT_TRUE(isSubfieldFilterSupported(
+      subfield,
+      common::MultiRange(std::move(filters), /*nullAllowed*/ true)));
+
+  filters.clear();
+  filters.push_back(std::make_unique<common::IsNull>());
+  filters.push_back(
+      std::make_unique<common::TimestampRange>(
+          Timestamp(1, 0), Timestamp(2, 0), /*nullAllowed*/ false));
+  EXPECT_FALSE(isSubfieldFilterSupported(
+      subfield,
+      common::MultiRange(std::move(filters), /*nullAllowed*/ true)));
+}
+
 } // namespace

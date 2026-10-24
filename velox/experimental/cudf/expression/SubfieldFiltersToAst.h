@@ -44,6 +44,12 @@ struct SubfieldFilterDecimalType {
 using SubfieldFilterDecimalTypes =
     std::unordered_map<std::string, SubfieldFilterDecimalType>;
 
+// Returns whether createAstFromSubfieldFilter() can convert 'filter' on
+// 'subfield'.
+bool isSubfieldFilterSupported(
+    const common::Subfield& subfield,
+    const common::Filter& filter);
+
 bool hasDecimalSubfieldFilter(
     const common::SubfieldFilters& subfieldFilters,
     const RowTypePtr& inputRowSchema);

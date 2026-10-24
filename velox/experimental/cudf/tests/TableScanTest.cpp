@@ -2183,6 +2183,62 @@ TEST_F(TableScanTest, remainingFilterTimestampTimezoneEligibility) {
       true);
 }
 
+TEST_F(TableScanTest, subfieldFilterEligibility) {
+  auto rowType = ROW({"c0", "c1"}, {BIGINT(), TIMESTAMP()});
+  auto data = makeRowVector(
+      {"c0", "c1"},
+      {makeFlatVector<int64_t>({1, 2, 3, 4}),
+       makeFlatVector<Timestamp>(
+           {Timestamp(100, 0),
+            Timestamp(200, 0),
+            Timestamp(300, 0),
+            Timestamp(400, 0)})});
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), data);
+
+  auto testFilter = [&](const std::string& filter,
+                        bool asRemainingFilter,
+                        bool expectCudfScan) {
+    SCOPED_TRACE(
+        fmt::format("{}, remaining filter: {}", filter, asRemainingFilter));
+
+    PlanBuilder builder(pool_.get());
+    auto& scan = builder.startTableScan()
+                     .connectorId(kCudfHiveConnectorId)
+                     .outputType(ROW({"c0"}, {BIGINT()}))
+                     .dataColumns(rowType);
+    if (asRemainingFilter) {
+      scan.remainingFilter(filter);
+    } else {
+      scan.subfieldFilter(filter);
+    }
+    auto scanPlan = scan.endTableScan().planNode();
+
+    std::shared_ptr<Task> task;
+    auto actual = AssertQueryBuilder(scanPlan)
+                      .config(CudfConfig::kCudfEnabled, true)
+                      .splits(makeCudfHiveConnectorSplits({filePath}))
+                      .copyResults(pool(), task);
+
+    assertEqualResults(
+        {makeRowVector({"c0"}, {makeFlatVector<int64_t>({2, 3, 4})})},
+        {actual});
+    EXPECT_EQ(wasCudfToVeloxUsed(task, scanPlan->id()), expectCudfScan);
+  };
+
+  // A BIGINT range filter is converted to a cuDF AST.
+  testFilter("c0 > 1", false, true);
+  testFilter("c0 > 1", true, true);
+
+  // A TIMESTAMP range filter is not, so the scan falls back to the CPU Hive
+  // data source whether the filter is pushed down or extracted from the
+  // remaining filter.
+  const std::string timestampFilter =
+      "c1 > cast('1970-01-01 00:02:00' as timestamp)";
+  testFilter(timestampFilter, false, false);
+  testFilter(timestampFilter, true, false);
+}
+
 TEST_F(TableScanTest, decimalSubfieldFilter) {
   auto rowType = ROW({"c0", "c1"}, {DECIMAL(5, 2), BIGINT()});
   auto vector = makeRowVector(

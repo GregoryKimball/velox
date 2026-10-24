@@ -40,6 +40,7 @@
 #include "velox/connectors/hive/TableHandle.h"
 #include "velox/core/Expressions.h"
 #include "velox/core/QueryCtx.h"
+#include "velox/expression/Expr.h"
 #include "velox/expression/ExprOptimizer.h"
 #include "velox/functions/lib/string/StringImpl.h"
 #include "velox/type/Filter.h"
@@ -246,13 +247,33 @@ bool CudfHiveDataSource::isSupported(
     return false;
   }
 
+  VELOX_CHECK_NOT_NULL(pool);
+  auto optimizeQueryCtx = core::QueryCtx::create();
+
+  // The subfield filters, including those the constructor extracts from the
+  // remaining filter, are converted to a cuDF AST.
+  common::SubfieldFilters subfieldFilters;
+  for (const auto& [subfield, filter] : hiveTableHandle->subfieldFilters()) {
+    subfieldFilters.emplace(subfield.clone(), filter->clone());
+  }
+  exec::SimpleExpressionEvaluator evaluator(optimizeQueryCtx.get(), pool);
+  double sampleRate = hiveTableHandle->sampleRate();
+  extractFiltersFromRemainingFilter(
+      hiveTableHandle->remainingFilter(),
+      &evaluator,
+      subfieldFilters,
+      sampleRate);
+  for (const auto& [subfield, filter] : subfieldFilters) {
+    if (filter && !isSubfieldFilterSupported(subfield, *filter)) {
+      return false;
+    }
+  }
+
   const auto& remainingFilter = hiveTableHandle->remainingFilter();
   if (!remainingFilter) {
     return true;
   }
 
-  VELOX_CHECK_NOT_NULL(pool);
-  auto optimizeQueryCtx = core::QueryCtx::create();
   auto optimizedRemainingFilter =
       expression::optimize(remainingFilter, optimizeQueryCtx.get(), pool);
 
