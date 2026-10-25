@@ -263,6 +263,10 @@ class CudfSplitReader : public NvtxHelper {
   std::unique_ptr<RowGroupPassState> passState_;
   bool serializeIoRequests_{false};
 
+  // Whether the reader runs on a high-priority stream, resolved from the
+  // session when the reader is created.
+  bool highPriorityScanStreams_{false};
+
   // Chunk and pass read limits resolved from the session when the reader is
   // created.
   std::size_t chunkReadLimit_{0};

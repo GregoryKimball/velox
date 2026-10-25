@@ -154,6 +154,17 @@ bool CudfHiveConfig::preloadChunkingSetupSession(
       config_->get<bool>(kPreloadChunkingSetup, false));
 }
 
+bool CudfHiveConfig::highPriorityScanStreams() const {
+  return config_->get<bool>(kHighPriorityScanStreams, false);
+}
+
+bool CudfHiveConfig::highPriorityScanStreamsSession(
+    const config::ConfigBase* session) const {
+  return session->get<bool>(
+      kHighPriorityScanStreamsSession,
+      config_->get<bool>(kHighPriorityScanStreams, false));
+}
+
 bool CudfHiveConfig::serializeIoRequests() const {
   return config_->get<bool>(kSerializeIoRequests, false);
 }

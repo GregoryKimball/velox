@@ -50,6 +50,7 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -150,6 +151,32 @@ std::unique_ptr<cudf::column> castDecimalColumns(
   return col;
 }
 
+// Returns a greatest-priority CUDA stream of the calling thread. Each thread
+// hands out its two streams in turn, as cuDF's per-thread stream pool does, so
+// that consecutive splits prepared on one thread get different streams. They
+// are never destroyed: destroying them from a thread_local destructor could
+// race driver teardown when the process exits.
+cuda::stream_ref highPriorityStreamForCurrentThread() {
+  static thread_local std::array<cudaStream_t, 2> streams{};
+  static thread_local std::size_t next = 0;
+  auto& stream = streams[next++ % streams.size()];
+  if (stream == nullptr) {
+    int leastPriority = 0;
+    int greatestPriority = 0;
+    VELOX_CHECK_EQ(
+        static_cast<int>(cudaSuccess),
+        static_cast<int>(
+            cudaDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority)),
+        "Failed to get the CUDA stream priority range");
+    VELOX_CHECK_EQ(
+        static_cast<int>(cudaSuccess),
+        static_cast<int>(cudaStreamCreateWithPriority(
+            &stream, cudaStreamNonBlocking, greatestPriority)),
+        "Failed to create a high-priority CUDA stream");
+  }
+  return cuda::stream_ref{stream};
+}
+
 } // namespace
 
 std::unique_ptr<cudf::table> castDecimalColumnsToVeloxTypes(
@@ -233,6 +260,8 @@ CudfSplitReader::CudfSplitReader(
       hiveConfig.maxCoalescedDistanceBytes(sessionProperties));
   caseInsensitiveColumnNames_ =
       hiveConfig.isFileColumnNamesReadAsLowerCase(sessionProperties);
+  highPriorityScanStreams_ =
+      cudfHiveConfig_->highPriorityScanStreamsSession(sessionProperties);
 }
 
 CudfSplitReader::~CudfSplitReader() {
@@ -336,8 +365,9 @@ void CudfSplitReader::prepareSplit(dwio::common::RuntimeStats& runtimeStats) {
   // Reset existing split and split readers, if any
   resetSplit();
 
-  // Acquire a stream from the global stream pool
-  stream_ = cudfGlobalStreamPool().get_stream();
+  // Acquire a stream from the global stream pool, or a high-priority one
+  stream_ = highPriorityScanStreams_ ? highPriorityStreamForCurrentThread()
+                                     : cudfGlobalStreamPool().get_stream();
 
   // Perform split-specific setup.
   prepareSplitInternal(runtimeStats);

@@ -98,6 +98,14 @@ class CudfHiveConfig {
   static constexpr const char* kPreloadChunkingSetupSession =
       "cudf.hive.preload_chunking_setup";
 
+  // Whether table scans run their GPU work on high-priority CUDA streams, so
+  // that the many short kernels and copies of background split preparation
+  // start ahead of queued blocks of long operator kernels.
+  static constexpr const char* kHighPriorityScanStreams =
+      "cudf.hive.high-priority-scan-streams";
+  static constexpr const char* kHighPriorityScanStreamsSession =
+      "cudf.hive.high_priority_scan_streams";
+
   // Whether to serialize concurrent I/O request submission batches.
   static constexpr const char* kSerializeIoRequests =
       "cudf.hive.serialize-io-requests";
@@ -176,6 +184,9 @@ class CudfHiveConfig {
 
   bool preloadChunkingSetup() const;
   bool preloadChunkingSetupSession(const config::ConfigBase* session) const;
+
+  bool highPriorityScanStreams() const;
+  bool highPriorityScanStreamsSession(const config::ConfigBase* session) const;
 
   bool serializeIoRequests() const;
   bool serializeIoRequestsSession(const config::ConfigBase* session) const;
