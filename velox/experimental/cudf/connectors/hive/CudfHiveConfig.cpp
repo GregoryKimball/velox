@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
+#include "velox/experimental/cudf/CudfConfig.h"
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/config/Config.h"
@@ -95,7 +96,7 @@ bool CudfHiveConfig::isAllowMismatchedCudfHiveSchemasSession(
 
 cudf::data_type CudfHiveConfig::timestampType() const {
   const auto unit = config_->get<cudf::type_id>(
-      kTimestampType, cudf::type_id::TIMESTAMP_MILLISECONDS /*milli*/);
+      kTimestampType, CudfConfig::getInstance().timestampUnit);
   VELOX_CHECK(
       unit == cudf::type_id::TIMESTAMP_DAYS /*days*/ ||
           unit == cudf::type_id::TIMESTAMP_SECONDS /*seconds*/ ||
@@ -111,7 +112,7 @@ cudf::data_type CudfHiveConfig::timestampTypeSession(
   const auto unit = session->get<cudf::type_id>(
       kTimestampTypeSession,
       config_->get<cudf::type_id>(
-          kTimestampType, cudf::type_id::TIMESTAMP_MILLISECONDS /*milli*/));
+          kTimestampType, CudfConfig::getInstance().timestampUnit));
   VELOX_CHECK(
       unit == cudf::type_id::TIMESTAMP_DAYS /*days*/ ||
           unit == cudf::type_id::TIMESTAMP_SECONDS /*seconds*/ ||
