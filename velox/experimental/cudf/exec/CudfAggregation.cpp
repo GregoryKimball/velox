@@ -285,7 +285,7 @@ AggregationInputChannels buildAggregationInputChannels(
       aggInputs.push_back(fallbackChannel);
     }
 
-    if (aggregate.distinct) {
+    if (aggregate.distinct && !isCountFunctionName(aggregate.call->name())) {
       VELOX_NYI("De-dup before aggregation is not yet supported");
     }
 
