@@ -695,6 +695,29 @@ cudf::ast::expression const& createAstFromSubfieldFilterImpl(
       return createBytesRangeExpr(filter, tree, scalars, columnRef, stream, mr);
     }
 
+    case common::FilterKind::kTimestampRange: {
+      const auto& range = static_cast<const common::TimestampRange&>(filter);
+      auto compare = [&](Timestamp bound, Op op) -> const cudf::ast::expression& {
+        scalars.push_back(makeScalarFromValue(TIMESTAMP(), bound, false));
+        auto& scalar = static_cast<cudf::timestamp_scalar<cudf::timestamp_ns>&>(
+            *scalars.back());
+        return tree.push(
+            Operation{op, columnRef, tree.push(cudf::ast::literal{scalar})});
+      };
+      const cudf::ast::expression* result = nullptr;
+      if (range.lower() != std::numeric_limits<Timestamp>::min()) {
+        result = &compare(range.lower(), Op::GREATER_EQUAL);
+      }
+      if (range.upper() != std::numeric_limits<Timestamp>::max()) {
+        const auto& upper = compare(range.upper(), Op::LESS_EQUAL);
+        result = result
+            ? &tree.push(Operation{Op::NULL_LOGICAL_AND, *result, upper})
+            : &upper;
+      }
+      return result ? *result
+                    : tree.push(Operation{Op::EQUAL, columnRef, columnRef});
+    }
+
     case common::FilterKind::kBoolValue: {
       auto* boolValue = static_cast<const common::BoolValue*>(&filter);
       auto matchesTrue = boolValue->testBool(true);
@@ -797,6 +820,11 @@ bool isSubfieldFilterSupported(
     case common::FilterKind::kIsNotNull:
     case common::FilterKind::kNegatedBigintRange:
       return true;
+    // Velox encodes exclusive bounds as +/-1ns, which is exact only at
+    // nanosecond resolution.
+    case common::FilterKind::kTimestampRange:
+      return CudfConfig::getInstance().timestampUnit ==
+          cudf::type_id::TIMESTAMP_NANOSECONDS;
     case common::FilterKind::kBigintMultiRange: {
       const auto& ranges =
           static_cast<const common::BigintMultiRange&>(filter).ranges();
