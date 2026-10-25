@@ -165,6 +165,10 @@ bool CudfHiveConfig::highPriorityScanStreamsSession(
       config_->get<bool>(kHighPriorityScanStreams, false));
 }
 
+uint64_t CudfHiveConfig::fusedForScanCacheBytes() const {
+  return config_->get<uint64_t>(kFusedForScanCacheBytes, 0);
+}
+
 bool CudfHiveConfig::serializeIoRequests() const {
   return config_->get<bool>(kSerializeIoRequests, false);
 }

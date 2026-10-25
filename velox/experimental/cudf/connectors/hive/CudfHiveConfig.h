@@ -106,6 +106,13 @@ class CudfHiveConfig {
   static constexpr const char* kHighPriorityScanStreamsSession =
       "cudf.hive.high_priority_scan_streams";
 
+  // Capacity in bytes of the process-wide fused FOR scan cache, which keeps
+  // the Parquet columns read from each file re-encoded with cuDF's fused
+  // frame-of-reference codec in pinned host memory and serves later reads of
+  // them by copying and decoding the encoded bytes. 0 disables the cache.
+  static constexpr const char* kFusedForScanCacheBytes =
+      "cudf.hive.fused-for-scan-cache-bytes";
+
   // Whether to serialize concurrent I/O request submission batches.
   static constexpr const char* kSerializeIoRequests =
       "cudf.hive.serialize-io-requests";
@@ -187,6 +194,8 @@ class CudfHiveConfig {
 
   bool highPriorityScanStreams() const;
   bool highPriorityScanStreamsSession(const config::ConfigBase* session) const;
+
+  uint64_t fusedForScanCacheBytes() const;
 
   bool serializeIoRequests() const;
   bool serializeIoRequestsSession(const config::ConfigBase* session) const;
