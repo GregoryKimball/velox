@@ -317,11 +317,137 @@ const CudfExpressionEvaluatorEntry* findBestEvaluator(
   return best;
 }
 
+// Nests switch(c1, v1, c2, v2, ..., [else]) from inputs[begin] on into
+// single-branch switches: switch(c1, v1, switch(c2, v2, ..., [else])).
+core::TypedExprPtr nestSwitch(
+    const TypePtr& type,
+    const std::vector<core::TypedExprPtr>& inputs,
+    size_t begin) {
+  const auto remaining = inputs.size() - begin;
+  if (remaining == 1) {
+    return inputs[begin];
+  }
+  std::vector<core::TypedExprPtr> branch{inputs[begin], inputs[begin + 1]};
+  if (remaining > 2) {
+    branch.push_back(nestSwitch(type, inputs, begin + 2));
+  }
+  return std::make_shared<core::CallTypedExpr>(
+      type, std::move(branch), "switch");
+}
+
+// element_at(<constant map>, key) as switch(key = k1, v1, key = k2, v2, ...),
+// whose ELSE is null like a missing key. Presto's RewriteCaseToMap rule
+// produces this form from simple CASE expressions. Returns nullptr for other
+// map arguments.
+core::TypedExprPtr constantMapElementAtToSwitch(const core::TypedExprPtr& expr) {
+  const auto& map = expr->inputs()[0];
+  if (!map->isConstantKind() || map->type()->kind() != TypeKind::MAP) {
+    return nullptr;
+  }
+  const auto* constant = map->asUnchecked<core::ConstantTypedExpr>();
+  if (!constant->hasValueVector() || constant->isNull()) {
+    return nullptr;
+  }
+  const auto& valueVector = constant->valueVector();
+  const auto* mapVector = valueVector->wrappedVector()->as<MapVector>();
+  if (mapVector == nullptr) {
+    return nullptr;
+  }
+  const auto row = valueVector->wrappedIndex(0);
+  const auto offset = mapVector->offsetAt(row);
+  const auto size = mapVector->sizeAt(row);
+  if (size == 0) {
+    return nullptr;
+  }
+  const auto eqName = CudfConfig::getInstance().functionNamePrefix + "eq";
+  std::vector<core::TypedExprPtr> inputs;
+  inputs.reserve(2 * size);
+  for (vector_size_t i = 0; i < size; ++i) {
+    auto key = std::make_shared<core::ConstantTypedExpr>(
+        BaseVector::wrapInConstant(1, offset + i, mapVector->mapKeys()));
+    inputs.push_back(std::make_shared<core::CallTypedExpr>(
+        BOOLEAN(),
+        std::vector<core::TypedExprPtr>{expr->inputs()[1], std::move(key)},
+        eqName));
+    inputs.push_back(std::make_shared<core::ConstantTypedExpr>(
+        BaseVector::wrapInConstant(1, offset + i, mapVector->mapValues())));
+  }
+  return nestSwitch(expr->type(), inputs, 0);
+}
+
+// contains(<constant array>, x) as x = a1 OR x = a2 OR ..., which has the same
+// null semantics when the array has no null elements. Returns nullptr for
+// other array arguments.
+core::TypedExprPtr constantArrayContainsToOr(const core::TypedExprPtr& expr) {
+  const auto& array = expr->inputs()[0];
+  if (!array->isConstantKind() || array->type()->kind() != TypeKind::ARRAY) {
+    return nullptr;
+  }
+  const auto* constant = array->asUnchecked<core::ConstantTypedExpr>();
+  if (!constant->hasValueVector() || constant->isNull()) {
+    return nullptr;
+  }
+  const auto& valueVector = constant->valueVector();
+  const auto* arrayVector = valueVector->wrappedVector()->as<ArrayVector>();
+  if (arrayVector == nullptr) {
+    return nullptr;
+  }
+  const auto row = valueVector->wrappedIndex(0);
+  const auto offset = arrayVector->offsetAt(row);
+  const auto size = arrayVector->sizeAt(row);
+  const auto& elements = arrayVector->elements();
+  const auto eqName = CudfConfig::getInstance().functionNamePrefix + "eq";
+  core::TypedExprPtr result;
+  for (vector_size_t i = 0; i < size; ++i) {
+    if (elements->isNullAt(offset + i)) {
+      return nullptr;
+    }
+    core::TypedExprPtr eq = std::make_shared<core::CallTypedExpr>(
+        BOOLEAN(),
+        std::vector<core::TypedExprPtr>{
+            expr->inputs()[1],
+            std::make_shared<core::ConstantTypedExpr>(
+                BaseVector::wrapInConstant(1, offset + i, elements))},
+        eqName);
+    result = result == nullptr
+        ? eq
+        : std::make_shared<core::CallTypedExpr>(
+              BOOLEAN(),
+              std::vector<core::TypedExprPtr>{std::move(result), std::move(eq)},
+              "or");
+  }
+  return result;
+}
+
+// Returns an equivalent expression in forms the cuDF evaluators support, or
+// nullptr if `expr` needs no rewrite.
+core::TypedExprPtr rewriteForCudf(const core::TypedExprPtr& expr) {
+  if (!expr->isCallKind()) {
+    return nullptr;
+  }
+  const auto& name = expr->asUnchecked<core::CallTypedExpr>()->name();
+  if (name == "switch" && expr->inputs().size() > 3) {
+    return nestSwitch(expr->type(), expr->inputs(), 0);
+  }
+  if (name == CudfConfig::getInstance().functionNamePrefix + "element_at" &&
+      expr->inputs().size() == 2) {
+    return constantMapElementAtToSwitch(expr);
+  }
+  if (name == CudfConfig::getInstance().functionNamePrefix + "contains" &&
+      expr->inputs().size() == 2) {
+    return constantArrayContainsToOr(expr);
+  }
+  return nullptr;
+}
+
 // Recursive, context-free check that some cuDF evaluator supports every node in
 // the expression tree. canExprRunOnGpu wraps this with expression optimization
 // and the timezone fallback.
 bool canBeEvaluatedByCudf(const core::TypedExprPtr& expr) {
   ensureBuiltinExpressionEvaluatorsRegistered();
+  if (auto rewritten = rewriteForCudf(expr)) {
+    return canBeEvaluatedByCudf(rewritten);
+  }
 
   const auto& registry = getCudfExpressionEvaluatorRegistry();
 
@@ -3412,6 +3538,9 @@ std::shared_ptr<CudfExpression> createCudfExpression(
     const RowTypePtr& inputRowSchema,
     memory::MemoryPool* pool,
     const core::QueryConfig& config) {
+  if (auto rewritten = rewriteForCudf(expr)) {
+    return createCudfExpression(rewritten, inputRowSchema, pool, config);
+  }
   const auto* best = findBestEvaluator(expr);
   VELOX_CHECK_NOT_NULL(
       best, "No cuDF expression evaluator can handle: {}", expr->toString());
