@@ -40,8 +40,8 @@ namespace {
 constexpr std::size_t kBlockBytes = std::size_t{1} << 30;
 constexpr std::size_t kAlignment = 256;
 
-// A string column is cached as dictionary indices when it has at most this
-// many distinct values and at most one per this many rows.
+// A column can be cached as dictionary indices when it has at most this many
+// distinct values and at most one per this many rows.
 constexpr cudf::size_type kMaxDictionaryKeys = 1 << 16;
 constexpr cudf::size_type kMinRowsPerKey = 8;
 
@@ -72,6 +72,28 @@ cudf::detail::fused_for_packed_columns pack(
 
 std::size_t payloadBytes(const cudf::detail::fused_for_packed_columns& packed) {
   return packed.wire_data->size() + packed.metadata->size();
+}
+
+// Returns 'column' dictionary encoded when it has few enough distinct values
+// to be cached as dictionary indices, otherwise null.
+std::unique_ptr<cudf::column> encodeDictionary(
+    cudf::column_view column,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref tempMr) {
+  if (column.nullable() || column.type().id() == cudf::type_id::BOOL8) {
+    return nullptr;
+  }
+  auto dictionary = cudf::dictionary::encode(
+      column,
+      cudf::data_type{cudf::type_id::INT32},
+      stream,
+      cudf::memory_resources{tempMr, tempMr});
+  const auto numKeys =
+      cudf::dictionary_column_view(dictionary->view()).keys_size();
+  if (numKeys > kMaxDictionaryKeys || numKeys * kMinRowsPerKey > column.size()) {
+    return nullptr;
+  }
+  return dictionary;
 }
 
 } // namespace
@@ -148,20 +170,9 @@ bool FusedForScanCache::insert(
 
   std::optional<cudf::detail::fused_for_packed_columns> keys;
   cudf::detail::fused_for_packed_columns values;
+  const auto dictionary = encodeDictionary(column, stream, tempMr);
   if (column.type().id() == cudf::type_id::STRING) {
-    std::unique_ptr<cudf::column> dictionary;
-    if (!column.nullable()) {
-      dictionary = cudf::dictionary::encode(
-          column,
-          cudf::data_type{cudf::type_id::INT32},
-          stream,
-          cudf::memory_resources{tempMr, tempMr});
-    }
-    const auto numKeys = dictionary
-        ? cudf::dictionary_column_view(dictionary->view()).keys_size()
-        : 0;
-    if (dictionary == nullptr || numKeys > kMaxDictionaryKeys ||
-        numKeys * kMinRowsPerKey > column.size()) {
+    if (dictionary == nullptr) {
       std::unique_lock lock(mutex_);
       uncacheable_.insert(std::move(entryKey));
       return false;
@@ -171,6 +182,20 @@ bool FusedForScanCache::insert(
     keys = pack(view.keys(), stream, tempMr);
   } else {
     values = pack(column, stream, tempMr);
+    if (dictionary != nullptr) {
+      // Few distinct values spread over a wide range (e.g. decimal quantities)
+      // take fewer bits as dictionary indices. Gathering the keys on read
+      // costs a pass over the column, so the dictionary must save at least a
+      // quarter of the bytes.
+      const cudf::dictionary_column_view view(dictionary->view());
+      auto indices = pack(view.indices(), stream, tempMr);
+      auto dictionaryKeys = pack(view.keys(), stream, tempMr);
+      if (4 * (payloadBytes(indices) + payloadBytes(dictionaryKeys)) <=
+          3 * payloadBytes(values)) {
+        values = std::move(indices);
+        keys = std::move(dictionaryKeys);
+      }
+    }
   }
   const auto bytes =
       payloadBytes(values) + (keys.has_value() ? payloadBytes(*keys) : 0);

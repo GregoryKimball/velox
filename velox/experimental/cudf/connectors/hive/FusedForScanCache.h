@@ -44,7 +44,9 @@ namespace facebook::velox::cudf_velox::connector::hive {
 /// device and decoding them, in place of fetching, decompressing and decoding
 /// the Parquet column chunks. String columns with few distinct values are
 /// stored as frame-of-reference coded dictionary indices plus their keys and
-/// gathered on read; other string columns are not cached. Entries are never
+/// gathered on read; other string columns are not cached. Fixed-width columns
+/// with few distinct values are stored the same way when that is clearly
+/// smaller than coding the values themselves. Entries are never
 /// evicted: once the capacity is reached, the cache is full and further
 /// columns are read from Parquet.
 class FusedForScanCache {
@@ -83,8 +85,8 @@ class FusedForScanCache {
   };
 
   /// Copies the cached column 'name' of 'file' to the device and decodes it
-  /// into memory from 'tempMr', except that a dictionary-encoded string column
-  /// is gathered into a column from 'mr'. The column must be cached.
+  /// into memory from 'tempMr', except that a dictionary-encoded column is
+  /// gathered into a column from 'mr'. The column must be cached.
   DecodedColumn decode(
       std::string_view file,
       std::string_view name,
@@ -103,8 +105,7 @@ class FusedForScanCache {
     std::size_t logicalDataSize{0};
   };
 
-  // A column, or the indices of a dictionary-encoded string column and its
-  // keys.
+  // A column, or the indices of a dictionary-encoded column and its keys.
   struct Entry {
     Payload values;
     std::optional<Payload> keys;
