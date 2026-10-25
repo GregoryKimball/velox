@@ -473,6 +473,32 @@ void registerGroupbyOnlyAggregationFunctions(
     const std::string& prefix) {
   using exec::FunctionSignatureBuilder;
 
+  auto arrayAggRawSignatures = std::vector<exec::FunctionSignaturePtr>{
+      FunctionSignatureBuilder()
+          .typeVariable("T")
+          .returnType("array(T)")
+          .argumentType("T")
+          .build()};
+  auto arrayAggMergeSignatures = std::vector<exec::FunctionSignaturePtr>{
+      FunctionSignatureBuilder()
+          .typeVariable("T")
+          .returnType("array(T)")
+          .argumentType("array(T)")
+          .build()};
+  for (auto step :
+       {core::AggregationNode::Step::kSingle,
+        core::AggregationNode::Step::kPartial}) {
+    registerAggregationFunctionForStep(
+        registry, prefix + "array_agg", step, arrayAggRawSignatures);
+  }
+  for (auto step :
+       {core::AggregationNode::Step::kIntermediate,
+        core::AggregationNode::Step::kFinal}) {
+    registerAggregationFunctionForStep(
+        registry, prefix + "array_agg", step, arrayAggMergeSignatures);
+  }
+  maskSupportedAggregations().insert(prefix + "array_agg");
+
   // Register stddev_samp function (sample standard deviation)
   // Note: stddev_samp uses M2/MERGE_M2 aggregations which are only available
   // for groupby, not reduce.

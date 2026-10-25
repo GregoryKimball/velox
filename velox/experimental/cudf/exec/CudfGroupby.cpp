@@ -32,6 +32,9 @@
 #include "velox/exec/Task.h"
 #include "velox/expression/Expr.h"
 
+#include <cudf/lists/count_elements.hpp>
+#include <cudf/lists/stream_compaction.hpp>
+#include <cudf/replace.hpp>
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
@@ -346,6 +349,104 @@ using GroupbyMinAggregator = SimpleGroupbyAggregator<
     &cudf::make_min_aggregation<cudf::groupby_aggregation>>;
 using GroupbyMaxAggregator = SimpleGroupbyAggregator<
     &cudf::make_max_aggregation<cudf::groupby_aggregation>>;
+
+std::unique_ptr<cudf::groupby_aggregation> makeCollectListAggregation() {
+  return cudf::make_collect_list_aggregation<cudf::groupby_aggregation>(
+      cudf::null_policy::INCLUDE);
+}
+std::unique_ptr<cudf::groupby_aggregation> makeMergeListsAggregation() {
+  return cudf::make_merge_lists_aggregation<cudf::groupby_aggregation>();
+}
+// array_agg collects raw input and merges partial lists. A FILTER mask is
+// collected alongside the values and applied per list, so null values that
+// pass the mask are kept. Partial lists stay non-null, as merge_lists
+// requires; groups with no rows produce null only in the final result.
+struct GroupbyArrayAggAggregator final : GroupbyAggregator {
+  GroupbyArrayAggAggregator(
+      core::AggregationNode::Step step,
+      uint32_t inputIndex,
+      VectorPtr constant,
+      const TypePtr& resultType,
+      std::optional<uint32_t> maskIndex)
+      : GroupbyAggregator(
+            step,
+            inputIndex,
+            std::move(constant),
+            resultType,
+            maskIndex) {}
+
+  void addGroupbyRequest(
+      cudf::table_view const& tbl,
+      std::vector<cudf::groupby::aggregation_request>& requests,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) override {
+    VELOX_CHECK(constant == nullptr, "array_agg does not support constants");
+    valuesIndex_ = requests.size();
+    auto& values = requests.emplace_back();
+    values.values = tbl.column(inputIndex);
+    values.aggregations.push_back(
+        exec::isRawInput(step) ? makeCollectListAggregation()
+                               : makeMergeListsAggregation());
+    if (maskIndex.has_value()) {
+      cudf::numeric_scalar<bool> falseScalar(false, true, stream, mr);
+      mask_ = cudf::replace_nulls(
+          tbl.column(*maskIndex), falseScalar, stream, mr);
+      auto& mask = requests.emplace_back();
+      mask.values = mask_->view();
+      mask.aggregations.push_back(makeCollectListAggregation());
+    }
+  }
+
+  std::unique_ptr<cudf::column> makeOutputColumn(
+      std::vector<cudf::groupby::aggregation_result>& results,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) override {
+    auto lists = std::move(results[valuesIndex_].results[0]);
+    if (maskIndex.has_value()) {
+      lists = cudf::lists::apply_boolean_mask(
+          cudf::lists_column_view(lists->view()),
+          cudf::lists_column_view(
+              results[valuesIndex_ + 1].results[0]->view()),
+          stream,
+          mr);
+    }
+    if (step == core::AggregationNode::Step::kSingle ||
+        step == core::AggregationNode::Step::kFinal) {
+      return finalize(std::move(lists), stream, mr);
+    }
+    return lists;
+  }
+
+  std::unique_ptr<cudf::column> finalize(
+      std::unique_ptr<cudf::column> state,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) override {
+    auto counts = cudf::lists::count_elements(
+        cudf::lists_column_view(state->view()), stream, get_temp_mr());
+    cudf::numeric_scalar<int32_t> zero(0, true, stream, get_temp_mr());
+    auto nonEmpty = cudf::binary_operation(
+        counts->view(),
+        zero,
+        cudf::binary_operator::GREATER,
+        cudf::data_type{cudf::type_id::BOOL8},
+        stream,
+        get_temp_mr());
+    auto [validity, nullCount] =
+        cudf::bools_to_mask(nonEmpty->view(), stream, mr);
+    if (nullCount > 0) {
+      state->set_null_mask(std::move(*validity), nullCount);
+    }
+    return state;
+  }
+
+  void releaseInput() override {
+    mask_.reset();
+  }
+
+ private:
+  size_t valuesIndex_{0};
+  std::unique_ptr<cudf::column> mask_;
+};
 
 // Decimal SUM and AVG aggregators are separate implementations, as they need to
 // handle the VARBINARY encoded intermediate state for streaming aggregation.
@@ -1192,6 +1293,9 @@ std::unique_ptr<GroupbyAggregator> createGroupbyAggregator(
           p.companionStep, p.inputIndex, p.constant, p.resultType);
     }
     return std::make_unique<GroupbyMeanAggregator>(
+        p.companionStep, p.inputIndex, p.constant, p.resultType, p.maskIndex);
+  } else if (kind.rfind(prefix + "array_agg", 0) == 0) {
+    return std::make_unique<GroupbyArrayAggAggregator>(
         p.companionStep, p.inputIndex, p.constant, p.resultType, p.maskIndex);
   } else if (kind.rfind(prefix + "stddev_samp", 0) == 0) {
     return std::make_unique<GroupbyStddevSampAggregator>(
