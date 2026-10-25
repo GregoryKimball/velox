@@ -1524,8 +1524,7 @@ bool canGroupbyBeEvaluatedByCudf(
         !(isCountFunctionName(aggregate.call->name()) &&
           step == core::AggregationNode::Step::kSingle &&
           aggregate.call->inputs().size() == 1 &&
-          aggregate.call->inputs()[0]->isFieldAccessKind() &&
-          aggregate.mask == nullptr)) {
+          aggregate.call->inputs()[0]->isFieldAccessKind())) {
       LOG_FALLBACK("Distinct aggregate: {}", aggregate.call->toString());
       return false;
     }
