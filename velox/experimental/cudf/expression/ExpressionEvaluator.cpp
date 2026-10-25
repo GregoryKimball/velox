@@ -37,6 +37,8 @@
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/ConstantVector.h"
 
+#include <folly/String.h>
+
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -530,6 +532,22 @@ class SplitFunction : public CudfFunction {
   cudf::size_type maxSplitCount_;
 };
 
+// cudf::cast plus integral <-> VARCHAR. VARCHAR to integral is limited to
+// cast, which fails on invalid input; try_cast would need nulls instead.
+bool isSupportedCudfCast(
+    bool isCast,
+    cudf::data_type source,
+    cudf::data_type target) {
+  if (cudf::is_supported_cast(source, target)) {
+    return true;
+  }
+  if (target.id() == cudf::type_id::STRING) {
+    return cudf::is_integral_not_bool(source);
+  }
+  return isCast && source.id() == cudf::type_id::STRING &&
+      cudf::is_integral_not_bool(target);
+}
+
 class CastFunction : public CudfFunction {
  public:
   CastFunction(const core::TypedExprPtr& expr) {
@@ -538,8 +556,10 @@ class CastFunction : public CudfFunction {
     targetCudfType_ = cudf_velox::veloxToCudfDataType(expr->type());
     auto sourceType =
         cudf_velox::veloxToCudfDataType(expr->inputs()[0]->type());
+    checkStringToInteger_ =
+        expr->isCastKind() && sourceType.id() == cudf::type_id::STRING;
     VELOX_CHECK(
-        cudf::is_supported_cast(sourceType, targetCudfType_),
+        isSupportedCudfCast(expr->isCastKind(), sourceType, targetCudfType_),
         "Cast from {} to {} is not supported",
         expr->inputs()[0]->type()->toString(),
         expr->type()->toString());
@@ -550,11 +570,25 @@ class CastFunction : public CudfFunction {
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) const override {
     auto inputCol = asView(inputColumns[0]);
+    if (targetCudfType_.id() == cudf::type_id::STRING) {
+      return cudf::strings::from_integers(inputCol, stream, mr);
+    }
+    if (checkStringToInteger_) {
+      const cudf::strings_column_view strings(inputCol);
+      checkAllTrue(
+          cudf::strings::is_integer(strings, targetCudfType_, stream, mr)
+              ->view(),
+          "Cannot cast VARCHAR to an integral type",
+          stream,
+          mr);
+      return cudf::strings::to_integers(strings, targetCudfType_, stream, mr);
+    }
     return cudf::cast(inputCol, targetCudfType_, stream, mr);
   }
 
  private:
   cudf::data_type targetCudfType_;
+  bool checkStringToInteger_{false};
 };
 
 class CardinalityFunction : public CudfFunction {
@@ -1460,6 +1494,88 @@ class CoalesceFunction : public CudfFunction {
  private:
   size_t numColumnsBeforeLiteral_;
   std::unique_ptr<cudf::scalar> literalScalar_;
+};
+
+// date_diff for units of fixed length. Day and longer units depend on the
+// session time zone, so they stay on CPU.
+std::optional<int64_t> dateDiffUnitMillis(const core::TypedExprPtr& unit) {
+  if (!unit->isConstantKind()) {
+    return std::nullopt;
+  }
+  const auto* c = unit->asUnchecked<core::ConstantTypedExpr>();
+  auto name = c->hasValueVector() ? c->valueVector()->toString(0)
+                                  : c->value().value<std::string>();
+  folly::toLowerAscii(name);
+  static const std::unordered_map<std::string, int64_t> kUnits{
+      {"millisecond", 1},
+      {"second", 1'000},
+      {"minute", 60'000},
+      {"hour", 3'600'000}};
+  auto it = kUnits.find(name);
+  return it == kUnits.end() ? std::nullopt : std::optional(it->second);
+}
+
+class DateDiffFunction : public CudfFunction {
+ public:
+  DateDiffFunction(const core::TypedExprPtr& expr, memory::MemoryPool* pool)
+      : unitMillis_(*dateDiffUnitMillis(expr->inputs()[0])) {
+    if (expr->inputs()[1]->isConstantKind()) {
+      start_ = makeScalarFromConstantExpr(expr->inputs()[1], pool);
+    } else if (expr->inputs()[2]->isConstantKind()) {
+      end_ = makeScalarFromConstantExpr(expr->inputs()[2], pool);
+    }
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) const override {
+    const auto timestampId = asView(inputColumns[0]).type().id();
+    const cudf::data_type durationType{static_cast<cudf::type_id>(
+        static_cast<int32_t>(timestampId) +
+        static_cast<int32_t>(cudf::type_id::DURATION_DAYS) -
+        static_cast<int32_t>(cudf::type_id::TIMESTAMP_DAYS))};
+    const auto sub = cudf::binary_operator::SUB;
+    auto diff = start_
+        ? cudf::binary_operation(
+              asView(inputColumns[0]), *start_, sub, durationType, stream, mr)
+        : end_ ? cudf::binary_operation(
+                     *end_, asView(inputColumns[0]), sub, durationType, stream, mr)
+               : cudf::binary_operation(
+                     asView(inputColumns[1]),
+                     asView(inputColumns[0]),
+                     sub,
+                     durationType,
+                     stream,
+                     mr);
+    const cudf::data_type int64Type{cudf::type_id::INT64};
+    auto millis = cudf::cast(
+        *cudf::cast(
+            diff->view(),
+            cudf::data_type{cudf::type_id::DURATION_MILLISECONDS},
+            stream,
+            mr),
+        int64Type,
+        stream,
+        mr);
+    if (unitMillis_ == 1) {
+      return millis;
+    }
+    cudf::numeric_scalar<int64_t> divisor(
+        unitMillis_, true, stream, get_temp_mr());
+    return cudf::binary_operation(
+        millis->view(),
+        divisor,
+        cudf::binary_operator::DIV,
+        int64Type,
+        stream,
+        mr);
+  }
+
+ private:
+  int64_t unitMillis_;
+  std::unique_ptr<cudf::scalar> start_;
+  std::unique_ptr<cudf::scalar> end_;
 };
 
 class ExtractComponentFunction : public CudfFunction {
@@ -2549,6 +2665,26 @@ bool registerBuiltinFunctions(const std::string& prefix) {
           .build()};
 
   registerCudfFunction(
+      prefix + "date_diff",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool* pool) {
+        return std::make_shared<DateDiffFunction>(expr, pool);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("bigint")
+           .constantArgumentType("varchar")
+           .argumentType("timestamp")
+           .argumentType("timestamp")
+           .build()},
+      /*overwrite=*/true,
+      [](const core::TypedExprPtr& expr) {
+        return dateDiffUnitMillis(expr->inputs()[0]).has_value() &&
+            !(expr->inputs()[1]->isConstantKind() &&
+              expr->inputs()[2]->isConstantKind());
+      });
+
+  registerCudfFunction(
       prefix + "year",
       ExtractComponentFactory{cudf::datetime::datetime_component::YEAR},
       timestampDateIntegerSignatures);
@@ -3405,7 +3541,7 @@ bool FunctionExpression::canEvaluate(const core::TypedExprPtr& expr) {
     }
     auto src = cudf_velox::tryVeloxToCudfDataType(srcType);
     auto dst = cudf_velox::tryVeloxToCudfDataType(dstType);
-    return src && dst && cudf::is_supported_cast(*src, *dst);
+    return src && dst && isSupportedCudfCast(expr->isCastKind(), *src, *dst);
   }
 
   auto& registry = getCudfFunctionRegistry();
