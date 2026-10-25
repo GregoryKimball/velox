@@ -300,6 +300,9 @@ class CudfSplitReader : public NvtxHelper {
   // Rows of each row group of the file, in file order.
   std::vector<std::size_t> rowGroupNumRows_;
 
+  // The split read from the fused FOR scan cache while it was prepared.
+  std::optional<TableChunk> fusedForCacheChunk_;
+
   struct TotalScanTimeCallbackData {
     uint64_t startTimeUs;
     std::shared_ptr<io::IoStatistics> ioStatistics;

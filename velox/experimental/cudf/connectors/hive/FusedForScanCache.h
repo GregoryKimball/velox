@@ -74,9 +74,18 @@ class FusedForScanCache {
       cuda::stream_ref stream,
       rmm::device_async_resource_ref tempMr);
 
-  /// Copies the cached column 'name' of 'file' to the device and decodes it.
-  /// The column must be cached.
-  std::unique_ptr<cudf::column> read(
+  /// A cached column decoded on the device. 'view' points into memory the
+  /// object owns: the decoded packed allocation, or 'column'.
+  struct DecodedColumn {
+    cudf::packed_columns packed;
+    std::unique_ptr<cudf::column> column;
+    cudf::column_view view;
+  };
+
+  /// Copies the cached column 'name' of 'file' to the device and decodes it
+  /// into memory from 'tempMr', except that a dictionary-encoded string column
+  /// is gathered into a column from 'mr'. The column must be cached.
+  DecodedColumn decode(
       std::string_view file,
       std::string_view name,
       cuda::stream_ref stream,
@@ -105,7 +114,7 @@ class FusedForScanCache {
 
   // Copies a payload to the device and decodes its single column into a
   // packed allocation from 'mr', returned with a view of the column.
-  static std::pair<cudf::packed_columns, cudf::column_view> decode(
+  static std::pair<cudf::packed_columns, cudf::column_view> decodePayload(
       const Payload& payload,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr);

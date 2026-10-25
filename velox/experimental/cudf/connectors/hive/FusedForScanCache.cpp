@@ -217,7 +217,8 @@ FusedForScanCache::Payload FusedForScanCache::store(
   return payload;
 }
 
-std::pair<cudf::packed_columns, cudf::column_view> FusedForScanCache::decode(
+std::pair<cudf::packed_columns, cudf::column_view>
+FusedForScanCache::decodePayload(
     const Payload& payload,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
@@ -240,7 +241,7 @@ std::pair<cudf::packed_columns, cudf::column_view> FusedForScanCache::decode(
   return {std::move(columns), view};
 }
 
-std::unique_ptr<cudf::column> FusedForScanCache::read(
+FusedForScanCache::DecodedColumn FusedForScanCache::decode(
     std::string_view file,
     std::string_view name,
     cuda::stream_ref stream,
@@ -258,20 +259,20 @@ std::unique_ptr<cudf::column> FusedForScanCache::read(
     entry = &it->second;
   }
 
-  // The views point into the packed allocations, which stay alive until the
-  // output is built.
-  const auto [values, valuesView] = decode(entry->values, stream, tempMr);
+  auto [values, valuesView] = decodePayload(entry->values, stream, tempMr);
   if (!entry->keys.has_value()) {
-    return std::make_unique<cudf::column>(valuesView, stream, mr);
+    return DecodedColumn{std::move(values), nullptr, valuesView};
   }
-  const auto [keys, keysView] = decode(*entry->keys, stream, tempMr);
+  const auto [keys, keysView] = decodePayload(*entry->keys, stream, tempMr);
   auto gathered = cudf::gather(
       cudf::table_view{{keysView}},
       valuesView,
       cudf::out_of_bounds_policy::DONT_CHECK,
       stream,
       cudf::memory_resources{mr, tempMr});
-  return std::move(gathered->release().front());
+  auto column = std::move(gathered->release().front());
+  const auto view = column->view();
+  return DecodedColumn{{}, std::move(column), view};
 }
 
 void* FusedForScanCache::allocatePinned(std::size_t bytes) {

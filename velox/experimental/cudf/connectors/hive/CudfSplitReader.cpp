@@ -454,6 +454,12 @@ std::optional<CudfSplitReader::TableChunk> CudfSplitReader::readNextChunk() {
   VELOX_CHECK_NOT_NULL(splitReader_, "cuDF parquet reader not present");
   VELOX_CHECK_NOT_NULL(passState_, "Row group pass state not present");
 
+  if (fusedForCacheChunk_.has_value()) {
+    auto chunk = std::move(fusedForCacheChunk_);
+    fusedForCacheChunk_.reset();
+    return chunk;
+  }
+
   auto outputMr = determineCudfMemoryResource();
 
   if (passState_->currentPass >= passState_->passes.size()) {
@@ -548,9 +554,16 @@ void CudfSplitReader::setupChunkingForCurrentPass(
 }
 
 void CudfSplitReader::setupFirstPassChunking() {
-  if (noColumnsToRead_ or fusedForCacheHit_ or passState_ == nullptr or
+  if (noColumnsToRead_ or passState_ == nullptr or
       passState_->currentPass >= passState_->passes.size() or
       passState_->isChunkingSetup) {
+    return;
+  }
+  if (fusedForCacheHit_) {
+    // A split served from the fused FOR scan cache is read here instead.
+    if (fusedForCacheRead_ and not fusedForCacheChunk_.has_value()) {
+      fusedForCacheChunk_ = readFromFusedForCache(determineCudfMemoryResource());
+    }
     return;
   }
   setupChunkingForCurrentPass(determineCudfMemoryResource());
@@ -619,14 +632,9 @@ CudfSplitReader::readFromFusedForCache(rmm::device_async_resource_ref mr) {
   }
   nvtxRangePush("readFromFusedForCache");
   const auto tempMr = get_temp_mr();
-  std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.reserve(readColumnNames_.size());
-  for (const auto& name : readColumnNames_) {
-    columns.push_back(cache.read(split_->filePath, name, stream_, mr, tempMr));
-  }
-  auto table = std::make_unique<cudf::table>(std::move(columns));
 
   // The cached columns hold the whole file; keep the selected row groups.
+  std::vector<cudf::size_type> bounds;
   std::vector<bool> selected(rowGroupNumRows_.size(), false);
   std::size_t numSelected = 0;
   for (const auto& pass : passState_->passes) {
@@ -640,7 +648,6 @@ CudfSplitReader::readFromFusedForCache(rmm::device_async_resource_ref mr) {
     }
   }
   if (numSelected < rowGroupNumRows_.size()) {
-    std::vector<cudf::size_type> bounds;
     cudf::size_type begin = 0;
     for (size_t rowGroup = 0; rowGroup < rowGroupNumRows_.size(); ++rowGroup) {
       const auto end =
@@ -655,14 +662,49 @@ CudfSplitReader::readFromFusedForCache(rmm::device_async_resource_ref mr) {
       }
       begin = end;
     }
-    auto pieces = cudf::slice(table->view(), bounds, stream_);
-    table = cudf::concatenate(pieces, stream_, mr);
   }
 
-  if (auto* filter = pushdownFilter(); filter != nullptr) {
-    auto keep = cudf::compute_column(table->view(), *filter, stream_, tempMr);
-    table = cudf::apply_boolean_mask(table->view(), keep->view(), stream_, mr);
+  // Selecting rows writes the output from the decoded columns; without a
+  // selection they are copied to it.
+  const auto* filter = pushdownFilter();
+  const bool selectsRows = filter != nullptr or not bounds.empty();
+  std::vector<FusedForScanCache::DecodedColumn> decoded;
+  std::vector<cudf::column_view> views;
+  decoded.reserve(readColumnNames_.size());
+  views.reserve(readColumnNames_.size());
+  for (const auto& name : readColumnNames_) {
+    decoded.push_back(cache.decode(
+        split_->filePath, name, stream_, selectsRows ? tempMr : mr, tempMr));
+    views.push_back(decoded.back().view);
   }
+  std::unique_ptr<cudf::table> table;
+  if (not selectsRows) {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.reserve(decoded.size());
+    for (auto& column : decoded) {
+      columns.push_back(
+          column.column != nullptr
+              ? std::move(column.column)
+              : std::make_unique<cudf::column>(column.view, stream_, mr));
+    }
+    table = std::make_unique<cudf::table>(std::move(columns));
+  } else {
+    cudf::table_view input{views};
+    std::unique_ptr<cudf::table> rowGroups;
+    if (not bounds.empty()) {
+      auto pieces = cudf::slice(input, bounds, stream_);
+      rowGroups =
+          cudf::concatenate(pieces, stream_, filter != nullptr ? tempMr : mr);
+      input = rowGroups->view();
+    }
+    if (filter != nullptr) {
+      auto keep = cudf::compute_column(input, *filter, stream_, tempMr);
+      table = cudf::apply_boolean_mask(input, keep->view(), stream_, mr);
+    } else {
+      table = std::move(rowGroups);
+    }
+  }
+  decoded.clear();
 
   // Nothing else of the split is read.
   releaseCurrentPassData();
@@ -701,6 +743,7 @@ void CudfSplitReader::resetSplit() {
   noColumnsToRead_ = false;
   fusedForCacheRead_ = false;
   fusedForCacheHit_ = false;
+  fusedForCacheChunk_.reset();
   rowGroupNumRows_.clear();
 }
 
