@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
+#include "velox/experimental/cudf/exec/Validation.h"
 #include "velox/experimental/cudf/exec/CudfAggregation.h"
 #include "velox/experimental/cudf/exec/CudfReduce.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationHostOps.h"
@@ -828,16 +829,22 @@ bool canReduceBeEvaluatedByCudf(
     // Use step-aware validation that handles partial/final/intermediate steps
     if (!canReduceAggregationBeEvaluatedByCudf(
             *aggregate.call, step, aggregate.rawInputTypes, queryCtx)) {
+      LOG_FALLBACK(
+          "Unsupported aggregate function or signature ({} step): {}",
+          core::AggregationNode::toName(step),
+          aggregate.call->toString());
       return false;
     }
 
     // `distinct` aggregations are not supported, in testing fails with "De-dup
     // before aggregation is not yet supported"
     if (aggregate.distinct) {
+      LOG_FALLBACK("Distinct aggregate: {}", aggregate.call->toString());
       return false;
     }
 
     if (!maskSupportedByCudf(aggregate, step)) {
+      LOG_FALLBACK("Unsupported aggregate mask: {}", aggregate.call->toString());
       return false;
     }
 
