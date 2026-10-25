@@ -33,6 +33,7 @@
 #include "velox/type/DecimalUtil.h"
 #include "velox/type/Time.h"
 #include "velox/type/Type.h"
+#include "velox/type/tz/TimeZoneMap.h"
 #include "velox/vector/BaseVector.h"
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/ConstantVector.h"
@@ -3644,6 +3645,106 @@ bool requiresCpuForTimezone(
 
 } // namespace
 
+// True if cast(TIMESTAMP as TIMESTAMP WITH TIME ZONE) keeps the timestamp's
+// millis as the UTC instant.
+bool timestampCastKeepsMillis(const core::QueryConfig& config) {
+  if (config.adjustTimestampToTimezone()) {
+    return true;
+  }
+  const auto& zone = config.sessionTimezone();
+  return !zone.empty() && tz::getTimeZoneID(zone, false) == 0;
+}
+
+// Rewrites comparisons and date_diff of cast(<timestamp> as TIMESTAMP WITH
+// TIME ZONE) against a literal into the same call on the timestamp, which
+// cuDF can evaluate. The cast truncates to millis, so gt and lte compare
+// against the next milli.
+core::TypedExprPtr rewriteTimestampWithTimeZoneCalls(
+    const core::TypedExprPtr& expr,
+    const core::QueryConfig& config) {
+  std::vector<core::TypedExprPtr> inputs;
+  bool changed = false;
+  for (const auto& input : expr->inputs()) {
+    inputs.push_back(rewriteTimestampWithTimeZoneCalls(input, config));
+    changed |= inputs.back() != input;
+  }
+  if (expr->isCastKind()) {
+    return changed ? std::make_shared<core::CastTypedExpr>(
+                         expr->type(),
+                         inputs,
+                         expr->asUnchecked<core::CastTypedExpr>()->isTryCast())
+                   : expr;
+  }
+  if (!expr->isCallKind()) {
+    return expr;
+  }
+  const auto& name = expr->asUnchecked<core::CallTypedExpr>()->name();
+  auto rebuilt = [&]() -> core::TypedExprPtr {
+    return changed
+        ? std::make_shared<core::CallTypedExpr>(expr->type(), inputs, name)
+        : expr;
+  };
+  const auto& prefix = CudfConfig::getInstance().functionNamePrefix;
+  if (name.rfind(prefix, 0) != 0 || inputs.size() < 2 ||
+      !timestampCastKeepsMillis(config)) {
+    return rebuilt();
+  }
+  auto isTimestampCast = [](const core::TypedExprPtr& e) {
+    return e->isCastKind() && std::string_view(e->type()->name()) == "TIMESTAMP WITH TIME ZONE" &&
+        e->inputs()[0]->type()->kind() == TypeKind::TIMESTAMP;
+  };
+  auto literalMillis = [](const core::TypedExprPtr& e) -> std::optional<int64_t> {
+    if (!e->isConstantKind() ||
+        std::string_view(e->type()->name()) != "TIMESTAMP WITH TIME ZONE") {
+      return std::nullopt;
+    }
+    const auto* c = e->asUnchecked<core::ConstantTypedExpr>();
+    if (c->isNull()) {
+      return std::nullopt;
+    }
+    const auto packed = c->hasValueVector()
+        ? c->valueVector()->as<SimpleVector<int64_t>>()->valueAt(0)
+        : c->value().value<int64_t>();
+    return packed >> 12;
+  };
+  auto timestampLiteral = [](int64_t millis) {
+    return std::make_shared<core::ConstantTypedExpr>(
+        TIMESTAMP(), Variant(Timestamp::fromMillis(millis)));
+  };
+  auto op = name.substr(prefix.size());
+  if (op == "date_diff" && inputs.size() == 3 && isTimestampCast(inputs[1])) {
+    if (auto millis = literalMillis(inputs[2])) {
+      return std::make_shared<core::CallTypedExpr>(
+          expr->type(),
+          std::vector<core::TypedExprPtr>{
+              inputs[0], inputs[1]->inputs()[0], timestampLiteral(*millis)},
+          name);
+    }
+  }
+  static const std::unordered_map<std::string, std::string> kFlipped{
+      {"lt", "gt"}, {"gt", "lt"}, {"lte", "gte"}, {"gte", "lte"}};
+  if (inputs.size() != 2 || !kFlipped.count(op)) {
+    return rebuilt();
+  }
+  int castIndex = isTimestampCast(inputs[0]) ? 0 : 1;
+  auto millis = literalMillis(inputs[1 - castIndex]);
+  if (!isTimestampCast(inputs[castIndex]) || !millis) {
+    return rebuilt();
+  }
+  if (castIndex == 1) {
+    op = kFlipped.at(op);
+  }
+  if (op == "gt" || op == "lte") {
+    op = op == "gt" ? "gte" : "lt";
+    *millis += 1;
+  }
+  return std::make_shared<core::CallTypedExpr>(
+      expr->type(),
+      std::vector<core::TypedExprPtr>{
+          inputs[castIndex]->inputs()[0], timestampLiteral(*millis)},
+      prefix + op);
+}
+
 bool canExprRunOnGpu(
     const core::TypedExprPtr& expr,
     core::QueryCtx* queryCtx,
@@ -3653,9 +3754,13 @@ bool canExprRunOnGpu(
   // compiling, folding e.g. cast(<literal> as DECIMAL) into a plain decimal
   // constant. Checking the un-optimized tree would reject such folded-away
   // casts that the operator never actually compiles.
-  const core::TypedExprPtr checked = (queryCtx != nullptr && pool != nullptr)
+  core::TypedExprPtr checked = (queryCtx != nullptr && pool != nullptr)
       ? expression::optimize(expr, queryCtx, pool)
       : expr;
+  if (queryCtx != nullptr) {
+    checked =
+        rewriteTimestampWithTimeZoneCalls(checked, queryCtx->queryConfig());
+  }
   return canExprRunOnGpu(
       checked,
       queryCtx != nullptr &&
@@ -3674,6 +3779,10 @@ std::shared_ptr<CudfExpression> createCudfExpression(
     const RowTypePtr& inputRowSchema,
     memory::MemoryPool* pool,
     const core::QueryConfig& config) {
+  if (auto rewritten = rewriteTimestampWithTimeZoneCalls(expr, config);
+      rewritten != expr) {
+    return createCudfExpression(rewritten, inputRowSchema, pool, config);
+  }
   if (auto rewritten = rewriteForCudf(expr)) {
     return createCudfExpression(rewritten, inputRowSchema, pool, config);
   }
