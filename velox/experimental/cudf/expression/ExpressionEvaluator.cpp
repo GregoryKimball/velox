@@ -63,6 +63,7 @@
 #include <cudf/strings/find.hpp>
 #include <cudf/strings/replace.hpp>
 #include <cudf/strings/split/split.hpp>
+#include <cudf/strings/strip.hpp>
 #include <cudf/strings/string_view.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/structs/structs_column_view.hpp>
@@ -509,6 +510,9 @@ class SplitFunction : public CudfFunction {
         "split delimiter must be a constant");
     delimiter_ = constantToString(expr->inputs()[1], pool);
 
+    if (expr->inputs().size() < 3) {
+      return;
+    }
     VELOX_CHECK(
         expr->inputs()[2]->isConstantKind(), "split limit must be a constant");
     maxSplitCount_ = std::stoll(constantToString(expr->inputs()[2], pool));
@@ -530,7 +534,73 @@ class SplitFunction : public CudfFunction {
 
  private:
   std::string delimiter_;
-  cudf::size_type maxSplitCount_;
+  cudf::size_type maxSplitCount_{-1};
+};
+
+class TrimFunction : public CudfFunction {
+ public:
+  explicit TrimFunction(cudf::strings::side_type side) : side_(side) {}
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) const override {
+    cudf::string_scalar whitespace("", true, stream, get_temp_mr());
+    return cudf::strings::strip(
+        asView(inputColumns[0]), side_, whitespace, stream, mr);
+  }
+
+ private:
+  cudf::strings::side_type side_;
+};
+
+// strpos(string, substring): 1-based character position, 0 when not found.
+class StrposFunction : public CudfFunction {
+ public:
+  StrposFunction(const core::TypedExprPtr& expr, memory::MemoryPool* pool) {
+    if (expr->inputs()[1]->isConstantKind()) {
+      target_ = constantToString(expr->inputs()[1], pool);
+    }
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) const override {
+    const cudf::strings_column_view strings(asView(inputColumns[0]));
+    auto found = target_.has_value()
+        ? cudf::strings::find(
+              strings,
+              cudf::string_scalar(*target_, true, stream, get_temp_mr()),
+              0,
+              -1,
+              stream,
+              get_temp_mr())
+        : cudf::strings::find(
+              strings,
+              cudf::strings_column_view(asView(inputColumns[1])),
+              0,
+              stream,
+              get_temp_mr());
+    if (!target_.has_value()) {
+      mergeNullSourceNullsIntoResult(
+          *found,
+          {asView(inputColumns[0]), asView(inputColumns[1])},
+          stream,
+          get_temp_mr());
+    }
+    cudf::numeric_scalar<int32_t> one(1, true, stream, get_temp_mr());
+    return cudf::binary_operation(
+        found->view(),
+        one,
+        cudf::binary_operator::ADD,
+        cudf::data_type{cudf::type_id::INT64},
+        stream,
+        mr);
+  }
+
+ private:
+  std::optional<std::string> target_;
 };
 
 // cudf::cast plus integral <-> VARCHAR. VARCHAR to integral is limited to
@@ -2474,6 +2544,11 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .returnType("array(varchar)")
            .argumentType("varchar")
            .constantArgumentType("varchar")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("array(varchar)")
+           .argumentType("varchar")
+           .constantArgumentType("varchar")
            .constantArgumentType("integer")
            .build(),
        FunctionSignatureBuilder()
@@ -2664,6 +2739,38 @@ bool registerBuiltinFunctions(const std::string& prefix) {
           .returnType("integer")
           .argumentType("date")
           .build()};
+
+  for (const auto& [name, side] :
+       {std::pair{"trim", cudf::strings::side_type::BOTH},
+        std::pair{"ltrim", cudf::strings::side_type::LEFT},
+        std::pair{"rtrim", cudf::strings::side_type::RIGHT}}) {
+    registerCudfFunction(
+        prefix + name,
+        [side](const std::string&, const core::TypedExprPtr&, memory::MemoryPool*) {
+          return std::make_shared<TrimFunction>(side);
+        },
+        {FunctionSignatureBuilder()
+             .returnType("varchar")
+             .argumentType("varchar")
+             .build()});
+  }
+
+  registerCudfFunction(
+      prefix + "strpos",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool* pool) {
+        return std::make_shared<StrposFunction>(expr, pool);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("bigint")
+           .argumentType("varchar")
+           .argumentType("varchar")
+           .build()},
+      /*overwrite=*/true,
+      [](const core::TypedExprPtr& expr) {
+        return !expr->inputs()[0]->isConstantKind();
+      });
 
   registerCudfFunction(
       prefix + "date_diff",
