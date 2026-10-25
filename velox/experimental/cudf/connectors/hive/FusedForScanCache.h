@@ -18,14 +18,18 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/contiguous_split.hpp>
+#include <cudf/detail/fused_for.hpp>
 
 #include <cuda/stream_ref>
 #include <folly/container/F14Map.h>
+#include <folly/container/F14Set.h>
 #include <rmm/resource_ref.hpp>
 
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -38,8 +42,11 @@ namespace facebook::velox::cudf_velox::connector::hive {
 /// and held in pinned host memory. A column is filled once per file from a
 /// full, unfiltered read and then served by copying its encoded bytes to the
 /// device and decoding them, in place of fetching, decompressing and decoding
-/// the Parquet column chunks. Entries are never evicted: once the capacity is
-/// reached, further columns are not cached and are read from Parquet.
+/// the Parquet column chunks. String columns with few distinct values are
+/// stored as frame-of-reference coded dictionary indices plus their keys and
+/// gathered on read; other string columns are not cached. Entries are never
+/// evicted: once the capacity is reached, the cache is full and further
+/// columns are read from Parquet.
 class FusedForScanCache {
  public:
   static FusedForScanCache& instance();
@@ -52,8 +59,14 @@ class FusedForScanCache {
       std::string_view file,
       const std::vector<std::string>& columns) const;
 
+  /// Returns whether the columns of 'file' that are not cached yet could still
+  /// be: the cache is not full and none of them was found uncacheable.
+  bool mayCache(std::string_view file, const std::vector<std::string>& columns)
+      const;
+
   /// Encodes 'column' and caches it as column 'name' of 'file'. Returns false
-  /// when the cache is full. A column that is already cached is kept.
+  /// when the column is not cacheable or the cache is full. A column that is
+  /// already cached is kept.
   bool insert(
       std::string_view file,
       std::string_view name,
@@ -70,13 +83,10 @@ class FusedForScanCache {
       rmm::device_async_resource_ref mr,
       rmm::device_async_resource_ref tempMr) const;
 
-  /// Bytes of encoded data cached so far.
-  uint64_t usedBytes() const {
-    return usedBytes_.load(std::memory_order_relaxed);
-  }
-
  private:
-  struct Entry {
+  // One fused FOR payload: the packed-table metadata and the encoded bytes in
+  // pinned host memory.
+  struct Payload {
     std::vector<uint8_t> metadata;
     const void* wire{nullptr};
     std::size_t wireBytes{0};
@@ -84,7 +94,27 @@ class FusedForScanCache {
     std::size_t logicalDataSize{0};
   };
 
+  // A column, or the indices of a dictionary-encoded string column and its
+  // keys.
+  struct Entry {
+    Payload values;
+    std::optional<Payload> keys;
+  };
+
   static std::string key(std::string_view file, std::string_view name);
+
+  // Copies a payload to the device and decodes its single column into a
+  // packed allocation from 'mr', returned with a view of the column.
+  static std::pair<cudf::packed_columns, cudf::column_view> decode(
+      const Payload& payload,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr);
+
+  // Moves an encoded payload to pinned memory. Called with 'mutex_' held
+  // exclusively.
+  Payload store(
+      cudf::detail::fused_for_packed_columns&& packed,
+      cuda::stream_ref stream);
 
   // Returns pinned host memory for 'bytes', from the current block or a new
   // one. Called with 'mutex_' held exclusively.
@@ -93,11 +123,13 @@ class FusedForScanCache {
   mutable std::shared_mutex mutex_;
   // Node map: an entry stays at its address while others are inserted.
   folly::F14NodeMap<std::string, Entry> entries_;
+  folly::F14FastSet<std::string> uncacheable_;
   std::vector<void*> blocks_;
   char* blockCursor_{nullptr};
   std::size_t blockRemaining_{0};
   std::atomic<uint64_t> capacity_{0};
   std::atomic<uint64_t> usedBytes_{0};
+  std::atomic<bool> full_{false};
 };
 
 } // namespace facebook::velox::cudf_velox::connector::hive

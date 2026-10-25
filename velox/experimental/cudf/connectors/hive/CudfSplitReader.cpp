@@ -307,8 +307,9 @@ void CudfSplitReader::prepareSplitInternal(
       capacity > 0 and fusedForCacheEligible()) {
     auto& cache = FusedForScanCache::instance();
     cache.reserveCapacity(capacity);
-    fusedForCacheRead_ = true;
     fusedForCacheHit_ = cache.containsAll(split_->filePath, readColumnNames_);
+    fusedForCacheRead_ = fusedForCacheHit_ or
+        cache.mayCache(split_->filePath, readColumnNames_);
   }
 }
 
@@ -592,15 +593,14 @@ void CudfSplitReader::fillFusedForCache() {
   const auto tempMr = get_temp_mr();
   auto result = cudf::io::read_parquet(options, stream_, tempMr);
   auto& cache = FusedForScanCache::instance();
+  // A column that is not cacheable does not keep the others out.
   for (size_t i = 0; i < readColumnNames_.size(); ++i) {
-    if (not cache.insert(
-            split_->filePath,
-            readColumnNames_[i],
-            result.tbl->view().column(i),
-            stream_,
-            tempMr)) {
-      break;
-    }
+    cache.insert(
+        split_->filePath,
+        readColumnNames_[i],
+        result.tbl->view().column(i),
+        stream_,
+        tempMr);
   }
   if (ioStats_) {
     ioStats_->addCounter("cudfFusedForCacheFills", RuntimeCounter(1));

@@ -19,8 +19,10 @@
 
 #include "velox/common/base/Exceptions.h"
 
-#include <cudf/contiguous_split.hpp>
-#include <cudf/detail/fused_for.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/dictionary/dictionary_column_view.hpp>
+#include <cudf/dictionary/encode.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
 #include <rmm/device_buffer.hpp>
@@ -38,6 +40,11 @@ namespace {
 constexpr std::size_t kBlockBytes = std::size_t{1} << 30;
 constexpr std::size_t kAlignment = 256;
 
+// A string column is cached as dictionary indices when it has at most this
+// many distinct values and at most one per this many rows.
+constexpr cudf::size_type kMaxDictionaryKeys = 1 << 16;
+constexpr cudf::size_type kMinRowsPerKey = 8;
+
 std::size_t alignUp(std::size_t bytes) {
   return (bytes + kAlignment - 1) / kAlignment * kAlignment;
 }
@@ -51,6 +58,20 @@ void* allocatePinnedBlock(std::size_t bytes) {
       bytes,
       cudaGetErrorString(status));
   return ptr;
+}
+
+cudf::detail::fused_for_packed_columns pack(
+    cudf::column_view column,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  cudf::detail::fused_for_options options;
+  options.layout = cudf::detail::fused_for_layout::bitpacked;
+  return cudf::detail::pack_fused_for(
+      cudf::table_view{{column}}, stream, mr, options);
+}
+
+std::size_t payloadBytes(const cudf::detail::fused_for_packed_columns& packed) {
+  return packed.wire_data->size() + packed.metadata->size();
 }
 
 } // namespace
@@ -90,6 +111,21 @@ bool FusedForScanCache::containsAll(
   return true;
 }
 
+bool FusedForScanCache::mayCache(
+    std::string_view file,
+    const std::vector<std::string>& columns) const {
+  if (full_.load(std::memory_order_relaxed)) {
+    return false;
+  }
+  std::shared_lock lock(mutex_);
+  for (const auto& name : columns) {
+    if (uncacheable_.contains(key(file, name))) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool FusedForScanCache::insert(
     std::string_view file,
     std::string_view name,
@@ -102,13 +138,42 @@ bool FusedForScanCache::insert(
     if (entries_.contains(entryKey)) {
       return true;
     }
+    if (uncacheable_.contains(entryKey)) {
+      return false;
+    }
   }
-  cudf::detail::fused_for_options options;
-  options.layout = cudf::detail::fused_for_layout::bitpacked;
-  auto packed = cudf::detail::pack_fused_for(
-      cudf::table_view{{column}}, stream, tempMr, options);
-  const auto wireBytes = packed.wire_data->size();
-  const auto bytes = wireBytes + packed.metadata->size();
+  if (full_.load(std::memory_order_relaxed)) {
+    return false;
+  }
+
+  std::optional<cudf::detail::fused_for_packed_columns> keys;
+  cudf::detail::fused_for_packed_columns values;
+  if (column.type().id() == cudf::type_id::STRING) {
+    std::unique_ptr<cudf::column> dictionary;
+    if (!column.nullable()) {
+      dictionary = cudf::dictionary::encode(
+          column,
+          cudf::data_type{cudf::type_id::INT32},
+          stream,
+          cudf::memory_resources{tempMr, tempMr});
+    }
+    const auto numKeys = dictionary
+        ? cudf::dictionary_column_view(dictionary->view()).keys_size()
+        : 0;
+    if (dictionary == nullptr || numKeys > kMaxDictionaryKeys ||
+        numKeys * kMinRowsPerKey > column.size()) {
+      std::unique_lock lock(mutex_);
+      uncacheable_.insert(std::move(entryKey));
+      return false;
+    }
+    const cudf::dictionary_column_view view(dictionary->view());
+    values = pack(view.indices(), stream, tempMr);
+    keys = pack(view.keys(), stream, tempMr);
+  } else {
+    values = pack(column, stream, tempMr);
+  }
+  const auto bytes =
+      payloadBytes(values) + (keys.has_value() ? payloadBytes(*keys) : 0);
 
   std::unique_lock lock(mutex_);
   if (entries_.contains(entryKey)) {
@@ -116,27 +181,63 @@ bool FusedForScanCache::insert(
   }
   if (usedBytes_.load(std::memory_order_relaxed) + bytes >
       capacity_.load(std::memory_order_relaxed)) {
+    full_.store(true, std::memory_order_relaxed);
     return false;
   }
-  void* host = allocatePinned(wireBytes);
+  Entry entry;
+  entry.values = store(std::move(values), stream);
+  if (keys.has_value()) {
+    entry.keys = store(std::move(*keys), stream);
+  }
+  stream.sync();
+  entries_.emplace(std::move(entryKey), std::move(entry));
+  usedBytes_.fetch_add(bytes, std::memory_order_relaxed);
+  return true;
+}
+
+FusedForScanCache::Payload FusedForScanCache::store(
+    cudf::detail::fused_for_packed_columns&& packed,
+    cuda::stream_ref stream) {
+  Payload payload;
+  payload.wireBytes = packed.wire_data->size();
+  void* host = allocatePinned(payload.wireBytes);
   const auto status = cudaMemcpyAsync(
       host,
       packed.wire_data->data(),
-      wireBytes,
+      payload.wireBytes,
       cudaMemcpyDeviceToHost,
       stream.get());
   VELOX_CHECK(status == cudaSuccess, "{}", cudaGetErrorString(status));
-  stream.sync();
-  entries_.emplace(
-      std::move(entryKey),
-      Entry{
-          std::move(*packed.metadata),
-          host,
-          wireBytes,
-          packed.segment_count,
-          packed.logical_data_size});
-  usedBytes_.fetch_add(bytes, std::memory_order_relaxed);
-  return true;
+  payload.wire = host;
+  payload.metadata = std::move(*packed.metadata);
+  payload.segmentCount = packed.segment_count;
+  payload.logicalDataSize = packed.logical_data_size;
+  // The device buffer is released on 'stream' after the copy above.
+  packed.wire_data.reset();
+  return payload;
+}
+
+std::pair<cudf::packed_columns, cudf::column_view> FusedForScanCache::decode(
+    const Payload& payload,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  rmm::device_buffer wire(payload.wireBytes, stream, mr);
+  const auto status = cudaMemcpyAsync(
+      wire.data(),
+      payload.wire,
+      payload.wireBytes,
+      cudaMemcpyHostToDevice,
+      stream.get());
+  VELOX_CHECK(status == cudaSuccess, "{}", cudaGetErrorString(status));
+
+  cudf::detail::fused_for_packed_columns packed;
+  packed.metadata = std::make_unique<std::vector<uint8_t>>(payload.metadata);
+  packed.wire_data = std::make_unique<rmm::device_buffer>(std::move(wire));
+  packed.segment_count = payload.segmentCount;
+  packed.logical_data_size = payload.logicalDataSize;
+  auto columns = cudf::detail::decode_fused_for(std::move(packed), stream, mr);
+  const auto view = cudf::unpack(columns).column(0);
+  return {std::move(columns), view};
 }
 
 std::unique_ptr<cudf::column> FusedForScanCache::read(
@@ -157,24 +258,20 @@ std::unique_ptr<cudf::column> FusedForScanCache::read(
     entry = &it->second;
   }
 
-  rmm::device_buffer wire(entry->wireBytes, stream, tempMr);
-  const auto status = cudaMemcpyAsync(
-      wire.data(),
-      entry->wire,
-      entry->wireBytes,
-      cudaMemcpyHostToDevice,
-      stream.get());
-  VELOX_CHECK(status == cudaSuccess, "{}", cudaGetErrorString(status));
-
-  cudf::detail::fused_for_packed_columns payload;
-  payload.metadata = std::make_unique<std::vector<uint8_t>>(entry->metadata);
-  payload.wire_data = std::make_unique<rmm::device_buffer>(std::move(wire));
-  payload.segment_count = entry->segmentCount;
-  payload.logical_data_size = entry->logicalDataSize;
-  auto packedColumns =
-      cudf::detail::decode_fused_for(std::move(payload), stream, tempMr);
-  return std::make_unique<cudf::column>(
-      cudf::unpack(packedColumns).column(0), stream, mr);
+  // The views point into the packed allocations, which stay alive until the
+  // output is built.
+  const auto [values, valuesView] = decode(entry->values, stream, tempMr);
+  if (!entry->keys.has_value()) {
+    return std::make_unique<cudf::column>(valuesView, stream, mr);
+  }
+  const auto [keys, keysView] = decode(*entry->keys, stream, tempMr);
+  auto gathered = cudf::gather(
+      cudf::table_view{{keysView}},
+      valuesView,
+      cudf::out_of_bounds_policy::DONT_CHECK,
+      stream,
+      cudf::memory_resources{mr, tempMr});
+  return std::move(gathered->release().front());
 }
 
 void* FusedForScanCache::allocatePinned(std::size_t bytes) {
