@@ -357,6 +357,13 @@ std::unique_ptr<cudf::groupby_aggregation> makeCollectListAggregation() {
 std::unique_ptr<cudf::groupby_aggregation> makeMergeListsAggregation() {
   return cudf::make_merge_lists_aggregation<cudf::groupby_aggregation>();
 }
+std::unique_ptr<cudf::groupby_aggregation> makeNuniqueAggregation() {
+  return cudf::make_nunique_aggregation<cudf::groupby_aggregation>(
+      cudf::null_policy::EXCLUDE);
+}
+using GroupbyCountDistinctAggregator =
+    SimpleGroupbyAggregator<&makeNuniqueAggregation>;
+
 // array_agg collects raw input and merges partial lists. A FILTER mask is
 // collected alongside the values and applied per list, so null values that
 // pass the mask are kept. Partial lists stay non-null, as merge_lists
@@ -1266,6 +1273,10 @@ std::unique_ptr<GroupbyAggregator> createGroupbyAggregator(
     const ResolvedAggregateInfo& p) {
   auto const& kind = p.kind;
   auto prefix = cudf_velox::CudfConfig::getInstance().functionNamePrefix;
+  if (p.distinct) {
+    return std::make_unique<GroupbyCountDistinctAggregator>(
+        p.companionStep, p.inputIndex, p.constant, p.resultType, p.maskIndex);
+  }
   if (kind.rfind(prefix + "sum", 0) == 0) {
     if (p.isDecimalAggregate) {
       return std::make_unique<GroupbyDecimalSumAggregator>(
@@ -1314,7 +1325,8 @@ std::unique_ptr<StreamingGroupbyAggregator> createStreamingGroupbyAggregator(
     column_index_t inputIndex,
     const TypePtr& inputType,
     const TypePtr& resultType) {
-  if (aggregate.constant != nullptr || aggregate.maskIndex.has_value()) {
+  if (aggregate.constant != nullptr || aggregate.maskIndex.has_value() ||
+      aggregate.distinct) {
     return nullptr;
   }
 
@@ -1508,7 +1520,12 @@ bool canGroupbyBeEvaluatedByCudf(
 
     // `distinct` aggregations are not supported, in testing fails with "De-dup
     // before aggregation is not yet supported"
-    if (aggregate.distinct) {
+    if (aggregate.distinct &&
+        !(isCountFunctionName(aggregate.call->name()) &&
+          step == core::AggregationNode::Step::kSingle &&
+          aggregate.call->inputs().size() == 1 &&
+          aggregate.call->inputs()[0]->isFieldAccessKind() &&
+          aggregate.mask == nullptr)) {
       LOG_FALLBACK("Distinct aggregate: {}", aggregate.call->toString());
       return false;
     }

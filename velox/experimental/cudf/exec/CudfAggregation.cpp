@@ -241,6 +241,7 @@ std::vector<ResolvedAggregateInfo> resolveAggregateInfos(
             : std::nullopt,
         maskIndex,
         isDecimalAggregate);
+    params.back().distinct = aggregate.distinct;
   }
   return params;
 }
