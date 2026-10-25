@@ -64,6 +64,8 @@ struct CudfConfig {
       "cudf.decimal_groupby_narrow_accumulation"};
   static constexpr const char* kCudfCompactDecimalIntermediateState{
       "cudf.compact_decimal_intermediate_state"};
+  static constexpr const char* kCudfPartialAggregationAbandonment{
+      "cudf.partial_aggregation_abandonment"};
   static constexpr const char* kCudfTimestampUnit{"cudf.timestamp_unit"};
   static constexpr const char* kUcxExchange{"cudf.exchange"};
   static constexpr const char* kUcxxErrorHandling{"ucxx.error_handling"};
@@ -223,6 +225,12 @@ struct CudfConfig {
   /// and AVG partial results. The historical 32-byte state remains the default
   /// and DECIMAL128 results always retain that representation.
   bool compactDecimalIntermediateState{false};
+
+  /// Stop hashing in a partial groupby that does not reduce its input, by the
+  /// rule of Velox CPU's HashAggregation (query configs
+  /// abandon_partial_aggregation_min_rows and abandon_partial_aggregation_min_pct):
+  /// later inputs are converted to intermediate rows one to one and emitted.
+  bool partialAggregationAbandonment{false};
 
   /// Minimum rows to accumulate before GPU-side concatenation (default 100k).
   /// Applies when batchSizeMinBytes is unset, and always to zero-column

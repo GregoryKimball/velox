@@ -526,6 +526,10 @@ void CudfConfig::initialize(
     compactDecimalIntermediateState =
         folly::to<bool>(config[kCudfCompactDecimalIntermediateState]);
   }
+  if (config.find(kCudfPartialAggregationAbandonment) != config.end()) {
+    partialAggregationAbandonment =
+        folly::to<bool>(config[kCudfPartialAggregationAbandonment]);
+  }
   if (config.find(kCudfFunctionNamePrefix) != config.end()) {
     functionNamePrefix = config[kCudfFunctionNamePrefix];
   }

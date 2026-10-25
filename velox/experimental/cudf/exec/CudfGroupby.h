@@ -226,7 +226,8 @@ class CudfGroupby : public CudfOperatorBase {
   void initialize() override;
 
   bool needsInput() const override {
-    return !noMoreInput_;
+    // After abandoning partial aggregation, each input is emitted on its own.
+    return !noMoreInput_ && !(abandonedPartialAggregation_ && bufferedResult_);
   }
 
   exec::BlockingReason isBlocked(ContinueFuture* /* unused */) override {
@@ -251,9 +252,14 @@ class CudfGroupby : public CudfOperatorBase {
       std::vector<std::unique_ptr<GroupbyAggregator>>& aggregators,
       TypePtr const& outputType,
       cuda::stream_ref stream,
-      rmm::device_async_resource_ref mr);
+      rmm::device_async_resource_ref mr,
+      bool rowPerGroup = false);
 
   CudfVectorPtr releaseAndResetBufferedResult();
+
+  // Abandons partial aggregation when the buffered result shows too little
+  // reduction of the input since the last flush.
+  void maybeAbandonPartialAggregation();
 
   bool initializeStreamingGroupby(
       const RowTypePtr& inputRowSchema,
@@ -308,6 +314,9 @@ class CudfGroupby : public CudfOperatorBase {
   bool incrementalAggregationEnabled_{true};
   bool streamingGroupbyEnabled_{false};
   const int64_t maxPartialAggregationMemoryUsage_;
+  const int32_t abandonPartialAggregationMinRows_;
+  const int32_t abandonPartialAggregationMinPct_;
+  bool abandonedPartialAggregation_{false};
   int64_t numInputRows_ = 0;
 
   bool finished_ = false;

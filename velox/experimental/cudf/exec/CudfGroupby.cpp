@@ -36,6 +36,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/filling.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/partitioning.hpp>
@@ -1693,7 +1694,11 @@ CudfGroupby::CudfGroupby(
       isSingleStep_(
           aggregationNode->step() == core::AggregationNode::Step::kSingle),
       maxPartialAggregationMemoryUsage_(
-          driverCtx->queryConfig().maxPartialAggregationMemoryUsage()) {}
+          driverCtx->queryConfig().maxPartialAggregationMemoryUsage()),
+      abandonPartialAggregationMinRows_(
+          driverCtx->queryConfig().abandonPartialAggregationMinRows()),
+      abandonPartialAggregationMinPct_(
+          driverCtx->queryConfig().abandonPartialAggregationMinPct()) {}
 
 bool CudfGroupby::initializeStreamingGroupby(
     const RowTypePtr& inputRowSchema,
@@ -2098,7 +2103,20 @@ void CudfGroupby::computePartialGroupbyIncrementally(CudfVectorPtr tbl) {
       aggregators_,
       bufferedResultType_,
       inputTableStream,
-      get_output_mr());
+      get_output_mr(),
+      abandonedPartialAggregation_);
+
+  if (abandonedPartialAggregation_) {
+    // needsInput() waits for getOutput() to emit the previous input.
+    VELOX_CHECK_NULL(bufferedResult_);
+    bufferedResult_ = groupbyOnInput;
+    if (bufferedResult_) {
+      addRuntimeStat(
+          std::string(exec::HashAggregation::kAbandonedPartialAggregationRows),
+          RuntimeCounter(bufferedResult_->size()));
+    }
+    return;
+  }
 
   // If we already have partial output, concatenate the new results with it.
   if (bufferedResult_) {
@@ -2126,6 +2144,23 @@ void CudfGroupby::computePartialGroupbyIncrementally(CudfVectorPtr tbl) {
     // First time processing, just store the result of the input batch's groupby
     // This means we're storing the stream from the first batch.
     bufferedResult_ = groupbyOnInput;
+  }
+  maybeAbandonPartialAggregation();
+}
+
+void CudfGroupby::maybeAbandonPartialAggregation() {
+  // Rows with null keys would need dropping, which the one-to-one conversion
+  // does not do.
+  if (!CudfConfig::getInstance().partialAggregationAbandonment ||
+      !bufferedResult_ || ignoreNullKeys_ ||
+      groupingKeyOutputChannels_.empty()) {
+    return;
+  }
+  // Velox CPU's HashAggregation::abandonPartialAggregationEarly().
+  if (numInputRows_ > abandonPartialAggregationMinRows_ &&
+      100 * static_cast<int64_t>(bufferedResult_->size()) / numInputRows_ >=
+          abandonPartialAggregationMinPct_) {
+    abandonedPartialAggregation_ = true;
   }
 }
 
@@ -2260,16 +2295,30 @@ CudfVectorPtr CudfGroupby::doGroupByAggregation(
     std::vector<std::unique_ptr<GroupbyAggregator>>& aggregators,
     TypePtr const& outputType,
     cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr) {
+    rmm::device_async_resource_ref mr,
+    bool rowPerGroup) {
   auto groupbyKeyView =
       tableView.select(groupByKeys.begin(), groupByKeys.end());
 
+  // With 'rowPerGroup' every row is its own group, in input order: grouping by
+  // a row number declared sorted takes libcudf's sort-based path with no
+  // hashing or sorting, and the input keys are the output keys.
+  std::unique_ptr<cudf::column> rowNumbers;
+  if (rowPerGroup) {
+    VELOX_CHECK(!ignoreNullKeys_);
+    rowNumbers = cudf::sequence(
+        tableView.num_rows(),
+        cudf::numeric_scalar<cudf::size_type>(0, true, stream, get_temp_mr()),
+        stream,
+        get_temp_mr());
+  }
   // TODO: All other args to groupby are related to sort groupby. We don't
   // support optimizations related to it yet.
   cudf::groupby::groupby groupByOwner(
-      groupbyKeyView,
+      rowPerGroup ? cudf::table_view{{rowNumbers->view()}} : groupbyKeyView,
       ignoreNullKeys_ ? cudf::null_policy::EXCLUDE
-                      : cudf::null_policy::INCLUDE);
+                      : cudf::null_policy::INCLUDE,
+      rowPerGroup ? cudf::sorted::YES : cudf::sorted::NO);
 
   auto releaseInputs = [&]() {
     for (auto& aggregator : aggregators) {
@@ -2332,7 +2381,9 @@ CudfVectorPtr CudfGroupby::doGroupByAggregation(
   std::vector<std::unique_ptr<cudf::column>> resultColumns;
 
   // first fill the grouping keys
-  auto groupKeysColumns = groupKeys->release();
+  auto groupKeysColumns = rowPerGroup
+      ? cudf::table(groupbyKeyView, stream, mr).release()
+      : groupKeys->release();
   resultColumns.insert(
       resultColumns.begin(),
       std::make_move_iterator(groupKeysColumns.begin()),
@@ -2383,8 +2434,9 @@ RowVectorPtr CudfGroupby::doGetOutput() {
   // Handle partial streaming groupby.
   if (isPartialOutput_ && incrementalAggregationEnabled_) {
     if (bufferedResult_ &&
-        bufferedResult_->estimateFlatSize() >
-            maxPartialAggregationMemoryUsage_) {
+        (abandonedPartialAggregation_ ||
+         bufferedResult_->estimateFlatSize() >
+             maxPartialAggregationMemoryUsage_)) {
       return releaseAndResetBufferedResult();
     }
     if (not noMoreInput_) {
