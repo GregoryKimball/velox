@@ -27,6 +27,7 @@
 #include "velox/type/Type.h"
 
 #include <cudf/aggregation.hpp>
+#include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
@@ -379,6 +380,73 @@ std::unique_ptr<cudf::rolling_aggregation> makeRollingAggregation(
   VELOX_FAIL("Unsupported rolling window function: {}", baseName);
 }
 
+// Dense rank of each row's tuple of `keys` under the given orders, as INT64.
+// Ordering by it ascending, with equal ranks as peers, matches ordering by
+// `keys`, so a multi-column ORDER BY can use the single-key cuDF window APIs.
+std::unique_ptr<cudf::column> denseRankOfKeys(
+    const cudf::table_view& keys,
+    const std::vector<cudf::order>& orders,
+    const std::vector<cudf::null_order>& nullOrders,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  const auto numRows = keys.num_rows();
+  const auto boolType = cudf::data_type{cudf::type_id::BOOL8};
+  auto order = cudf::stable_sorted_order(keys, orders, nullOrders, stream, mr);
+  auto sorted = cudf::gather(
+      keys,
+      order->view(),
+      cudf::out_of_bounds_policy::DONT_CHECK,
+      stream,
+      mr);
+  auto newGroup = cudf::make_column_from_scalar(
+      cudf::numeric_scalar<bool>(true, true, stream), numRows, stream, mr);
+  if (numRows > 1) {
+    std::unique_ptr<cudf::column> sameAsPrevious;
+    for (const auto& column : sorted->view()) {
+      auto equal = cudf::binary_operation(
+          cudf::slice(column, {1, numRows})[0],
+          cudf::slice(column, {0, numRows - 1})[0],
+          cudf::binary_operator::NULL_EQUALS,
+          boolType,
+          stream,
+          mr);
+      sameAsPrevious = sameAsPrevious
+          ? cudf::binary_operation(
+                sameAsPrevious->view(),
+                equal->view(),
+                cudf::binary_operator::LOGICAL_AND,
+                boolType,
+                stream,
+                mr)
+          : std::move(equal);
+    }
+    auto differs = cudf::unary_operation(
+        sameAsPrevious->view(), cudf::unary_operator::NOT, stream, mr);
+    auto target = newGroup->mutable_view();
+    cudf::copy_range_in_place(
+        differs->view(), target, 0, numRows - 1, 1, stream);
+  }
+  auto dense = cudf::scan(
+      cudf::cast(
+          newGroup->view(),
+          cudf::data_type{cudf::type_id::INT64},
+          stream,
+          mr)
+          ->view(),
+      *cudf::make_sum_aggregation<cudf::scan_aggregation>(),
+      cudf::scan_type::INCLUSIVE,
+      cudf::null_policy::EXCLUDE,
+      stream,
+      mr);
+  auto scattered = cudf::scatter(
+      cudf::table_view{{dense->view()}},
+      order->view(),
+      cudf::table_view{{dense->view()}},
+      stream,
+      mr);
+  return std::move(scattered->release()[0]);
+}
+
 } // namespace
 
 bool CudfWindow::isSupportedWindowFunction(
@@ -415,10 +483,22 @@ bool CudfWindow::canRunOnGPU(
     const core::WindowNode& windowNode,
     std::string* reason) {
   if (windowNode.sortingKeys().size() > 1) {
-    if (reason) {
-      *reason = "Multi-column ORDER BY requires a cuDF upgrade (follow-on PR)";
+    // Multi-column ORDER BY runs on a dense rank of the keys, which has no
+    // distances for RANGE frames with offsets.
+    for (const auto& func : windowNode.windowFunctions()) {
+      const auto& frame = func.frame;
+      const auto hasOffset = [](core::WindowNode::BoundType bound) {
+        return bound == core::WindowNode::BoundType::kPreceding ||
+            bound == core::WindowNode::BoundType::kFollowing;
+      };
+      if (frame.type == core::WindowNode::WindowType::kRange &&
+          (hasOffset(frame.startType) || hasOffset(frame.endType))) {
+        if (reason) {
+          *reason = "RANGE frame with offsets over a multi-column ORDER BY";
+        }
+        return false;
+      }
     }
-    return false;
   }
 
   for (const auto& key : windowNode.partitionKeys()) {
@@ -989,6 +1069,23 @@ void CudfWindow::doNoMoreInput() {
   auto allData = getConcatenatedTable(
       std::exchange(inputBatches_, {}), inputRowType_, stream_, mr);
 
+  // Replace a multi-column ORDER BY with one dense-rank key column, appended
+  // after the input columns and dropped from the output.
+  if (sortKeyIndices_.size() > 1) {
+    auto rank = denseRankOfKeys(
+        allData->view().select(sortKeyIndices_),
+        sortOrders_,
+        nullOrders_,
+        stream_,
+        mr);
+    auto columns = allData->release();
+    columns.push_back(std::move(rank));
+    allData = std::make_unique<cudf::table>(std::move(columns));
+    sortKeyIndices_ = {allData->num_columns() - 1};
+    sortOrders_ = {cudf::order::ASCENDING};
+    nullOrders_ = {cudf::null_order::BEFORE};
+  }
+
   // Sort by partition keys + sort keys if the plan is not already sorted.
   if (!windowNode_->inputsSorted()) {
     std::vector<cudf::size_type> allSortKeys;
@@ -1225,6 +1322,7 @@ RowVectorPtr CudfWindow::doGetOutput() {
   auto sortedCols = sortedData_->release();
   sortedData_.reset();
   const auto numInputCols = inputRowType_->size();
+  sortedCols.resize(numInputCols);
   for (size_t i = 0; i < windowResultCols.size(); ++i) {
     auto& resultColumn = windowResultCols[i];
     VELOX_CHECK_NOT_NULL(resultColumn);
