@@ -26,7 +26,6 @@
 #include <cudf/dictionary/encode.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
-#include <cudf/sorting.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
@@ -102,26 +101,22 @@ std::unique_ptr<cudf::column> encodeDictionary(
 }
 
 // Returns the differences between consecutive values of 'column', starting
-// with its first value, when it is a non-null BIGINT column in ascending order
-// from a non-negative first value (sorted keys such as l_orderkey), otherwise
-// null. The order and sign keep every difference within BIGINT, so an
-// inclusive prefix sum restores the values exactly.
+// with its first value, when it is a non-null BIGINT column without negative
+// values (keys such as l_orderkey), otherwise null. The difference of two
+// non-negative BIGINTs fits in BIGINT, so an inclusive prefix sum restores the
+// values exactly. Rows need not be sorted: keys stored roughly in key order
+// (SF3K lineitem files) still differ by much less than their range.
 std::unique_ptr<cudf::column> encodeDeltas(
     cudf::column_view column,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref tempMr) {
   if (column.nullable() || column.is_empty() ||
-      column.type().id() != cudf::type_id::INT64 ||
-      !cudf::is_sorted(
-          cudf::table_view{{column}},
-          {cudf::order::ASCENDING},
-          {cudf::null_order::BEFORE},
-          stream)) {
+      column.type().id() != cudf::type_id::INT64) {
     return nullptr;
   }
-  const auto first = cudf::get_element(column, 0, stream, tempMr);
-  if (static_cast<const cudf::numeric_scalar<int64_t>&>(*first).value(stream) <
-      0) {
+  const auto minimum = cudf::minmax(column, stream, tempMr).first;
+  if (static_cast<const cudf::numeric_scalar<int64_t>&>(*minimum).value(
+          stream) < 0) {
     return nullptr;
   }
   const cudf::numeric_scalar<int64_t> zero(0, true, stream, tempMr);
@@ -237,10 +232,10 @@ bool FusedForScanCache::insert(
       }
     }
     if (!keys.has_value()) {
-      // Ascending keys take a few bits per row as differences between
-      // consecutive values where the values themselves take tens. Restoring
-      // them costs a prefix sum on read, so the differences must also save at
-      // least a quarter of the bytes.
+      // Keys stored near key order take a few bits per row as differences
+      // between consecutive values where the values themselves take tens.
+      // Restoring them costs a prefix sum on read, so the differences must
+      // also save at least a quarter of the bytes.
       if (const auto differences = encodeDeltas(column, stream, tempMr)) {
         auto packedDifferences = pack(differences->view(), stream, tempMr);
         if (4 * payloadBytes(packedDifferences) <= 3 * payloadBytes(values)) {

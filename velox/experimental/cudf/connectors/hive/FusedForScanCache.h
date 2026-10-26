@@ -46,9 +46,9 @@ namespace facebook::velox::cudf_velox::connector::hive {
 /// stored as frame-of-reference coded dictionary indices plus their keys and
 /// gathered on read; other string columns are not cached. Fixed-width columns
 /// with few distinct values are stored the same way when that is clearly
-/// smaller than coding the values themselves, and ascending BIGINT columns
-/// (sorted keys) as the differences between consecutive values, restored by a
-/// prefix sum on read, under the same condition. Entries are never
+/// smaller than coding the values themselves, and non-negative BIGINT columns
+/// (keys) as the differences between consecutive values, restored by a prefix
+/// sum on read, under the same condition. Entries are never
 /// evicted: once the capacity is reached, the cache is full and further
 /// columns are read from Parquet.
 class FusedForScanCache {
