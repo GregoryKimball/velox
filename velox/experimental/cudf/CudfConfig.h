@@ -66,6 +66,8 @@ struct CudfConfig {
       "cudf.compact_decimal_intermediate_state"};
   static constexpr const char* kCudfPartialAggregationAbandonment{
       "cudf.partial_aggregation_abandonment"};
+  static constexpr const char* kCudfNarrowDecimalSumState{
+      "cudf.narrow_decimal_sum_state"};
   static constexpr const char* kCudfTimestampUnit{"cudf.timestamp_unit"};
   static constexpr const char* kUcxExchange{"cudf.exchange"};
   static constexpr const char* kUcxxErrorHandling{"ucxx.error_handling"};
@@ -231,6 +233,15 @@ struct CudfConfig {
   /// abandon_partial_aggregation_min_rows and abandon_partial_aggregation_min_pct):
   /// later inputs are converted to intermediate rows one to one and emitted.
   bool partialAggregationAbandonment{false};
+
+  /// Keep the compact Decimal64 SUM state (compactAggregationStateEnabled) at
+  /// 64 bits, DECIMAL(18, s) instead of DECIMAL(38, s), from the partial
+  /// aggregation through the exchange into the final one. A partial or
+  /// intermediate sum enters the state only when it fits 64 bits (proven
+  /// before summing or checked after a 128-bit sum); the final aggregation
+  /// sums the states in 64 bits under a bound on all its input and fails
+  /// rather than overflow. Every worker of a query must use the same setting.
+  bool narrowDecimalSumState{false};
 
   /// Minimum rows to accumulate before GPU-side concatenation (default 100k).
   /// Applies when batchSizeMinBytes is unset, and always to zero-column

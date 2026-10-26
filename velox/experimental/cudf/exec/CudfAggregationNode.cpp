@@ -37,7 +37,8 @@ TypePtr CudfAggregationNode::compactIntermediateType(
       field && field->isInputColumn(),
       "Compact Decimal64 SUM requires a column input");
   return DECIMAL(
-      38, getDecimalPrecisionScale(*aggregate.rawInputTypes[0]).second);
+      CudfConfig::getInstance().narrowDecimalSumState ? 18 : 38,
+      getDecimalPrecisionScale(*aggregate.rawInputTypes[0]).second);
 }
 
 CudfAggregationNode::CudfAggregationNode(
@@ -73,7 +74,11 @@ CudfAggregationNode::CudfAggregationNode(
     const auto& inputType =
         step() == Step::kPartial ? aggregate.rawInputTypes[0] : stateType;
     VELOX_USER_CHECK(*input->type() == *inputType);
-    VELOX_USER_CHECK(*aggregate.call->type() == *stateType);
+    // A final step keeps its own decimal result type; only partial outputs
+    // carry the state.
+    VELOX_USER_CHECK(
+        step() == Step::kFinal ? aggregate.call->type()->isDecimal()
+                               : *aggregate.call->type() == *stateType);
     const auto& field = static_cast<const core::FieldAccessTypedExpr&>(*input);
     VELOX_USER_CHECK(
         *sources()[0]->outputType()->findChild(field.name()) == *inputType);

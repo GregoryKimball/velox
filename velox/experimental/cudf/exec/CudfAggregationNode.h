@@ -39,7 +39,8 @@ class CudfAggregationNode final : public core::AggregationNode {
     return compactIntermediateTypes_.at(index);
   }
 
-  /// Returns DECIMAL(38, raw input scale) for plain Decimal64 SUM, otherwise
+  /// Returns DECIMAL(38, raw input scale) for plain Decimal64 SUM, or
+  /// DECIMAL(18, raw input scale) with narrowDecimalSumState, otherwise
   /// nullptr. Modifiers on Decimal64 SUM are rejected rather than allowing
   /// producer and consumer fragments to choose different state protocols.
   static TypePtr compactIntermediateType(const Aggregate& aggregate);

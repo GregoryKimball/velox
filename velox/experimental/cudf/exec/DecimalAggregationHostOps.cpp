@@ -23,7 +23,11 @@
 
 #include "velox/common/base/Exceptions.h"
 
+#include <cudf/reduction.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/unary.hpp>
+
+#include <limits>
 
 namespace facebook::velox::cudf_velox {
 
@@ -50,6 +54,34 @@ cudf::column_view castDecimal64InputToDecimal128(
       stream,
       get_temp_mr());
   return holder->view();
+}
+
+std::unique_ptr<cudf::column> narrowDecimal128SumState(
+    std::unique_ptr<cudf::column> sum,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  VELOX_CHECK(sum->type().id() == cudf::type_id::DECIMAL128);
+  if (sum->null_count() < sum->size()) {
+    using Scalar = cudf::fixed_point_scalar<numeric::decimal128>;
+    auto const minAgg = cudf::make_min_aggregation<cudf::reduce_aggregation>();
+    auto const maxAgg = cudf::make_max_aggregation<cudf::reduce_aggregation>();
+    auto const minimum = cudf::reduce(
+        sum->view(), *minAgg, sum->type(), stream, get_temp_mr());
+    auto const maximum = cudf::reduce(
+        sum->view(), *maxAgg, sum->type(), stream, get_temp_mr());
+    VELOX_USER_CHECK(
+        static_cast<const Scalar&>(*minimum).value(stream) >=
+                std::numeric_limits<int64_t>::min() &&
+            static_cast<const Scalar&>(*maximum).value(stream) <=
+                std::numeric_limits<int64_t>::max(),
+        "A decimal SUM state exceeds 64 bits; disable {}",
+        CudfConfig::kCudfNarrowDecimalSumState);
+  }
+  return cudf::cast(
+      sum->view(),
+      cudf::data_type{cudf::type_id::DECIMAL64, sum->type().scale()},
+      stream,
+      mr);
 }
 
 std::unique_ptr<cudf::column> castCountColumnToInt64(

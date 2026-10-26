@@ -55,6 +55,20 @@ cudf::column_view castDecimal64InputToDecimal128(
     cuda::stream_ref stream);
 
 /**
+ * Narrows a DECIMAL128 sum to the 64-bit compact state (scale preserved) after
+ * checking that every value fits, failing instead of wrapping.
+ *
+ * @param sum DECIMAL128 sum column.
+ * @param stream CUDA stream for device work.
+ * @param mr memory resource for the returned column.
+ * @return DECIMAL64 column with the same values.
+ */
+std::unique_ptr<cudf::column> narrowDecimal128SumState(
+    std::unique_ptr<cudf::column> sum,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr);
+
+/**
  * Ensures the partial-row count column is INT64, casting with the temporary
  * memory resource (the result is consumed internally, not part of operator
  * output) when the incoming type differs.

@@ -251,10 +251,14 @@ PlanNodePtr rewriteNode(
           "Decimal64 SUM input does not match its source");
       const bool partialOutput = step == AggregationNode::Step::kPartial ||
           step == AggregationNode::Step::kIntermediate;
+      // A final step keeps its own decimal result type, which equals a
+      // DECIMAL(38, s) state but not a 64-bit one.
       VELOX_USER_CHECK(
-          *aggregate.call->type() ==
-                  *(partialOutput ? VARBINARY() : stateType) ||
-              *aggregate.call->type() == *stateType,
+          partialOutput ? *aggregate.call->type() == *VARBINARY() ||
+                  *aggregate.call->type() == *stateType
+                        : aggregate.call->type()->isDecimal() &&
+                  getDecimalPrecisionScale(*aggregate.call->type()).second ==
+                      getDecimalPrecisionScale(*stateType).second,
           "Unexpected Decimal64 SUM result type");
       if (!rawInput) {
         VELOX_USER_CHECK(
@@ -265,7 +269,7 @@ PlanNodePtr rewriteNode(
         inputTypes[channel] = stateType;
       }
       aggregate.call = std::make_shared<core::CallTypedExpr>(
-          stateType,
+          partialOutput ? stateType : aggregate.call->type(),
           std::vector<core::TypedExprPtr>{
               std::make_shared<core::FieldAccessTypedExpr>(
                   rawInput ? aggregate.rawInputTypes[0] : stateType,

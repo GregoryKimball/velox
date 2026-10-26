@@ -564,7 +564,9 @@ bool decimal64SumFitsInt64(
     return it->second;
   }
 
-  bool safe = decimalTypeBoundFitsInt64(rawInputType, input.size(), true);
+  // A group of one row sums to that row's DECIMAL64 value.
+  bool safe = context.rowPerGroup ||
+      decimalTypeBoundFitsInt64(rawInputType, input.size(), true);
   if (!safe && input.size() > 0) {
     ++context.decimal64SafetyProbes;
     auto minAgg = cudf::make_min_aggregation<cudf::reduce_aggregation>();
@@ -674,7 +676,8 @@ void addDecimalRawPartialSingleSumRequest(
     bool narrowable) {
   auto inputView = input;
   // The narrowing proof bounds one raw batch; merges of partial sums (the
-  // compact state's intermediate and final steps) keep the 128-bit path.
+  // compact state's intermediate and final steps) keep the 128-bit path,
+  // except into a 64-bit state, whose merges are bounded by the state type.
   if (!narrowable ||
       !CudfConfig::getInstance().decimalGroupbyNarrowAccumulation) {
     // Preserve the existing request and ownership path when disabled.
@@ -740,20 +743,30 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
       GroupbyRequestContext& context) override {
     if (compactDecimalSum_) {
       auto input = materializeMaskedInput(tbl, inputIndex, stream, mr);
+      // A final step reads the state, which narrowDecimalSumState keeps at
+      // DECIMAL64 under a DECIMAL128 result.
+      auto const resultCudfType = cudf_velox::veloxToCudfDataType(resultType);
       if (!exec::isRawInput(step)) {
         VELOX_CHECK(
-            input.type() == cudf_velox::veloxToCudfDataType(resultType));
+            input.type() == resultCudfType ||
+            (step == core::AggregationNode::Step::kFinal &&
+             input.type() ==
+                 cudf::data_type{
+                     cudf::type_id::DECIMAL64, resultCudfType.scale()}));
       }
+      // A 64-bit state is narrowed at every step that emits it; merges of
+      // states are bounded by the state type, then probed.
+      const bool narrowState = resultType->isShortDecimal();
       addDecimalRawPartialSingleSumRequest(
           input,
-          rawInputType_,
+          exec::isRawInput(step) ? rawInputType_ : resultType,
           requests,
           false,
           stream,
           sumIdx_,
           castedInput_,
           context,
-          exec::isRawInput(step));
+          exec::isRawInput(step) || narrowState);
     } else if (step == core::AggregationNode::Step::kIntermediate) {
       addDecimalDecodedSumCountRequests(
           tbl,
@@ -792,11 +805,14 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
       rmm::device_async_resource_ref mr) override {
     auto col = std::move(results[sumIdx_].results[0]);
     if (compactDecimalSum_) {
-      // A narrowed raw sum comes back as DECIMAL64; the compact state is
-      // DECIMAL(38, s).
+      // A narrowed sum comes back as DECIMAL64 and a wide one as DECIMAL128.
+      // The compact state is DECIMAL(38, s), or DECIMAL(18, s) with
+      // narrowDecimalSumState, which takes a wide sum only when it fits.
       auto const stateType = cudf_velox::veloxToCudfDataType(resultType);
       if (col->type() != stateType) {
-        col = cudf::cast(*col, stateType, stream, mr);
+        col = stateType.id() == cudf::type_id::DECIMAL64
+            ? cudf_velox::narrowDecimal128SumState(std::move(col), stream, mr)
+            : cudf::cast(*col, stateType, stream, mr);
       }
       return col;
     }
@@ -1431,6 +1447,89 @@ std::unique_ptr<GroupbyAggregator> createGroupbyAggregator(
   }
 }
 
+// Final SUM of 64-bit decimal states (narrowDecimalSumState), accumulated in
+// 64 bits by streaming_groupby. Each input batch records its row count and
+// largest magnitude without a readback; their total bounds every group sum, and
+// the first output checks it, failing rather than returning a wrapped sum.
+struct StreamingGroupbyDecimal64SumAggregator final
+    : StreamingGroupbyAggregator {
+  StreamingGroupbyDecimal64SumAggregator(
+      column_index_t inputIndex,
+      TypePtr resultType)
+      : StreamingGroupbyAggregator(inputIndex, std::move(resultType)) {}
+
+  void prepareInput(
+      cudf::table_view input,
+      std::vector<cudf::column_view>& preparedColumns,
+      cuda::stream_ref stream) override {
+    preparedInputIndex_ = prepareColumn(input, preparedColumns);
+    auto const column = preparedColumns[*preparedInputIndex_];
+    if (column.size() == 0) {
+      return;
+    }
+    auto const minAgg = cudf::make_min_aggregation<cudf::reduce_aggregation>();
+    auto const maxAgg = cudf::make_max_aggregation<cudf::reduce_aggregation>();
+    batchBounds_.push_back(
+        {column.size(),
+         cudf::reduce(column, *minAgg, column.type(), stream, get_temp_mr()),
+         cudf::reduce(column, *maxAgg, column.type(), stream, get_temp_mr())});
+  }
+
+  void addStreamingRequest(
+      std::vector<cudf::groupby::streaming_aggregation_request>& requests)
+      override {
+    VELOX_CHECK(preparedInputIndex_.has_value());
+    resultIndex_ = requests.size();
+    requests.push_back(
+        cudf::groupby::streaming_aggregation_request{
+            static_cast<cudf::size_type>(*preparedInputIndex_),
+            cudf::make_sum_aggregation<cudf::groupby_aggregation>()});
+  }
+
+  std::unique_ptr<cudf::column> makeOutputColumn(
+      std::vector<cudf::groupby::aggregation_result>& results,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) override {
+    checkSumBound(stream);
+    return castStreamingOutput(
+        std::move(results[resultIndex_].results[0]), resultType, stream, mr);
+  }
+
+ private:
+  struct BatchBound {
+    cudf::size_type rows;
+    std::unique_ptr<cudf::scalar> minimum;
+    std::unique_ptr<cudf::scalar> maximum;
+  };
+
+  void checkSumBound(cuda::stream_ref stream) {
+    using Scalar = cudf::fixed_point_scalar<numeric::decimal64>;
+    __uint128_t bound = 0;
+    for (const auto& batch : batchBounds_) {
+      const auto extrema = readDecimalExtrema<numeric::decimal64>(
+          static_cast<const Scalar&>(*batch.minimum),
+          static_cast<const Scalar&>(*batch.maximum),
+          stream);
+      // Both are invalid only for an all-null batch, which adds nothing.
+      if (extrema.minimumValid && extrema.maximumValid) {
+        bound += static_cast<__uint128_t>(std::max(
+                     decimal64Magnitude(extrema.minimum),
+                     decimal64Magnitude(extrema.maximum))) *
+            static_cast<uint64_t>(batch.rows);
+      }
+    }
+    batchBounds_.clear();
+    VELOX_USER_CHECK(
+        bound <= static_cast<__uint128_t>(std::numeric_limits<int64_t>::max()),
+        "Final decimal SUM input may exceed 64 bits; disable {}",
+        CudfConfig::kCudfNarrowDecimalSumState);
+  }
+
+  std::optional<column_index_t> preparedInputIndex_;
+  size_t resultIndex_{0};
+  std::vector<BatchBound> batchBounds_;
+};
+
 std::unique_ptr<StreamingGroupbyAggregator> createStreamingGroupbyAggregator(
     const ResolvedAggregateInfo& aggregate,
     column_index_t inputIndex,
@@ -1442,12 +1541,17 @@ std::unique_ptr<StreamingGroupbyAggregator> createStreamingGroupbyAggregator(
 
   const auto prefix = cudf_velox::CudfConfig::getInstance().functionNamePrefix;
   if (aggregate.compactDecimalSum) {
-    // The compact Decimal64 SUM state is a plain DECIMAL128 sum, not the
-    // VARBINARY state StreamingGroupbyDecimalAggregator decodes.
+    // The compact Decimal64 SUM state is a plain decimal sum (DECIMAL128, or
+    // DECIMAL64 with narrowDecimalSumState), not the VARBINARY state
+    // StreamingGroupbyDecimalAggregator decodes.
     if (!cudf::groupby::is_streaming_groupby_supported(
             cudf_velox::veloxToCudfDataType(inputType),
             cudf::aggregation::SUM)) {
       return nullptr;
+    }
+    if (inputType->isShortDecimal()) {
+      return std::make_unique<StreamingGroupbyDecimal64SumAggregator>(
+          inputIndex, resultType);
     }
     return std::make_unique<StreamingGroupbySumAggregator>(
         inputIndex, resultType);
@@ -2328,6 +2432,7 @@ CudfVectorPtr CudfGroupby::doGroupByAggregation(
   auto releaseInputsGuard = folly::makeGuard(releaseInputs);
   std::vector<cudf::groupby::aggregation_request> requests;
   GroupbyRequestContext requestContext;
+  requestContext.rowPerGroup = rowPerGroup;
   for (auto& aggregator : aggregators) {
     aggregator->addGroupbyRequest(
         tableView, requests, stream, get_temp_mr(), requestContext);

@@ -530,6 +530,10 @@ void CudfConfig::initialize(
     partialAggregationAbandonment =
         folly::to<bool>(config[kCudfPartialAggregationAbandonment]);
   }
+  if (config.find(kCudfNarrowDecimalSumState) != config.end()) {
+    narrowDecimalSumState =
+        folly::to<bool>(config[kCudfNarrowDecimalSumState]);
+  }
   if (config.find(kCudfFunctionNamePrefix) != config.end()) {
     functionNamePrefix = config[kCudfFunctionNamePrefix];
   }

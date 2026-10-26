@@ -468,11 +468,25 @@ struct ReduceDecimalSumAggregator : ReduceAggregator {
     cudf::column_view inputCol =
         injected ? injected->view() : input.column(inputIndex);
     if (compactDecimalSum_) {
+      // A final step reads the state, which narrowDecimalSumState keeps at
+      // DECIMAL64 under a DECIMAL128 result.
+      auto const outputCudfType = cudf_velox::veloxToCudfDataType(outputType);
       if (!exec::isRawInput(step)) {
         VELOX_CHECK(
-            inputCol.type() == cudf_velox::veloxToCudfDataType(outputType));
+            inputCol.type() == outputCudfType ||
+            (step == core::AggregationNode::Step::kFinal &&
+             inputCol.type() ==
+                 cudf::data_type{
+                     cudf::type_id::DECIMAL64, outputCudfType.scale()}));
       }
-      return singleOrRawDecimalSumWithCast(inputCol, outputType, stream, mr);
+      auto sum =
+          singleOrRawDecimalSumWithCast(inputCol, outputType, stream, mr);
+      // A 64-bit state takes the 128-bit sum only when it fits.
+      if (outputType->isShortDecimal() &&
+          sum->type().id() == cudf::type_id::DECIMAL128) {
+        sum = cudf_velox::narrowDecimal128SumState(std::move(sum), stream, mr);
+      }
+      return sum;
     }
     switch (step) {
       case core::AggregationNode::Step::kSingle:

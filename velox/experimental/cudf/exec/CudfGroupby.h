@@ -118,6 +118,9 @@ struct GroupbyRequestContext {
   std::map<DecimalInputKey, std::unique_ptr<cudf::column>> decimal64Inputs;
   std::map<DecimalInputKey, bool> decimal64SumSafe;
   std::map<DecimalInputKey, bool> decimal128SumSafe;
+  // Every input row is its own group (an abandoned partial aggregation), so
+  // each group sum is a single input value.
+  bool rowPerGroup{false};
   int64_t decimal64NarrowRequests{0};
   int64_t decimal64WideRequests{0};
   int64_t decimal64SafetyProbes{0};
