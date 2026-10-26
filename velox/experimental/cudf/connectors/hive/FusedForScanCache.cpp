@@ -19,9 +19,14 @@
 
 #include "velox/common/base/Exceptions.h"
 
+#include <cudf/aggregation.hpp>
+#include <cudf/binaryop.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/encode.hpp>
+#include <cudf/reduction.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/sorting.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
@@ -94,6 +99,40 @@ std::unique_ptr<cudf::column> encodeDictionary(
     return nullptr;
   }
   return dictionary;
+}
+
+// Returns the differences between consecutive values of 'column', starting
+// with its first value, when it is a non-null BIGINT column in ascending order
+// from a non-negative first value (sorted keys such as l_orderkey), otherwise
+// null. The order and sign keep every difference within BIGINT, so an
+// inclusive prefix sum restores the values exactly.
+std::unique_ptr<cudf::column> encodeDeltas(
+    cudf::column_view column,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref tempMr) {
+  if (column.nullable() || column.is_empty() ||
+      column.type().id() != cudf::type_id::INT64 ||
+      !cudf::is_sorted(
+          cudf::table_view{{column}},
+          {cudf::order::ASCENDING},
+          {cudf::null_order::BEFORE},
+          stream)) {
+    return nullptr;
+  }
+  const auto first = cudf::get_element(column, 0, stream, tempMr);
+  if (static_cast<const cudf::numeric_scalar<int64_t>&>(*first).value(stream) <
+      0) {
+    return nullptr;
+  }
+  const cudf::numeric_scalar<int64_t> zero(0, true, stream, tempMr);
+  const auto previous = cudf::shift(column, 1, zero, stream, tempMr);
+  return cudf::binary_operation(
+      column,
+      previous->view(),
+      cudf::binary_operator::SUB,
+      column.type(),
+      stream,
+      tempMr);
 }
 
 } // namespace
@@ -170,6 +209,7 @@ bool FusedForScanCache::insert(
 
   std::optional<cudf::detail::fused_for_packed_columns> keys;
   cudf::detail::fused_for_packed_columns values;
+  bool deltas = false;
   const auto dictionary = encodeDictionary(column, stream, tempMr);
   if (column.type().id() == cudf::type_id::STRING) {
     if (dictionary == nullptr) {
@@ -196,6 +236,19 @@ bool FusedForScanCache::insert(
         keys = std::move(dictionaryKeys);
       }
     }
+    if (!keys.has_value()) {
+      // Ascending keys take a few bits per row as differences between
+      // consecutive values where the values themselves take tens. Restoring
+      // them costs a prefix sum on read, so the differences must also save at
+      // least a quarter of the bytes.
+      if (const auto differences = encodeDeltas(column, stream, tempMr)) {
+        auto packedDifferences = pack(differences->view(), stream, tempMr);
+        if (4 * payloadBytes(packedDifferences) <= 3 * payloadBytes(values)) {
+          values = std::move(packedDifferences);
+          deltas = true;
+        }
+      }
+    }
   }
   const auto bytes =
       payloadBytes(values) + (keys.has_value() ? payloadBytes(*keys) : 0);
@@ -214,6 +267,7 @@ bool FusedForScanCache::insert(
   if (keys.has_value()) {
     entry.keys = store(std::move(*keys), stream);
   }
+  entry.deltas = deltas;
   stream.sync();
   entries_.emplace(std::move(entryKey), std::move(entry));
   usedBytes_.fetch_add(bytes, std::memory_order_relaxed);
@@ -285,6 +339,17 @@ FusedForScanCache::DecodedColumn FusedForScanCache::decode(
   }
 
   auto [values, valuesView] = decodePayload(entry->values, stream, tempMr);
+  if (entry->deltas) {
+    auto column = cudf::scan(
+        valuesView,
+        *cudf::make_sum_aggregation<cudf::scan_aggregation>(),
+        cudf::scan_type::INCLUSIVE,
+        cudf::null_policy::EXCLUDE,
+        stream,
+        mr);
+    const auto view = column->view();
+    return DecodedColumn{{}, std::move(column), view};
+  }
   if (!entry->keys.has_value()) {
     return DecodedColumn{std::move(values), nullptr, valuesView};
   }
