@@ -51,10 +51,11 @@ namespace facebook::velox::cudf_velox::connector::hive {
 /// sum on read, under the same condition. Entries are never
 /// evicted: once the capacity is reached, the cache is full and further
 /// columns are read from Parquet. The first payloads up to a device capacity
-/// are held in device memory instead, so that reading them skips the
-/// host-to-device copy. When a device allocation fails, the cache moves device
-/// blocks back to host memory and frees them (see releaseDeviceMemory() in
-/// GpuResources.h), and the device tier stays at the smaller size.
+/// are also copied to device memory, so that reading them skips the
+/// host-to-device copy. When a device allocation fails, the cache frees its
+/// newest device blocks (see releaseDeviceMemory() in GpuResources.h) and reads
+/// their payloads from host memory, and the device tier stays at the smaller
+/// size.
 class FusedForScanCache {
  public:
   static FusedForScanCache& instance();
@@ -107,11 +108,12 @@ class FusedForScanCache {
 
  private:
   // One fused FOR payload: the packed-table metadata and the encoded bytes in
-  // pinned host memory or, when 'onDevice', in device memory.
+  // pinned host memory, with a copy in device memory while the device tier
+  // holds one.
   struct Payload {
     std::vector<uint8_t> metadata;
     const void* wire{nullptr};
-    bool onDevice{false};
+    const void* deviceWire{nullptr};
     std::size_t wireBytes{0};
     std::size_t segmentCount{0};
     std::size_t logicalDataSize{0};
@@ -134,16 +136,13 @@ class FusedForScanCache {
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) const;
 
-  // Moves the newest device blocks to pinned memory and frees them until at
-  // least 'bytes' are freed or none is left. Returns whether any was freed.
+  // Frees the newest device blocks, dropping the device copies they hold,
+  // until at least 'bytes' are freed or none is left. Returns whether any was
+  // freed.
   bool releaseDeviceBlocks(std::size_t bytes);
 
-  // Copies 'payload' to pinned memory if it lies in the device block at
-  // 'block'. Called with 'mutex_' held exclusively.
-  void demote(Payload& payload, const char* block, std::size_t blockBytes);
-
-  // Moves an encoded payload to device memory while the device capacity
-  // allows, otherwise to pinned memory. Called with 'mutex_' held exclusively.
+  // Copies an encoded payload to pinned memory and, while the device capacity
+  // allows, to device memory. Called with 'mutex_' held exclusively.
   Payload store(
       cudf::detail::fused_for_packed_columns&& packed,
       cuda::stream_ref stream);

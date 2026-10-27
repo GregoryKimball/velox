@@ -286,23 +286,30 @@ FusedForScanCache::Payload FusedForScanCache::store(
     cuda::stream_ref stream) {
   Payload payload;
   payload.wireBytes = packed.wire_data->size();
-  void* target = allocateDevice(payload.wireBytes);
-  payload.onDevice = target != nullptr;
-  if (!payload.onDevice) {
-    target = allocatePinned(payload.wireBytes);
-  }
-  const auto status = cudaMemcpyAsync(
-      target,
+  void* host = allocatePinned(payload.wireBytes);
+  auto status = cudaMemcpyAsync(
+      host,
       packed.wire_data->data(),
       payload.wireBytes,
-      payload.onDevice ? cudaMemcpyDeviceToDevice : cudaMemcpyDeviceToHost,
+      cudaMemcpyDeviceToHost,
       stream.get());
   VELOX_CHECK(status == cudaSuccess, "{}", cudaGetErrorString(status));
-  payload.wire = target;
+  payload.wire = host;
+  // The host copy stays, so that releasing the device copy needs no copy back.
+  if (void* device = allocateDevice(payload.wireBytes)) {
+    status = cudaMemcpyAsync(
+        device,
+        packed.wire_data->data(),
+        payload.wireBytes,
+        cudaMemcpyDeviceToDevice,
+        stream.get());
+    VELOX_CHECK(status == cudaSuccess, "{}", cudaGetErrorString(status));
+    payload.deviceWire = device;
+  }
   payload.metadata = std::move(*packed.metadata);
   payload.segmentCount = packed.segment_count;
   payload.logicalDataSize = packed.logical_data_size;
-  // The device buffer is released on 'stream' after the copy above.
+  // The device buffer is released on 'stream' after the copies above.
   packed.wire_data.reset();
   return payload;
 }
@@ -316,15 +323,16 @@ FusedForScanCache::decodePayload(
   // release device blocks, which takes the lock exclusively.
   rmm::device_buffer wire(payload.wireBytes, stream, mr);
   {
-    // The payload can move from a device block to host memory: copy it under
-    // the lock. Releasing a block synchronizes the device first, so no copy
-    // from it is in flight when it is freed.
+    // The device copy can be released: copy from it under the lock. Releasing
+    // a block synchronizes the device first, so no copy from it is in flight
+    // when it is freed.
     std::shared_lock lock(mutex_);
+    const bool onDevice = payload.deviceWire != nullptr;
     const auto status = cudaMemcpyAsync(
         wire.data(),
-        payload.wire,
+        onDevice ? payload.deviceWire : payload.wire,
         payload.wireBytes,
-        payload.onDevice ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice,
+        onDevice ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice,
         stream.get());
     VELOX_CHECK(status == cudaSuccess, "{}", cudaGetErrorString(status));
   }
@@ -417,49 +425,35 @@ void* FusedForScanCache::allocateDevice(std::size_t bytes) {
   return ptr;
 }
 
-void FusedForScanCache::demote(
-    Payload& payload,
-    const char* block,
-    std::size_t blockBytes) {
-  const auto* wire = static_cast<const char*>(payload.wire);
-  if (!payload.onDevice || wire < block || wire >= block + blockBytes) {
-    return;
-  }
-  void* host = allocatePinned(payload.wireBytes);
-  const auto status =
-      cudaMemcpy(host, payload.wire, payload.wireBytes, cudaMemcpyDeviceToHost);
-  VELOX_CHECK(status == cudaSuccess, "{}", cudaGetErrorString(status));
-  payload.wire = host;
-  payload.onDevice = false;
-}
-
 bool FusedForScanCache::releaseDeviceBlocks(std::size_t bytes) {
   std::unique_lock lock(mutex_);
   std::size_t freed = 0;
-  try {
-    while (freed < bytes && !deviceBlocks_.empty()) {
-      const auto [block, blockBytes] = deviceBlocks_.back();
-      const auto* begin = static_cast<const char*>(block);
-      for (auto& [name, entry] : entries_) {
-        demote(entry.values, begin, blockBytes);
-        if (entry.keys.has_value()) {
-          demote(*entry.keys, begin, blockBytes);
-        }
+  while (freed < bytes && !deviceBlocks_.empty()) {
+    const auto [block, blockBytes] = deviceBlocks_.back();
+    const auto* begin = static_cast<const char*>(block);
+    const auto dropIfInBlock = [&](Payload& payload) {
+      const auto* wire = static_cast<const char*>(payload.deviceWire);
+      if (wire >= begin && wire < begin + blockBytes) {
+        payload.deviceWire = nullptr;
       }
-      // Copies from the block were enqueued under the lock: wait for them.
-      VELOX_CHECK(cudaDeviceSynchronize() == cudaSuccess);
-      VELOX_CHECK(cudaFree(block) == cudaSuccess);
-      deviceBlocks_.pop_back();
-      deviceAllocatedBytes_ -= blockBytes;
-      freed += blockBytes;
+    };
+    for (auto& [name, entry] : entries_) {
+      dropIfInBlock(entry.values);
+      if (entry.keys.has_value()) {
+        dropIfInBlock(*entry.keys);
+      }
     }
-  } catch (const std::exception&) {
-    // Out of pinned memory or a CUDA error: keep what was freed so far.
+    // Copies from the block were enqueued under the lock: wait for them.
+    VELOX_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+    VELOX_CHECK(cudaFree(block) == cudaSuccess);
+    deviceBlocks_.pop_back();
+    deviceAllocatedBytes_ -= blockBytes;
+    freed += blockBytes;
   }
   if (freed > 0) {
-    LOG(WARNING) << "Fused FOR scan cache: moved " << freed
-                 << " bytes of device blocks to host memory for a failed "
-                 << bytes << "-byte allocation; device tier now "
+    LOG(WARNING) << "Fused FOR scan cache: released " << freed
+                 << " bytes of device blocks for a failed " << bytes
+                 << "-byte allocation; device tier now "
                  << deviceAllocatedBytes_ << " bytes";
     // The newest block held the cursor: start the next one fresh, and keep
     // the tier at its new size under memory pressure.
