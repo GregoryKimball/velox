@@ -113,6 +113,12 @@ class CudfHiveConfig {
   static constexpr const char* kFusedForScanCacheBytes =
       "cudf.hive.fused-for-scan-cache-bytes";
 
+  // Bytes of the fused FOR scan cache held in device memory instead of pinned
+  // host memory, so that hits on them skip the host-to-device copy. 0 keeps
+  // the whole cache in host memory.
+  static constexpr const char* kFusedForScanCacheDeviceBytes =
+      "cudf.hive.fused-for-scan-cache-device-bytes";
+
   // Whether to serialize concurrent I/O request submission batches.
   static constexpr const char* kSerializeIoRequests =
       "cudf.hive.serialize-io-requests";
@@ -196,6 +202,8 @@ class CudfHiveConfig {
   bool highPriorityScanStreamsSession(const config::ConfigBase* session) const;
 
   uint64_t fusedForScanCacheBytes() const;
+
+  uint64_t fusedForScanCacheDeviceBytes() const;
 
   bool serializeIoRequests() const;
   bool serializeIoRequestsSession(const config::ConfigBase* session) const;

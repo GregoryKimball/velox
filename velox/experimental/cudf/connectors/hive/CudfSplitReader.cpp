@@ -307,6 +307,7 @@ void CudfSplitReader::prepareSplitInternal(
       capacity > 0 and fusedForCacheEligible()) {
     auto& cache = FusedForScanCache::instance();
     cache.reserveCapacity(capacity);
+    cache.reserveDeviceCapacity(cudfHiveConfig_->fusedForScanCacheDeviceBytes());
     fusedForCacheHit_ = cache.containsAll(split_->filePath, readColumnNames_);
     fusedForCacheRead_ = fusedForCacheHit_ or
         cache.mayCache(split_->filePath, readColumnNames_);

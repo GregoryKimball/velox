@@ -33,6 +33,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <mutex>
 
 namespace facebook::velox::cudf_velox::connector::hive {
@@ -141,6 +142,14 @@ void FusedForScanCache::reserveCapacity(uint64_t bytes) {
   auto current = capacity_.load(std::memory_order_relaxed);
   while (current < bytes &&
          !capacity_.compare_exchange_weak(
+             current, bytes, std::memory_order_relaxed)) {
+  }
+}
+
+void FusedForScanCache::reserveDeviceCapacity(uint64_t bytes) {
+  auto current = deviceCapacity_.load(std::memory_order_relaxed);
+  while (current < bytes &&
+         !deviceCapacity_.compare_exchange_weak(
              current, bytes, std::memory_order_relaxed)) {
   }
 }
@@ -274,15 +283,19 @@ FusedForScanCache::Payload FusedForScanCache::store(
     cuda::stream_ref stream) {
   Payload payload;
   payload.wireBytes = packed.wire_data->size();
-  void* host = allocatePinned(payload.wireBytes);
+  void* target = allocateDevice(payload.wireBytes);
+  payload.onDevice = target != nullptr;
+  if (!payload.onDevice) {
+    target = allocatePinned(payload.wireBytes);
+  }
   const auto status = cudaMemcpyAsync(
-      host,
+      target,
       packed.wire_data->data(),
       payload.wireBytes,
-      cudaMemcpyDeviceToHost,
+      payload.onDevice ? cudaMemcpyDeviceToDevice : cudaMemcpyDeviceToHost,
       stream.get());
   VELOX_CHECK(status == cudaSuccess, "{}", cudaGetErrorString(status));
-  payload.wire = host;
+  payload.wire = target;
   payload.metadata = std::move(*packed.metadata);
   payload.segmentCount = packed.segment_count;
   payload.logicalDataSize = packed.logical_data_size;
@@ -301,7 +314,7 @@ FusedForScanCache::decodePayload(
       wire.data(),
       payload.wire,
       payload.wireBytes,
-      cudaMemcpyHostToDevice,
+      payload.onDevice ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice,
       stream.get());
   VELOX_CHECK(status == cudaSuccess, "{}", cudaGetErrorString(status));
 
@@ -358,6 +371,34 @@ FusedForScanCache::DecodedColumn FusedForScanCache::decode(
   auto column = std::move(gathered->release().front());
   const auto view = column->view();
   return DecodedColumn{{}, std::move(column), view};
+}
+
+void* FusedForScanCache::allocateDevice(std::size_t bytes) {
+  bytes = alignUp(bytes);
+  const auto capacity = deviceCapacity_.load(std::memory_order_relaxed);
+  if (bytes > deviceRemaining_) {
+    // Whole blocks count against the capacity, so the device never holds more
+    // than it.
+    const auto blockBytes = std::max(bytes, kBlockBytes);
+    if (deviceAllocatedBytes_ + blockBytes > capacity) {
+      return nullptr;
+    }
+    void* block = nullptr;
+    if (cudaMalloc(&block, blockBytes) != cudaSuccess) {
+      // Out of device memory: keep the rest of the cache in host memory.
+      (void)cudaGetLastError();
+      deviceCapacity_.store(deviceAllocatedBytes_, std::memory_order_relaxed);
+      return nullptr;
+    }
+    deviceBlocks_.push_back(block);
+    deviceAllocatedBytes_ += blockBytes;
+    deviceCursor_ = static_cast<char*>(block);
+    deviceRemaining_ = blockBytes;
+  }
+  void* ptr = deviceCursor_;
+  deviceCursor_ += bytes;
+  deviceRemaining_ -= bytes;
+  return ptr;
 }
 
 void* FusedForScanCache::allocatePinned(std::size_t bytes) {

@@ -50,13 +50,19 @@ namespace facebook::velox::cudf_velox::connector::hive {
 /// (keys) as the differences between consecutive values, restored by a prefix
 /// sum on read, under the same condition. Entries are never
 /// evicted: once the capacity is reached, the cache is full and further
-/// columns are read from Parquet.
+/// columns are read from Parquet. The first payloads up to a device capacity
+/// are held in device memory instead, so that reading them skips the
+/// host-to-device copy.
 class FusedForScanCache {
  public:
   static FusedForScanCache& instance();
 
   /// Raises the capacity in bytes of encoded data to at least 'bytes'.
   void reserveCapacity(uint64_t bytes);
+
+  /// Raises the bytes of encoded data held in device memory to at least
+  /// 'bytes'.
+  void reserveDeviceCapacity(uint64_t bytes);
 
   /// Returns whether every column in 'columns' of 'file' is cached.
   bool containsAll(
@@ -99,10 +105,11 @@ class FusedForScanCache {
 
  private:
   // One fused FOR payload: the packed-table metadata and the encoded bytes in
-  // pinned host memory.
+  // pinned host memory or, when 'onDevice', in device memory.
   struct Payload {
     std::vector<uint8_t> metadata;
     const void* wire{nullptr};
+    bool onDevice{false};
     std::size_t wireBytes{0};
     std::size_t segmentCount{0};
     std::size_t logicalDataSize{0};
@@ -125,8 +132,8 @@ class FusedForScanCache {
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr);
 
-  // Moves an encoded payload to pinned memory. Called with 'mutex_' held
-  // exclusively.
+  // Moves an encoded payload to device memory while the device capacity
+  // allows, otherwise to pinned memory. Called with 'mutex_' held exclusively.
   Payload store(
       cudf::detail::fused_for_packed_columns&& packed,
       cuda::stream_ref stream);
@@ -134,6 +141,10 @@ class FusedForScanCache {
   // Returns pinned host memory for 'bytes', from the current block or a new
   // one. Called with 'mutex_' held exclusively.
   void* allocatePinned(std::size_t bytes);
+
+  // Returns device memory for 'bytes' within the device capacity, or null.
+  // Called with 'mutex_' held exclusively.
+  void* allocateDevice(std::size_t bytes);
 
   mutable std::shared_mutex mutex_;
   // Node map: an entry stays at its address while others are inserted.
@@ -143,6 +154,11 @@ class FusedForScanCache {
   char* blockCursor_{nullptr};
   std::size_t blockRemaining_{0};
   std::atomic<uint64_t> capacity_{0};
+  std::vector<void*> deviceBlocks_;
+  char* deviceCursor_{nullptr};
+  std::size_t deviceRemaining_{0};
+  std::size_t deviceAllocatedBytes_{0};
+  std::atomic<uint64_t> deviceCapacity_{0};
   std::atomic<uint64_t> usedBytes_{0};
   std::atomic<bool> full_{false};
 };
