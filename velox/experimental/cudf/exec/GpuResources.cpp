@@ -35,6 +35,8 @@
 #include <common/base/Exceptions.h>
 
 #include <cstdlib>
+#include <mutex>
+#include <vector>
 #include <string_view>
 
 namespace facebook::velox::cudf_velox {
@@ -139,6 +141,39 @@ std::optional<rmm::mr::statistics_resource_adaptor> outputStatsMr_;
 
 rmm::device_async_resource_ref get_output_mr() {
   return output_mr_.value();
+}
+
+namespace {
+
+std::mutex& releasersMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::vector<std::function<bool(std::size_t)>>& releasers() {
+  static std::vector<std::function<bool(std::size_t)>> functions;
+  return functions;
+}
+
+} // namespace
+
+void registerDeviceMemoryReleaser(std::function<bool(std::size_t)> releaser) {
+  std::lock_guard lock(releasersMutex());
+  releasers().push_back(std::move(releaser));
+}
+
+bool releaseDeviceMemory(std::size_t bytes) {
+  std::vector<std::function<bool(std::size_t)>> functions;
+  {
+    std::lock_guard lock(releasersMutex());
+    functions = releasers();
+  }
+  for (const auto& release : functions) {
+    if (release(bytes)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 int64_t cudfAllocatedBytes() {

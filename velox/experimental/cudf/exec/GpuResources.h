@@ -23,7 +23,9 @@
 
 #include <cuda/memory_resource>
 
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string_view>
 
@@ -49,6 +51,16 @@ rmm::device_async_resource_ref get_output_mr();
 /// device memory a pool resource retains for reuse, so the value drops as
 /// queries free their allocations.
 int64_t cudfAllocatedBytes();
+
+/// Registers a function that frees device memory its owner holds outside the
+/// cuDF memory resource (e.g. a cache), given the size of a failed allocation.
+/// It returns whether it freed any.
+void registerDeviceMemoryReleaser(std::function<bool(std::size_t)> releaser);
+
+/// Asks the registered releasers, in order, to free device memory for a failed
+/// allocation of 'bytes'. Returns whether one freed any, in which case the
+/// allocation is worth retrying.
+bool releaseDeviceMemory(std::size_t bytes);
 
 /// Creates a memory resource based on the given mode.
 ///

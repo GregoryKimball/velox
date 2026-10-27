@@ -39,6 +39,7 @@
 
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/utilities/memory_resource.hpp>
+#include <rmm/mr/failure_callback_resource_adaptor.hpp>
 
 #include <cuda.h>
 
@@ -382,9 +383,17 @@ void registerCudf() {
   const std::string mrMode = CudfConfig::getInstance().memoryResource;
   auto base = cudf_velox::createMemoryResource(
       mrMode, CudfConfig::getInstance().memoryPercent);
+  // A failed allocation first asks holders of device memory outside this
+  // resource (the scan cache's device tier) to release some, then retries.
+  rmm::mr::failure_callback_resource_adaptor<> releasing(
+      std::move(base),
+      [](std::size_t bytes, void*) {
+        return cudf_velox::releaseDeviceMemory(bytes);
+      },
+      nullptr);
   // Wrap the device resource in a statistics adaptor so that
   // cudfAllocatedBytes() can report live device memory.
-  statsMr_.emplace(std::move(base));
+  statsMr_.emplace(std::move(releasing));
   mr_ = statsMr_.value();
   cudf::set_current_device_resource(mr_.value());
 

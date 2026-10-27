@@ -18,6 +18,9 @@
 #include "velox/experimental/cudf/connectors/hive/FusedForScanCache.h"
 
 #include "velox/common/base/Exceptions.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
+
+#include <glog/logging.h>
 
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
@@ -308,15 +311,23 @@ std::pair<cudf::packed_columns, cudf::column_view>
 FusedForScanCache::decodePayload(
     const Payload& payload,
     cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr) {
+    rmm::device_async_resource_ref mr) const {
+  // Allocate before taking the lock: a failed allocation makes the cache
+  // release device blocks, which takes the lock exclusively.
   rmm::device_buffer wire(payload.wireBytes, stream, mr);
-  const auto status = cudaMemcpyAsync(
-      wire.data(),
-      payload.wire,
-      payload.wireBytes,
-      payload.onDevice ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice,
-      stream.get());
-  VELOX_CHECK(status == cudaSuccess, "{}", cudaGetErrorString(status));
+  {
+    // The payload can move from a device block to host memory: copy it under
+    // the lock. Releasing a block synchronizes the device first, so no copy
+    // from it is in flight when it is freed.
+    std::shared_lock lock(mutex_);
+    const auto status = cudaMemcpyAsync(
+        wire.data(),
+        payload.wire,
+        payload.wireBytes,
+        payload.onDevice ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice,
+        stream.get());
+    VELOX_CHECK(status == cudaSuccess, "{}", cudaGetErrorString(status));
+  }
 
   cudf::detail::fused_for_packed_columns packed;
   packed.metadata = std::make_unique<std::vector<uint8_t>>(payload.metadata);
@@ -390,7 +401,12 @@ void* FusedForScanCache::allocateDevice(std::size_t bytes) {
       deviceCapacity_.store(deviceAllocatedBytes_, std::memory_order_relaxed);
       return nullptr;
     }
-    deviceBlocks_.push_back(block);
+    if (!releaserRegistered_) {
+      registerDeviceMemoryReleaser(
+          [this](std::size_t bytes) { return releaseDeviceBlocks(bytes); });
+      releaserRegistered_ = true;
+    }
+    deviceBlocks_.emplace_back(block, blockBytes);
     deviceAllocatedBytes_ += blockBytes;
     deviceCursor_ = static_cast<char*>(block);
     deviceRemaining_ = blockBytes;
@@ -399,6 +415,59 @@ void* FusedForScanCache::allocateDevice(std::size_t bytes) {
   deviceCursor_ += bytes;
   deviceRemaining_ -= bytes;
   return ptr;
+}
+
+void FusedForScanCache::demote(
+    Payload& payload,
+    const char* block,
+    std::size_t blockBytes) {
+  const auto* wire = static_cast<const char*>(payload.wire);
+  if (!payload.onDevice || wire < block || wire >= block + blockBytes) {
+    return;
+  }
+  void* host = allocatePinned(payload.wireBytes);
+  const auto status =
+      cudaMemcpy(host, payload.wire, payload.wireBytes, cudaMemcpyDeviceToHost);
+  VELOX_CHECK(status == cudaSuccess, "{}", cudaGetErrorString(status));
+  payload.wire = host;
+  payload.onDevice = false;
+}
+
+bool FusedForScanCache::releaseDeviceBlocks(std::size_t bytes) {
+  std::unique_lock lock(mutex_);
+  std::size_t freed = 0;
+  try {
+    while (freed < bytes && !deviceBlocks_.empty()) {
+      const auto [block, blockBytes] = deviceBlocks_.back();
+      const auto* begin = static_cast<const char*>(block);
+      for (auto& [name, entry] : entries_) {
+        demote(entry.values, begin, blockBytes);
+        if (entry.keys.has_value()) {
+          demote(*entry.keys, begin, blockBytes);
+        }
+      }
+      // Copies from the block were enqueued under the lock: wait for them.
+      VELOX_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+      VELOX_CHECK(cudaFree(block) == cudaSuccess);
+      deviceBlocks_.pop_back();
+      deviceAllocatedBytes_ -= blockBytes;
+      freed += blockBytes;
+    }
+  } catch (const std::exception&) {
+    // Out of pinned memory or a CUDA error: keep what was freed so far.
+  }
+  if (freed > 0) {
+    LOG(WARNING) << "Fused FOR scan cache: moved " << freed
+                 << " bytes of device blocks to host memory for a failed "
+                 << bytes << "-byte allocation; device tier now "
+                 << deviceAllocatedBytes_ << " bytes";
+    // The newest block held the cursor: start the next one fresh, and keep
+    // the tier at its new size under memory pressure.
+    deviceCursor_ = nullptr;
+    deviceRemaining_ = 0;
+    deviceCapacity_.store(deviceAllocatedBytes_, std::memory_order_relaxed);
+  }
+  return freed > 0;
 }
 
 void* FusedForScanCache::allocatePinned(std::size_t bytes) {

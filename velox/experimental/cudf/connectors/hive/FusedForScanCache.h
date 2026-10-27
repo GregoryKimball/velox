@@ -52,7 +52,9 @@ namespace facebook::velox::cudf_velox::connector::hive {
 /// evicted: once the capacity is reached, the cache is full and further
 /// columns are read from Parquet. The first payloads up to a device capacity
 /// are held in device memory instead, so that reading them skips the
-/// host-to-device copy.
+/// host-to-device copy. When a device allocation fails, the cache moves device
+/// blocks back to host memory and frees them (see releaseDeviceMemory() in
+/// GpuResources.h), and the device tier stays at the smaller size.
 class FusedForScanCache {
  public:
   static FusedForScanCache& instance();
@@ -127,10 +129,18 @@ class FusedForScanCache {
 
   // Copies a payload to the device and decodes its single column into a
   // packed allocation from 'mr', returned with a view of the column.
-  static std::pair<cudf::packed_columns, cudf::column_view> decodePayload(
+  std::pair<cudf::packed_columns, cudf::column_view> decodePayload(
       const Payload& payload,
       cuda::stream_ref stream,
-      rmm::device_async_resource_ref mr);
+      rmm::device_async_resource_ref mr) const;
+
+  // Moves the newest device blocks to pinned memory and frees them until at
+  // least 'bytes' are freed or none is left. Returns whether any was freed.
+  bool releaseDeviceBlocks(std::size_t bytes);
+
+  // Copies 'payload' to pinned memory if it lies in the device block at
+  // 'block'. Called with 'mutex_' held exclusively.
+  void demote(Payload& payload, const char* block, std::size_t blockBytes);
 
   // Moves an encoded payload to device memory while the device capacity
   // allows, otherwise to pinned memory. Called with 'mutex_' held exclusively.
@@ -154,7 +164,9 @@ class FusedForScanCache {
   char* blockCursor_{nullptr};
   std::size_t blockRemaining_{0};
   std::atomic<uint64_t> capacity_{0};
-  std::vector<void*> deviceBlocks_;
+  // Device blocks and their sizes, oldest first.
+  std::vector<std::pair<void*, std::size_t>> deviceBlocks_;
+  bool releaserRegistered_{false};
   char* deviceCursor_{nullptr};
   std::size_t deviceRemaining_{0};
   std::size_t deviceAllocatedBytes_{0};
