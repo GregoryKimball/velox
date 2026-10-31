@@ -166,6 +166,7 @@ class TpchQueryBuilder {
   std::shared_ptr<io::IoStatistics> metadataIoStats_ =
       std::make_shared<io::IoStatistics>();
   const bool filtersAsNode_;
+  parse::ParseOptions parseOptions_;
 };
 
 } // namespace facebook::velox::exec::test
