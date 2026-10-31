@@ -247,6 +247,11 @@ void ColumnStore::load(Column& column) {
   }
 }
 
+const Column& ColumnStore::metadata(const std::string& tableName, const std::string& name) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return describe(tableName, name);
+}
+
 const Column& ColumnStore::column(const std::string& tableName, const std::string& name) {
   Column* column;
   {

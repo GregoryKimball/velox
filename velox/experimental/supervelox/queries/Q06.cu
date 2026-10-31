@@ -109,11 +109,11 @@ Result q6(QueryContext& ctx) {
   a.price = ctx.col<int32_t>("lineitem", "l_extendedprice");
   a.zones = ctx.zones("lineitem", "l_shipdate");
   a.rows = ctx.rows("lineitem");
-  a.dateLow = days(1994, 1, 1);
-  a.dateHigh = days(1995, 1, 1);
-  a.discountLow = 5;
-  a.discountHigh = 7;
-  a.quantityLimit = 2400;
+  a.dateLow = ctx.param("shipdate_min", days(1994, 1, 1));
+  a.dateHigh = ctx.param("shipdate_max", days(1994, 12, 31)) + 1;
+  a.discountLow = ctx.param("discount_min", 5);
+  a.discountHigh = ctx.param("discount_max", 7);
+  a.quantityLimit = ctx.param("quantity_max", 2399) + 1;
   auto* sum = ctx.zeroed<unsigned long long>(1);
   q6Kernel<<<persistentBlocks(q6Kernel, kThreads), kThreads, 0, ctx.stream()>>>(a, sum);
   SV_CUDA(cudaGetLastError());

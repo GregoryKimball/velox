@@ -30,6 +30,9 @@ class Engine {
   struct Run {
     double gpuMs{0};
     DeviceCache::Stats cache;
+    /// The backend that ran, which is the hand-written one when the chosen
+    /// backend has no version of the query.
+    Backend backend{Backend::kHandwritten};
   };
 
   Engine(const std::string& dataDirectory, size_t cacheBytes, size_t stageBytes);
@@ -38,7 +41,19 @@ class Engine {
   static void setInstance(Engine* engine);
   static Engine& instance();
 
-  Result run(const QuerySpec& spec);
+  /// Chooses the backend for all queries, or for one query.
+  void setBackend(Backend backend) {
+    backend_ = backend;
+  }
+  void setBackend(int32_t query, Backend backend) {
+    queryBackends_[query] = backend;
+  }
+  Backend backend(int32_t query) const {
+    auto it = queryBackends_.find(query);
+    return it == queryBackends_.end() ? backend_ : it->second;
+  }
+
+  Result run(const QuerySpec& spec, const QueryParams& params = {});
 
   const Run& lastRun() const {
     return lastRun_;
@@ -56,6 +71,8 @@ class Engine {
   ColumnStore store_;
   DeviceCache cache_;
   cudaStream_t stream_;
+  Backend backend_{Backend::kHandwritten};
+  std::map<int32_t, Backend> queryBackends_;
   Run lastRun_;
 };
 
@@ -63,9 +80,16 @@ RowTypePtr resultRowType(const std::vector<ResultField>& schema);
 
 /// Leaf plan node standing for the fused GPU part of a TPC-H query. Velox
 /// operators above it finish the query on its small result.
+///
+/// When it replaces a subtree of a plan, `outputType` is that subtree's, and
+/// the query's result columns are converted to it by position.
 class FusedQueryNode : public core::PlanNode {
  public:
-  FusedQueryNode(const core::PlanNodeId& id, int32_t query);
+  FusedQueryNode(
+      const core::PlanNodeId& id,
+      int32_t query,
+      QueryParams params = {},
+      RowTypePtr outputType = nullptr);
 
   const RowTypePtr& outputType() const override {
     return outputType_;
@@ -84,10 +108,15 @@ class FusedQueryNode : public core::PlanNode {
     return *spec_;
   }
 
+  const QueryParams& params() const {
+    return params_;
+  }
+
  private:
   void addDetails(std::stringstream& stream) const override;
 
   const QuerySpec* spec_;
+  const QueryParams params_;
   const RowTypePtr outputType_;
 };
 
@@ -110,6 +139,7 @@ class FusedQueryOperator : public exec::SourceOperator {
 
  private:
   const QuerySpec& spec_;
+  const QueryParams& params_;
   bool finished_{false};
 };
 

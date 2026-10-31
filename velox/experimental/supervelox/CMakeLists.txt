@@ -27,6 +27,7 @@ add_library(
   queries/Queries.cpp
   ${SUPERVELOX_QUERIES}
   exec/FusedQuery.cpp
+  exec/PlanMatcher.cpp
 )
 
 target_link_libraries(velox_supervelox velox_exec CUDA::cudart Folly::folly)
@@ -37,7 +38,38 @@ target_compile_options(
 
 add_executable(sv_bench tools/SvBench.cpp)
 
-target_link_libraries(sv_bench velox_supervelox velox_exec_test_lib velox_exec gflags::gflags)
+target_link_libraries(
+  sv_bench
+  velox_supervelox
+  velox_exec_test_lib
+  velox_exec
+  velox_aggregates
+  velox_dwio_parquet_reader
+  gflags::gflags
+)
+
+set(SUPERVELOX_MELD_INCLUDE_DIR
+    ""
+    CACHE PATH "Directory holding meldvelox/MeldVelox.h; empty builds no Meld backend")
+if(SUPERVELOX_MELD_INCLUDE_DIR)
+  add_library(velox_supervelox_meld meld/MeldBackend.cpp)
+  target_include_directories(velox_supervelox_meld PRIVATE ${SUPERVELOX_MELD_INCLUDE_DIR})
+  target_link_libraries(velox_supervelox_meld velox_supervelox CUDA::cudart ${CMAKE_DL_LIBS})
+  target_link_libraries(sv_bench velox_supervelox_meld)
+  target_compile_definitions(sv_bench PRIVATE SUPERVELOX_MELD)
+endif()
+
+if(VELOX_ENABLE_CUDF)
+  add_library(
+    velox_supervelox_cudf
+    cudf/CudfBackend.cpp
+    cudf/CudfQ01.cpp
+    cudf/CudfQ06.cpp
+  )
+  target_link_libraries(velox_supervelox_cudf velox_supervelox cudf::cudf fmt::fmt)
+  target_link_libraries(sv_bench velox_supervelox_cudf)
+  target_compile_definitions(sv_bench PRIVATE SUPERVELOX_CUDF)
+endif()
 
 add_executable(sv_bandwidth tools/Bandwidth.cu)
 

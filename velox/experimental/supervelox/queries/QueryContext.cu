@@ -108,8 +108,17 @@ double nowMs() {
 
 } // namespace
 
-QueryContext::QueryContext(ColumnStore& store, DeviceCache& cache, cudaStream_t stream)
-    : store_(store), cache_(cache), stream_(stream), trace_(getenv("SV_TRACE") != nullptr), lastMark_(nowMs()) {}
+QueryContext::QueryContext(
+    ColumnStore& store,
+    DeviceCache& cache,
+    cudaStream_t stream,
+    const QueryParams& params)
+    : store_(store),
+      cache_(cache),
+      stream_(stream),
+      params_(params),
+      trace_(getenv("SV_TRACE") != nullptr),
+      lastMark_(nowMs()) {}
 
 void QueryContext::mark(const char* phase) {
   if (!trace_) {

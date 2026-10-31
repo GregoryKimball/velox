@@ -24,16 +24,6 @@
 
 namespace facebook::velox::supervelox {
 
-/// Days since 1970-01-01 for a proleptic Gregorian date.
-constexpr int32_t days(int32_t year, int32_t month, int32_t day) {
-  year -= month <= 2;
-  const int32_t era = (year >= 0 ? year : year - 399) / 400;
-  const int32_t yoe = year - era * 400;
-  const int32_t doy = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
-  const int32_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-  return era * 146097 + doe - 719468;
-}
-
 /// Year of a day count since 1970-01-01.
 __host__ __device__ constexpr int32_t yearOf(int32_t z) {
   z += 719468;

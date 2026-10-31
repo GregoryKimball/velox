@@ -196,7 +196,7 @@ Result q1(QueryContext& ctx) {
   a.shipdate = ctx.col<int16_t>("lineitem", "l_shipdate");
   a.zones = ctx.zones("lineitem", "l_shipdate");
   a.rows = ctx.rows("lineitem");
-  a.dateLimit = days(1998, 9, 2);
+  a.dateLimit = ctx.param("shipdate_max", days(1998, 9, 2));
   auto* totals = ctx.zeroed<Totals>(kGroups);
   q1Kernel<<<persistentBlocks(q1Kernel, kThreads), kThreads, 0, ctx.stream()>>>(a, totals);
   SV_CUDA(cudaGetLastError());

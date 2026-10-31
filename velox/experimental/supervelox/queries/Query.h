@@ -18,6 +18,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,16 @@
 // not include Velox or folly.
 
 namespace facebook::velox::supervelox {
+
+/// Days since 1970-01-01 for a proleptic Gregorian date.
+constexpr int32_t days(int32_t year, int32_t month, int32_t day) {
+  year -= month <= 2;
+  const int32_t era = (year >= 0 ? year : year - 399) / 400;
+  const int32_t yoe = year - era * 400;
+  const int32_t doy = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+  const int32_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + doe - 719468;
+}
 
 enum class ResultType { kBigint, kInteger, kDouble, kVarchar, kDate, kDecimal };
 
@@ -65,12 +76,28 @@ struct Result {
   size_t rows() const;
 };
 
+/// Literals taken from a matched plan, in the store's encoding: dates as days,
+/// decimals unscaled at the column's scale, strings as dictionary codes. A
+/// query uses the TPC-H validation value for any literal it is not given.
+struct QueryParams {
+  std::map<std::string, int64_t> values;
+
+  int64_t get(const std::string& name, int64_t fallback) const {
+    auto it = values.find(name);
+    return it == values.end() ? fallback : it->second;
+  }
+};
+
 /// Everything a fused query needs while it runs: device-readable columns from
 /// the HBM cache, derived structures, and scratch memory freed at the end.
 class QueryContext {
  public:
-  QueryContext(ColumnStore& store, DeviceCache& cache, cudaStream_t stream);
+  QueryContext(ColumnStore& store, DeviceCache& cache, cudaStream_t stream, const QueryParams& params);
   ~QueryContext();
+
+  int64_t param(const std::string& name, int64_t fallback) const {
+    return params_.get(name, fallback);
+  }
 
   const Column& meta(const std::string& table, const std::string& name) {
     return store_.column(table, name);
@@ -142,6 +169,7 @@ class QueryContext {
   ColumnStore& store_;
   DeviceCache& cache_;
   cudaStream_t stream_;
+  const QueryParams& params_;
   std::vector<void*> scratch_;
   const bool trace_;
   double lastMark_;
@@ -158,5 +186,19 @@ struct QuerySpec {
 /// The fused queries that exist, by TPC-H number.
 const std::vector<QuerySpec>& querySpecs();
 const QuerySpec* findQuery(int32_t number);
+
+/// Who implements a query: the hand-written kernels of QuerySpec::run, or a
+/// version composed from a library's operators over the same cached columns.
+enum class Backend { kHandwritten, kCudf, kMeld };
+
+const char* backendName(Backend backend);
+Backend parseBackend(const std::string& name);
+
+/// Adds a library version of a query, which must produce the same result
+/// schema as the hand-written one.
+void registerImplementation(Backend backend, int32_t query, QueryFunction function);
+
+/// The version of `spec` that `backend` provides, or null if it has none.
+QueryFunction implementation(const QuerySpec& spec, Backend backend);
 
 } // namespace facebook::velox::supervelox

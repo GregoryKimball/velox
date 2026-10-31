@@ -15,6 +15,8 @@
  */
 #include "velox/experimental/supervelox/queries/Query.h"
 
+#include <stdexcept>
+
 namespace facebook::velox::supervelox {
 
 QuerySpec q1Spec();
@@ -56,6 +58,48 @@ const QuerySpec* findQuery(int32_t number) {
     }
   }
   return nullptr;
+}
+
+namespace {
+
+std::map<std::pair<Backend, int32_t>, QueryFunction>& implementations() {
+  static std::map<std::pair<Backend, int32_t>, QueryFunction> functions;
+  return functions;
+}
+
+} // namespace
+
+const char* backendName(Backend backend) {
+  switch (backend) {
+    case Backend::kHandwritten:
+      return "handwritten";
+    case Backend::kCudf:
+      return "cudf";
+    case Backend::kMeld:
+      return "meld";
+  }
+  return "?";
+}
+
+Backend parseBackend(const std::string& name) {
+  for (Backend backend : {Backend::kHandwritten, Backend::kCudf, Backend::kMeld}) {
+    if (name == backendName(backend)) {
+      return backend;
+    }
+  }
+  throw std::invalid_argument("unknown backend " + name);
+}
+
+void registerImplementation(Backend backend, int32_t query, QueryFunction function) {
+  implementations()[{backend, query}] = function;
+}
+
+QueryFunction implementation(const QuerySpec& spec, Backend backend) {
+  if (backend == Backend::kHandwritten) {
+    return spec.run;
+  }
+  auto it = implementations().find({backend, spec.number});
+  return it == implementations().end() ? nullptr : it->second;
 }
 
 } // namespace facebook::velox::supervelox

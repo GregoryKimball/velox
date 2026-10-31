@@ -68,6 +68,9 @@ class ColumnStore {
 
   const Column& column(const std::string& table, const std::string& name);
 
+  /// The column's description without its data, which stays unloaded.
+  const Column& metadata(const std::string& table, const std::string& name);
+
   /// Loads the named columns in parallel. Each entry is "table.column".
   void preload(const std::vector<std::string>& columns, int32_t threads = 32);
 
