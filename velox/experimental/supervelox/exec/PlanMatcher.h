@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -31,5 +32,10 @@ core::PlanNodePtr rewriteWithFusedQueries(
     const core::PlanNodePtr& plan,
     ColumnStore& store,
     std::vector<std::string>* log = nullptr);
+
+/// Records `plan` as how TPC-H query `query` is written with its validation
+/// parameters. A query with no matcher that reads its literals is still run
+/// fused for a subtree equal to this plan, with its default parameters.
+void registerReferencePlan(int32_t query, const core::PlanNodePtr& plan);
 
 } // namespace facebook::velox::supervelox

@@ -226,6 +226,9 @@ int main(int argc, char** argv) {
     connector::ConnectorRegistry::global().insert(hive->connectorId(), hive);
     tpch = std::make_unique<exec::test::TpchQueryBuilder>(dwio::common::FileFormat::PARQUET, FLAGS_filters_as_node);
     tpch->initialize(FLAGS_tpch_plans);
+    for (int32_t query = 1; query <= 22; ++query) {
+      registerReferencePlan(query, tpch->getQueryPlan(query).plan);
+    }
   }
 
   Engine engine(

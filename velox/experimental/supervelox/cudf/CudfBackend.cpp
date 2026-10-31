@@ -15,10 +15,19 @@
  */
 #include "velox/experimental/supervelox/cudf/CudfBackend.h"
 
+#include <cudf/binaryop.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/filling.hpp>
+#include <cudf/groupby.hpp>
+#include <cudf/aggregation.hpp>
 #include <cudf/reduction.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/sorting.hpp>
+#include <cudf/transform.hpp>
 #include <rmm/mr/cuda_async_view_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <algorithm>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -30,8 +39,12 @@
 namespace facebook::velox::supervelox::cudf_backend {
 
 Result q1(QueryContext& ctx);
+Result q3(QueryContext& ctx);
 Result q4(QueryContext& ctx);
+Result q5(QueryContext& ctx);
 Result q6(QueryContext& ctx);
+Result q7(QueryContext& ctx);
+Result q8(QueryContext& ctx);
 Result q12(QueryContext& ctx);
 Result q14(QueryContext& ctx);
 Result q19(QueryContext& ctx);
@@ -235,13 +248,204 @@ const cudf::compiled_fragment& compileFragment(const std::string& source) {
   return it->second;
 }
 
+namespace {
+
+const char* deviceType(cudf::type_id type) {
+  switch (type) {
+    case cudf::type_id::BOOL8:
+      return "bool";
+    case cudf::type_id::INT8:
+      return "int8_t";
+    case cudf::type_id::INT16:
+      return "int16_t";
+    case cudf::type_id::INT32:
+      return "int32_t";
+    case cudf::type_id::INT64:
+      return "int64_t";
+    case cudf::type_id::FLOAT64:
+      return "double";
+    default:
+      throw std::invalid_argument("no device type for this cuDF type");
+  }
+}
+
+} // namespace
+
+std::unique_ptr<cudf::column> computeColumn(
+    QueryContext& ctx,
+    const std::string& inputs,
+    const std::string& expression,
+    cudf::type_id type,
+    const std::vector<cudf::column_view>& columns,
+    const std::string& prelude) {
+  const std::string source = std::string(R"(
+#include <cuda/std/cstdint>
+
+using namespace cuda::std;
+
+extern "C" __device__ int transform()") +
+      deviceType(type) + "* out, " + inputs + ") {\n" + prelude + "  *out = " + expression + ";\n  return 0;\n}\n";
+  const std::vector<cudf::transform_input> in(columns.begin(), columns.end());
+  const cudf::transform_output out[] = {{cudf::data_type{type}, cudf::output_nullability::ALL_VALID}};
+  auto table = cudf::transform_lto(
+      compileFragment(source).view(),
+      cudf::lto_binary_type::LTO_IR,
+      cudf::null_aware::NO,
+      std::nullopt,
+      in,
+      out,
+      {},
+      std::nullopt,
+      ctx.stream());
+  return std::move(table->release()[0]);
+}
+
+std::unique_ptr<cudf::column> keyRows(QueryContext& ctx, const cudf::column_view& keys) {
+  const cudf::numeric_scalar<int32_t> one(1, true, ctx.stream());
+  return cudf::binary_operation(keys, one, cudf::binary_operator::SUB, cudf::data_type{cudf::type_id::INT32}, ctx.stream());
+}
+
+std::unique_ptr<cudf::table> gatherColumns(
+    QueryContext& ctx,
+    const std::string& table,
+    const std::vector<std::string>& names,
+    const cudf::column_view& rows) {
+  std::vector<cudf::column_view> columns;
+  for (const auto& name : names) {
+    columns.push_back(fixedView(ctx, table, name, {0, ctx.rows(table)}));
+  }
+  return cudf::gather(cudf::table_view(columns), rows, cudf::out_of_bounds_policy::DONT_CHECK, ctx.stream());
+}
+
+OrderLines orderLines(QueryContext& ctx, int64_t begin, int64_t end) {
+  OrderLines lines;
+  lines.begin = begin;
+  lines.end = end;
+  if (end <= begin) {
+    return lines;
+  }
+  const uint32_t* starts = orderLineStarts(ctx);
+  const auto bounds = ctx.download(starts + begin, 1);
+  const auto last = ctx.download(starts + end, 1);
+  lines.lines = {bounds[0], last[0]};
+  lines.counts = cudf::binary_operation(
+      deviceView(cudf::type_id::INT32, starts + begin + 1, end - begin),
+      deviceView(cudf::type_id::INT32, starts + begin, end - begin),
+      cudf::binary_operator::SUB,
+      cudf::data_type{cudf::type_id::INT32},
+      ctx.stream());
+  const cudf::numeric_scalar<int32_t> base(static_cast<int32_t>(lines.lines.begin), true, ctx.stream());
+  lines.offsets = cudf::binary_operation(
+      deviceView(cudf::type_id::INT32, starts + begin, end - begin + 1),
+      base,
+      cudf::binary_operator::SUB,
+      cudf::data_type{cudf::type_id::INT32},
+      ctx.stream());
+  return lines;
+}
+
+std::vector<std::pair<int64_t, int64_t>>
+orderChunks(QueryContext& ctx, int64_t begin, int64_t end, int64_t maxLines) {
+  std::vector<std::pair<int64_t, int64_t>> chunks;
+  if (end <= begin) {
+    return chunks;
+  }
+  // Orders hold at most seven lines, so a run of maxLines / 8 orders fits.
+  const int64_t orders = std::max<int64_t>(1, maxLines / 8);
+  for (int64_t first = begin; first < end; first += orders) {
+    chunks.emplace_back(first, std::min(end, first + orders));
+  }
+  return chunks;
+}
+
+std::unique_ptr<cudf::table>
+perLine(QueryContext& ctx, const OrderLines& lines, const std::vector<cudf::column_view>& columns) {
+  return cudf::repeat(cudf::table_view(columns), lines.counts->view(), ctx.stream());
+}
+
+std::unique_ptr<cudf::column> sumPerOrder(QueryContext& ctx, const cudf::column_view& values, const OrderLines& lines) {
+  return cudf::segmented_reduce(
+      values,
+      cudf::device_span<cudf::size_type const>(lines.offsets->view().data<cudf::size_type>(), lines.offsets->size()),
+      *cudf::make_sum_aggregation<cudf::segmented_reduce_aggregation>(),
+      cudf::data_type{cudf::type_id::INT64},
+      cudf::null_policy::EXCLUDE,
+      ctx.stream());
+}
+
+cudf::column_view stringView(QueryContext& ctx, const std::string& table, const std::string& name, RowRange rows) {
+  if (rows.size() > std::numeric_limits<cudf::size_type>::max()) {
+    throw std::invalid_argument("cuDF columns hold at most 2^31 - 1 rows");
+  }
+  const int64_t* offsets = ctx.offsets(table, name);
+  const cudf::column_view offsetView(
+      cudf::data_type{cudf::type_id::INT64}, static_cast<cudf::size_type>(rows.size() + 1), offsets + rows.begin, nullptr, 0);
+  return cudf::column_view(
+      cudf::data_type{cudf::type_id::STRING},
+      static_cast<cudf::size_type>(rows.size()),
+      ctx.chars(table, name),
+      nullptr,
+      0,
+      0,
+      {offsetView});
+}
+
+std::vector<int32_t> firstSorted(
+    QueryContext& ctx,
+    const cudf::table_view& keys,
+    const std::vector<cudf::order>& orders,
+    int64_t limit) {
+  auto order = cudf::sorted_order(keys, orders, {}, ctx.stream());
+  const auto count = std::min<int64_t>(limit, order->size());
+  return download<int32_t>(ctx, cudf::slice(order->view(), {0, static_cast<cudf::size_type>(count)})[0]);
+}
+
+Grouped groupBy(
+    QueryContext& ctx,
+    const cudf::table_view& keys,
+    const std::vector<std::pair<cudf::column_view, Aggregate>>& aggregates) {
+  std::vector<cudf::groupby::aggregation_request> requests(aggregates.size());
+  for (size_t i = 0; i < aggregates.size(); ++i) {
+    requests[i].values = aggregates[i].first;
+    switch (aggregates[i].second) {
+      case Aggregate::kSum:
+        requests[i].aggregations.push_back(cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+        break;
+      case Aggregate::kMin:
+        requests[i].aggregations.push_back(cudf::make_min_aggregation<cudf::groupby_aggregation>());
+        break;
+      case Aggregate::kMax:
+        requests[i].aggregations.push_back(cudf::make_max_aggregation<cudf::groupby_aggregation>());
+        break;
+      case Aggregate::kCount:
+        requests[i].aggregations.push_back(cudf::make_count_aggregation<cudf::groupby_aggregation>());
+        break;
+      case Aggregate::kDistinct:
+        requests[i].aggregations.push_back(cudf::make_nunique_aggregation<cudf::groupby_aggregation>());
+        break;
+    }
+  }
+  cudf::groupby::groupby grouping(keys);
+  auto [groupKeys, results] = grouping.aggregate(requests, ctx.stream());
+  Grouped grouped;
+  grouped.keys = std::move(groupKeys);
+  for (auto& result : results) {
+    grouped.values.push_back(std::move(result.results[0]));
+  }
+  return grouped;
+}
+
 void registerCudfBackend() {
   cudaMemPool_t pool;
   SV_CUDA(cudaDeviceGetDefaultMemPool(&pool, 0));
   rmm::mr::set_current_device_resource(rmm::mr::cuda_async_view_memory_resource(pool));
   registerImplementation(Backend::kCudf, 1, q1);
+  registerImplementation(Backend::kCudf, 3, q3);
   registerImplementation(Backend::kCudf, 4, q4);
+  registerImplementation(Backend::kCudf, 5, q5);
   registerImplementation(Backend::kCudf, 6, q6);
+  registerImplementation(Backend::kCudf, 7, q7);
+  registerImplementation(Backend::kCudf, 8, q8);
   registerImplementation(Backend::kCudf, 12, q12);
   registerImplementation(Backend::kCudf, 14, q14);
   registerImplementation(Backend::kCudf, 19, q19);

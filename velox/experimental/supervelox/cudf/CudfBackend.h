@@ -15,13 +15,19 @@
  */
 #pragma once
 
+#include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/types.hpp>
 #include <cudf/udf.hpp>
 
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "velox/experimental/supervelox/common/Cuda.h"
 #include "velox/experimental/supervelox/queries/Derived.h"
 #include "velox/experimental/supervelox/queries/Query.h"
 
@@ -85,6 +91,88 @@ struct GroupedSums {
 /// The sums, `groups` times `values.size()`, group-major.
 std::vector<int64_t>
 sumGroups(QueryContext& ctx, const GroupedSums& sums, const std::vector<cudf::column_view>& columns);
+
+/// One column computed by `expression`, after the statements of `prelude`,
+/// over `columns`, as one transform_lto. `inputs` declares one device
+/// parameter per column.
+std::unique_ptr<cudf::column> computeColumn(
+    QueryContext& ctx,
+    const std::string& inputs,
+    const std::string& expression,
+    cudf::type_id type,
+    const std::vector<cudf::column_view>& columns,
+    const std::string& prelude = "");
+
+/// The rows holding `keys` in a table stored by key, at row key - 1.
+std::unique_ptr<cudf::column> keyRows(QueryContext& ctx, const cudf::column_view& keys);
+
+/// Columns `names` of `table` at `rows`.
+std::unique_ptr<cudf::table> gatherColumns(
+    QueryContext& ctx,
+    const std::string& table,
+    const std::vector<std::string>& names,
+    const cudf::column_view& rows);
+
+/// The lines of orders [begin, end), which are contiguous, with each order's
+/// line count and where its lines start among them.
+struct OrderLines {
+  int64_t begin{0};
+  int64_t end{0};
+  RowRange lines;
+  std::unique_ptr<cudf::column> counts;
+  std::unique_ptr<cudf::column> offsets;
+};
+
+OrderLines orderLines(QueryContext& ctx, int64_t begin, int64_t end);
+
+/// Orders [begin, end) cut into runs whose lines are at most `maxLines`, so
+/// that what is made per line fits beside the cache.
+std::vector<std::pair<int64_t, int64_t>>
+orderChunks(QueryContext& ctx, int64_t begin, int64_t end, int64_t maxLines = int64_t{1} << 28);
+
+/// Each order's value of `columns` repeated over its lines.
+std::unique_ptr<cudf::table>
+perLine(QueryContext& ctx, const OrderLines& lines, const std::vector<cudf::column_view>& columns);
+
+/// The sum of the INT64 `values` over each order's lines.
+std::unique_ptr<cudf::column> sumPerOrder(QueryContext& ctx, const cudf::column_view& values, const OrderLines& lines);
+
+/// A zero-copy view of rows of a cached string column.
+cudf::column_view stringView(QueryContext& ctx, const std::string& table, const std::string& name, RowRange rows);
+
+/// The first `limit` row indices of `keys` in the order `orders` gives.
+std::vector<int32_t> firstSorted(
+    QueryContext& ctx,
+    const cudf::table_view& keys,
+    const std::vector<cudf::order>& orders,
+    int64_t limit);
+
+/// Aggregations `groupBy` computes per group.
+enum class Aggregate { kSum, kMin, kMax, kCount, kDistinct };
+
+struct Grouped {
+  std::unique_ptr<cudf::table> keys;
+  std::vector<std::unique_ptr<cudf::column>> values;
+};
+
+/// One row per distinct row of `keys`, with each of `aggregates` over its
+/// column of values.
+Grouped groupBy(
+    QueryContext& ctx,
+    const cudf::table_view& keys,
+    const std::vector<std::pair<cudf::column_view, Aggregate>>& aggregates);
+
+/// The host copy of a fixed-width column.
+template <typename T>
+std::vector<T> download(QueryContext& ctx, const cudf::column_view& column) {
+  std::vector<T> host(column.size());
+  if (!host.empty()) {
+    SV_CUDA(cudaMemcpyAsync(
+        host.data(), column.data<T>(), host.size() * sizeof(T), cudaMemcpyDeviceToHost, ctx.stream()));
+    SV_CUDA(cudaStreamSynchronize(ctx.stream()));
+  }
+  return host;
+}
 
 /// Registers the cuDF versions of the queries and makes cuDF allocate from
 /// the CUDA default memory pool the engine pre-grows.

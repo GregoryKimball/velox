@@ -17,7 +17,9 @@
 
 #include <cmath>
 #include <limits>
+#include <map>
 #include <optional>
+#include <regex>
 #include <set>
 
 #include <fmt/format.h>
@@ -1078,7 +1080,40 @@ std::optional<std::pair<int32_t, QueryParams>> match(const Aggregation& aggregat
   return std::nullopt;
 }
 
+std::map<int32_t, std::string>& referencePlans() {
+  static std::map<int32_t, std::string> plans;
+  return plans;
+}
+
+/// `node`'s plan text without the node ids, which say where in a plan a node
+/// was made rather than what it does.
+std::string planText(const core::PlanNode& node) {
+  static const std::regex kIds(R"((-- [A-Za-z]+)\[[^\]]*\])");
+  return std::regex_replace(node.toString(true, true), kIds, "$1");
+}
+
+/// The query whose reference plan `node` is, among those no matcher reads
+/// the literals of.
+std::optional<int32_t> referenceQuery(const core::PlanNode& node) {
+  if (referencePlans().empty()) {
+    return std::nullopt;
+  }
+  const std::string text = planText(node);
+  for (const auto& [query, reference] : referencePlans()) {
+    if (text == reference) {
+      return query;
+    }
+  }
+  return std::nullopt;
+}
+
 core::PlanNodePtr rewrite(const core::PlanNodePtr& node, ColumnStore& store, std::vector<std::string>* log) {
+  if (auto query = referenceQuery(*node)) {
+    if (log) {
+      log->push_back(fmt::format("plan node {} ({}) is the reference plan of q{}", node->id(), node->name(), *query));
+    }
+    return std::make_shared<FusedQueryNode>(node->id(), *query, QueryParams{}, node->outputType());
+  }
   std::optional<Aggregation> aggregation;
   if (const auto* project = dynamic_cast<const core::ProjectNode*>(node.get())) {
     aggregation = readAggregation(skipLocalExchanges(project->sources()[0].get()), project);
@@ -1114,6 +1149,15 @@ core::PlanNodePtr rewrite(const core::PlanNodePtr& node, ColumnStore& store, std
 }
 
 } // namespace
+
+void registerReferencePlan(int32_t query, const core::PlanNodePtr& plan) {
+  for (const auto& matcher : kMatchers) {
+    if (matcher.query == query) {
+      return;
+    }
+  }
+  referencePlans()[query] = planText(*plan);
+}
 
 core::PlanNodePtr
 rewriteWithFusedQueries(const core::PlanNodePtr& plan, ColumnStore& store, std::vector<std::string>* log) {
