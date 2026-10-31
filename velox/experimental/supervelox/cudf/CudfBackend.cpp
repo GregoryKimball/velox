@@ -16,14 +16,19 @@
 #include "velox/experimental/supervelox/cudf/CudfBackend.h"
 
 #include <cudf/binaryop.hpp>
+#include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/strings/contains.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/groupby.hpp>
 #include <cudf/aggregation.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/sorting.hpp>
+#include <cudf/stream_compaction.hpp>
 #include <cudf/transform.hpp>
+#include <cudf/unary.hpp>
 #include <rmm/mr/cuda_async_view_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
@@ -39,15 +44,27 @@
 namespace facebook::velox::supervelox::cudf_backend {
 
 Result q1(QueryContext& ctx);
+Result q2(QueryContext& ctx);
 Result q3(QueryContext& ctx);
 Result q4(QueryContext& ctx);
 Result q5(QueryContext& ctx);
 Result q6(QueryContext& ctx);
 Result q7(QueryContext& ctx);
 Result q8(QueryContext& ctx);
+Result q9(QueryContext& ctx);
+Result q10(QueryContext& ctx);
+Result q11(QueryContext& ctx);
 Result q12(QueryContext& ctx);
+Result q13(QueryContext& ctx);
 Result q14(QueryContext& ctx);
+Result q15(QueryContext& ctx);
+Result q16(QueryContext& ctx);
+Result q17(QueryContext& ctx);
+Result q18(QueryContext& ctx);
 Result q19(QueryContext& ctx);
+Result q20(QueryContext& ctx);
+Result q21(QueryContext& ctx);
+Result q22(QueryContext& ctx);
 
 namespace {
 
@@ -248,8 +265,6 @@ const cudf::compiled_fragment& compileFragment(const std::string& source) {
   return it->second;
 }
 
-namespace {
-
 const char* deviceType(cudf::type_id type) {
   switch (type) {
     case cudf::type_id::BOOL8:
@@ -268,8 +283,6 @@ const char* deviceType(cudf::type_id type) {
       throw std::invalid_argument("no device type for this cuDF type");
   }
 }
-
-} // namespace
 
 std::unique_ptr<cudf::column> computeColumn(
     QueryContext& ctx,
@@ -373,6 +386,65 @@ std::unique_ptr<cudf::column> sumPerOrder(QueryContext& ctx, const cudf::column_
       ctx.stream());
 }
 
+std::unique_ptr<cudf::column>
+extremePerOrder(QueryContext& ctx, const cudf::column_view& values, const OrderLines& lines, bool maximum) {
+  return cudf::segmented_reduce(
+      values,
+      cudf::device_span<cudf::size_type const>(lines.offsets->view().data<cudf::size_type>(), lines.offsets->size()),
+      maximum ? *cudf::make_max_aggregation<cudf::segmented_reduce_aggregation>()
+              : *cudf::make_min_aggregation<cudf::segmented_reduce_aggregation>(),
+      values.type(),
+      cudf::null_policy::EXCLUDE,
+      ctx.stream());
+}
+
+std::unique_ptr<cudf::column>
+partsuppRows(QueryContext& ctx, const cudf::column_view& partkeys, const cudf::column_view& suppkeys) {
+  const std::string part = std::string(deviceType(partkeys.type().id())) + " part";
+  std::vector<std::unique_ptr<cudf::table>> slots;
+  for (int slot = 0; slot < 4; ++slot) {
+    auto rows = computeColumn(
+        ctx, part, "(int32_t{part} - 1) * 4 + " + std::to_string(slot), cudf::type_id::INT32, {partkeys});
+    slots.push_back(gatherColumns(ctx, "partsupp", {"ps_suppkey"}, rows->view()));
+  }
+  const std::string supplier = deviceType(slots[0]->get_column(0).type().id());
+  auto rows = computeColumn(
+      ctx,
+      part + ", " + deviceType(suppkeys.type().id()) + " supplier, " + supplier + " s0, " + supplier + " s1, " + supplier +
+          " s2, " + supplier + " s3",
+      "supplier == s0 ? base : supplier == s1 ? base + 1 : supplier == s2 ? base + 2 : supplier == s3 ? base + 3 : -1",
+      cudf::type_id::INT32,
+      {partkeys,
+       suppkeys,
+       slots[0]->get_column(0).view(),
+       slots[1]->get_column(0).view(),
+       slots[2]->get_column(0).view(),
+       slots[3]->get_column(0).view()},
+      "  const int32_t base = (int32_t{part} - 1) * 4;\n");
+  if (rows->size() > 0) {
+    auto lowest =
+        cudf::reduce(rows->view(), *cudf::make_min_aggregation<cudf::reduce_aggregation>(), rows->type(), ctx.stream());
+    if (static_cast<cudf::numeric_scalar<int32_t>&>(*lowest).value(ctx.stream()) < 0) {
+      throw std::runtime_error("lineitem (part, supplier) missing from the partsupp layout");
+    }
+  }
+  return rows;
+}
+
+std::unique_ptr<cudf::table> concatenateTables(QueryContext& ctx, const std::vector<std::unique_ptr<cudf::table>>& pieces) {
+  std::vector<cudf::table_view> views;
+  for (const auto& piece : pieces) {
+    views.push_back(piece->view());
+  }
+  return cudf::concatenate(views, ctx.stream());
+}
+
+std::unique_ptr<cudf::column>
+likeColumn(QueryContext& ctx, const std::string& table, const std::string& column, const std::string& pattern, RowRange rows) {
+  return cudf::strings::like(
+      cudf::strings_column_view(stringView(ctx, table, column, rows)), pattern, "", ctx.stream());
+}
+
 cudf::column_view stringView(QueryContext& ctx, const std::string& table, const std::string& name, RowRange rows) {
   if (rows.size() > std::numeric_limits<cudf::size_type>::max()) {
     throw std::invalid_argument("cuDF columns hold at most 2^31 - 1 rows");
@@ -398,6 +470,35 @@ std::vector<int32_t> firstSorted(
   auto order = cudf::sorted_order(keys, orders, {}, ctx.stream());
   const auto count = std::min<int64_t>(limit, order->size());
   return download<int32_t>(ctx, cudf::slice(order->view(), {0, static_cast<cudf::size_type>(count)})[0]);
+}
+
+std::unique_ptr<cudf::table> firstRows(
+    QueryContext& ctx,
+    const cudf::table_view& values,
+    const cudf::table_view& keys,
+    const std::vector<cudf::order>& orders,
+    int64_t limit) {
+  auto order = cudf::sorted_order(keys, orders, {}, ctx.stream());
+  const auto count = static_cast<cudf::size_type>(std::min<int64_t>(limit, order->size()));
+  return cudf::gather(values, cudf::slice(order->view(), {0, count})[0], cudf::out_of_bounds_policy::DONT_CHECK, ctx.stream());
+}
+
+std::unique_ptr<cudf::column> sequence(QueryContext& ctx, int64_t count, int32_t first, int32_t step) {
+  const cudf::numeric_scalar<int32_t> init(first, true, ctx.stream());
+  const cudf::numeric_scalar<int32_t> stride(step, true, ctx.stream());
+  return cudf::sequence(static_cast<cudf::size_type>(count), init, stride, ctx.stream());
+}
+
+std::unique_ptr<cudf::table> selectRows(QueryContext& ctx, const cudf::table_view& table, const cudf::column_view& mask) {
+  return cudf::apply_boolean_mask(table, mask, ctx.stream());
+}
+
+std::vector<int64_t> downloadInts(QueryContext& ctx, const cudf::column_view& column) {
+  if (column.type().id() == cudf::type_id::INT64) {
+    return download<int64_t>(ctx, column);
+  }
+  auto wide = cudf::cast(column, cudf::data_type{cudf::type_id::INT64}, ctx.stream());
+  return download<int64_t>(ctx, wide->view());
 }
 
 Grouped groupBy(
@@ -440,15 +541,27 @@ void registerCudfBackend() {
   SV_CUDA(cudaDeviceGetDefaultMemPool(&pool, 0));
   rmm::mr::set_current_device_resource(rmm::mr::cuda_async_view_memory_resource(pool));
   registerImplementation(Backend::kCudf, 1, q1);
+  registerImplementation(Backend::kCudf, 2, q2);
   registerImplementation(Backend::kCudf, 3, q3);
   registerImplementation(Backend::kCudf, 4, q4);
   registerImplementation(Backend::kCudf, 5, q5);
   registerImplementation(Backend::kCudf, 6, q6);
   registerImplementation(Backend::kCudf, 7, q7);
   registerImplementation(Backend::kCudf, 8, q8);
+  registerImplementation(Backend::kCudf, 9, q9);
+  registerImplementation(Backend::kCudf, 10, q10);
+  registerImplementation(Backend::kCudf, 11, q11);
   registerImplementation(Backend::kCudf, 12, q12);
+  registerImplementation(Backend::kCudf, 13, q13);
   registerImplementation(Backend::kCudf, 14, q14);
+  registerImplementation(Backend::kCudf, 15, q15);
+  registerImplementation(Backend::kCudf, 16, q16);
+  registerImplementation(Backend::kCudf, 17, q17);
+  registerImplementation(Backend::kCudf, 18, q18);
   registerImplementation(Backend::kCudf, 19, q19);
+  registerImplementation(Backend::kCudf, 20, q20);
+  registerImplementation(Backend::kCudf, 21, q21);
+  registerImplementation(Backend::kCudf, 22, q22);
 }
 
 } // namespace facebook::velox::supervelox::cudf_backend

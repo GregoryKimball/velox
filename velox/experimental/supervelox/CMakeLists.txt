@@ -64,15 +64,27 @@ if(VELOX_ENABLE_CUDF)
     velox_supervelox_cudf
     cudf/CudfBackend.cpp
     cudf/CudfQ01.cpp
+    cudf/CudfQ02.cpp
     cudf/CudfQ03.cpp
     cudf/CudfQ04.cpp
     cudf/CudfQ05.cpp
     cudf/CudfQ06.cpp
     cudf/CudfQ07.cpp
     cudf/CudfQ08.cpp
+    cudf/CudfQ09.cpp
+    cudf/CudfQ10.cpp
+    cudf/CudfQ11.cpp
     cudf/CudfQ12.cpp
+    cudf/CudfQ13.cpp
     cudf/CudfQ14.cpp
+    cudf/CudfQ15.cpp
+    cudf/CudfQ16.cpp
+    cudf/CudfQ17.cpp
+    cudf/CudfQ18.cpp
     cudf/CudfQ19.cpp
+    cudf/CudfQ20.cpp
+    cudf/CudfQ21.cpp
+    cudf/CudfQ22.cpp
   )
   target_link_libraries(velox_supervelox_cudf velox_supervelox cudf::cudf fmt::fmt)
   target_link_libraries(sv_bench velox_supervelox_cudf)

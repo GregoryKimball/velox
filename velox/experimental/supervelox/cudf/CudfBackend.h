@@ -137,6 +137,25 @@ perLine(QueryContext& ctx, const OrderLines& lines, const std::vector<cudf::colu
 /// The sum of the INT64 `values` over each order's lines.
 std::unique_ptr<cudf::column> sumPerOrder(QueryContext& ctx, const cudf::column_view& values, const OrderLines& lines);
 
+/// The minimum or maximum of `values` over each order's lines, at their type.
+std::unique_ptr<cudf::column>
+extremePerOrder(QueryContext& ctx, const cudf::column_view& values, const OrderLines& lines, bool maximum);
+
+/// The CUDA type of a column's values, for declaring it in generated code.
+const char* deviceType(cudf::type_id type);
+
+/// The partsupp row of each (part key, supplier key) pair, from the four rows
+/// of the part; -1 where the supplier is not among them.
+std::unique_ptr<cudf::column>
+partsuppRows(QueryContext& ctx, const cudf::column_view& partkeys, const cudf::column_view& suppkeys);
+
+/// The rows of `pieces`, which share a schema, in one table.
+std::unique_ptr<cudf::table> concatenateTables(QueryContext& ctx, const std::vector<std::unique_ptr<cudf::table>>& pieces);
+
+/// BOOL8 per row of table.column: whether it matches the SQL LIKE `pattern`.
+std::unique_ptr<cudf::column>
+likeColumn(QueryContext& ctx, const std::string& table, const std::string& column, const std::string& pattern, RowRange rows);
+
 /// A zero-copy view of rows of a cached string column.
 cudf::column_view stringView(QueryContext& ctx, const std::string& table, const std::string& name, RowRange rows);
 
@@ -146,6 +165,20 @@ std::vector<int32_t> firstSorted(
     const cudf::table_view& keys,
     const std::vector<cudf::order>& orders,
     int64_t limit);
+
+/// The rows of `values` in the order `orders` gives `keys`, at most `limit`.
+std::unique_ptr<cudf::table> firstRows(
+    QueryContext& ctx,
+    const cudf::table_view& values,
+    const cudf::table_view& keys,
+    const std::vector<cudf::order>& orders,
+    int64_t limit);
+
+/// INT32 `first`, `first + step`, ... of length `count`.
+std::unique_ptr<cudf::column> sequence(QueryContext& ctx, int64_t count, int32_t first = 0, int32_t step = 1);
+
+/// The rows of `table` where the BOOL8 `mask` is true.
+std::unique_ptr<cudf::table> selectRows(QueryContext& ctx, const cudf::table_view& table, const cudf::column_view& mask);
 
 /// Aggregations `groupBy` computes per group.
 enum class Aggregate { kSum, kMin, kMax, kCount, kDistinct };
@@ -173,6 +206,9 @@ std::vector<T> download(QueryContext& ctx, const cudf::column_view& column) {
   }
   return host;
 }
+
+/// The host copy of an integer column of any width, widened.
+std::vector<int64_t> downloadInts(QueryContext& ctx, const cudf::column_view& column);
 
 /// Registers the cuDF versions of the queries and makes cuDF allocate from
 /// the CUDA default memory pool the engine pre-grows.
