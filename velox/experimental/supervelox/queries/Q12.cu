@@ -72,8 +72,8 @@ const std::vector<ResultField> kSchema = {
 
 Result q12(QueryContext& ctx) {
   Q12Args a;
-  a.dateLow = days(1994, 1, 1);
-  a.dateHigh = days(1995, 1, 1);
+  a.dateLow = ctx.param("receiptdate_min", days(1994, 1, 1));
+  a.dateHigh = ctx.param("receiptdate_max", days(1995, 1, 1) - 1) + 1;
   const auto lag = lineDateLag(ctx, "l_receiptdate");
   const auto range = sortedRange(ctx, "orders", "o_orderdate", a.dateLow - lag.second, a.dateHigh - lag.first);
   a.begin = range.first;
@@ -84,8 +84,8 @@ Result q12(QueryContext& ctx) {
   a.shipdate = ctx.col<int16_t>("lineitem", "l_shipdate");
   a.commitdate = ctx.col<int16_t>("lineitem", "l_commitdate");
   a.receiptdate = ctx.col<int16_t>("lineitem", "l_receiptdate");
-  a.modes = dictionaryCodes(ctx, "lineitem", "l_shipmode", {"MAIL", "SHIP"});
-  a.high = dictionaryCodes(ctx, "orders", "o_orderpriority", {"1-URGENT", "2-HIGH"});
+  a.modes = codesParam(ctx, "shipmodes", dictionaryCodes(ctx, "lineitem", "l_shipmode", {"MAIL", "SHIP"}));
+  a.high = codesParam(ctx, "high_priorities", dictionaryCodes(ctx, "orders", "o_orderpriority", {"1-URGENT", "2-HIGH"}));
   a.counts = ctx.zeroed<unsigned long long>(kModes * 2);
   q12Kernel<<<2048, 256, 0, ctx.stream()>>>(a);
   SV_CUDA(cudaGetLastError());
@@ -96,7 +96,7 @@ Result q12(QueryContext& ctx) {
   }
   Result result(kSchema);
   for (size_t mode = 0; mode < names.size(); ++mode) {
-    if (a.modes.contains(mode)) {
+    if (a.modes.contains(mode) && counts[mode * 2] + counts[mode * 2 + 1]) {
       result.strings[0].push_back(names[mode]);
       result.ints[1].push_back(counts[mode * 2]);
       result.ints[2].push_back(counts[mode * 2 + 1]);

@@ -56,7 +56,12 @@ const std::vector<ResultField> kSchema = {
 };
 
 Result q4(QueryContext& ctx) {
-  const auto [begin, end] = sortedRange(ctx, "orders", "o_orderdate", days(1993, 7, 1), days(1993, 10, 1));
+  const auto [begin, end] = sortedRange(
+      ctx,
+      "orders",
+      "o_orderdate",
+      ctx.param("orderdate_min", days(1993, 7, 1)),
+      ctx.param("orderdate_max", days(1993, 10, 1) - 1) + 1);
   auto* counts = ctx.zeroed<unsigned long long>(kPriorities);
   q4Kernel<<<1024, 256, 0, ctx.stream()>>>(
       orderLineStarts(ctx),

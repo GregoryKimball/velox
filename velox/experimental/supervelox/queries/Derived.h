@@ -93,6 +93,24 @@ struct CodeSet {
   }
 };
 
+/// A code set travels in QueryParams as the words 'name.0' to 'name.7'.
+inline void putCodes(QueryParams& params, const std::string& name, const CodeSet& codes) {
+  for (int i = 0; i < 8; ++i) {
+    params.values[name + "." + std::to_string(i)] = codes.words[i];
+  }
+}
+
+inline CodeSet codesParam(const QueryContext& ctx, const std::string& name, const CodeSet& fallback) {
+  if (ctx.param(name + ".0", -1) < 0) {
+    return fallback;
+  }
+  CodeSet codes;
+  for (int i = 0; i < 8; ++i) {
+    codes.words[i] = static_cast<uint32_t>(ctx.param(name + "." + std::to_string(i), 0));
+  }
+  return codes;
+}
+
 /// Codes of the dictionary column table.column whose value matches.
 CodeSet dictionaryCodes(
     QueryContext& ctx,

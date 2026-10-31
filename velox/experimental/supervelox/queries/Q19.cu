@@ -28,6 +28,7 @@ struct Branch {
   CodeSet containers;
   int32_t quantityLow;
   int32_t quantityHigh;
+  int32_t sizeLow;
   int32_t sizeHigh;
 };
 
@@ -59,7 +60,7 @@ __device__ __forceinline__ long long q19Row(const Q19Args& a, int64_t row) {
   for (int b = 0; b < 3; ++b) {
     const Branch& branch = a.branches[b];
     pass |= brand == branch.brand && branch.containers.contains(container) && quantity >= branch.quantityLow &&
-        quantity <= branch.quantityHigh && size >= 1 && size <= branch.sizeHigh;
+        quantity <= branch.quantityHigh && size >= branch.sizeLow && size <= branch.sizeHigh;
   }
   return pass ? (long long)a.price[row] * (100 - a.discount[row]) : 0;
 }
@@ -107,27 +108,39 @@ Result q19(QueryContext& ctx) {
   a.container = ctx.col<int8_t>("part", "p_container");
   a.size = ctx.col<int8_t>("part", "p_size");
   a.rows = ctx.rows("lineitem");
-  a.instruct = ctx.meta("lineitem", "l_shipinstruct").code("DELIVER IN PERSON");
-  a.modes = dictionaryCodes(ctx, "lineitem", "l_shipmode", {"AIR", "AIR REG"});
+  a.instruct = ctx.param("shipinstruct", ctx.meta("lineitem", "l_shipinstruct").code("DELIVER IN PERSON"));
+  a.modes = codesParam(ctx, "shipmodes", dictionaryCodes(ctx, "lineitem", "l_shipmode", {"AIR", "AIR REG"}));
   const Column& brand = ctx.meta("part", "p_brand");
-  a.branches[0] = {
-      brand.code("Brand#12"),
-      dictionaryCodes(ctx, "part", "p_container", {"SM CASE", "SM BOX", "SM PACK", "SM PKG"}),
-      100,
-      1100,
-      5};
-  a.branches[1] = {
-      brand.code("Brand#23"),
-      dictionaryCodes(ctx, "part", "p_container", {"MED BAG", "MED BOX", "MED PKG", "MED PACK"}),
-      1000,
-      2000,
-      10};
-  a.branches[2] = {
-      brand.code("Brand#34"),
-      dictionaryCodes(ctx, "part", "p_container", {"LG CASE", "LG BOX", "LG PACK", "LG PKG"}),
-      2000,
-      3000,
-      15};
+  const Branch defaults[3] = {
+      {brand.code("Brand#12"),
+       dictionaryCodes(ctx, "part", "p_container", {"SM CASE", "SM BOX", "SM PACK", "SM PKG"}),
+       100,
+       1100,
+       1,
+       5},
+      {brand.code("Brand#23"),
+       dictionaryCodes(ctx, "part", "p_container", {"MED BAG", "MED BOX", "MED PKG", "MED PACK"}),
+       1000,
+       2000,
+       1,
+       10},
+      {brand.code("Brand#34"),
+       dictionaryCodes(ctx, "part", "p_container", {"LG CASE", "LG BOX", "LG PACK", "LG PKG"}),
+       2000,
+       3000,
+       1,
+       15}};
+  for (int b = 0; b < 3; ++b) {
+    const std::string n = std::to_string(b);
+    const Branch& d = defaults[b];
+    a.branches[b] = {
+        static_cast<int32_t>(ctx.param("brand" + n, d.brand)),
+        codesParam(ctx, "containers" + n, d.containers),
+        static_cast<int32_t>(ctx.param("quantity_min" + n, d.quantityLow)),
+        static_cast<int32_t>(ctx.param("quantity_max" + n, d.quantityHigh)),
+        static_cast<int32_t>(ctx.param("size_min" + n, d.sizeLow)),
+        static_cast<int32_t>(ctx.param("size_max" + n, d.sizeHigh))};
+  }
   a.revenue = ctx.zeroed<unsigned long long>(1);
   q19Kernel<<<persistentBlocks(q19Kernel, kThreads), kThreads, 0, ctx.stream()>>>(a);
   SV_CUDA(cudaGetLastError());

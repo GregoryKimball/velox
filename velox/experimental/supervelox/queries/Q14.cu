@@ -77,9 +77,9 @@ Result q14(QueryContext& ctx) {
   a.partType = ctx.col<int16_t>("part", "p_type");
   a.zones = ctx.zones("lineitem", "l_shipdate");
   a.rows = ctx.rows("lineitem");
-  a.dateLow = days(1995, 9, 1);
-  a.dateHigh = days(1995, 10, 1);
-  a.promo = dictionaryCodes(ctx, "part", "p_type", Match::kPrefix, "PROMO");
+  a.dateLow = ctx.param("shipdate_min", days(1995, 9, 1));
+  a.dateHigh = ctx.param("shipdate_max", days(1995, 10, 1) - 1) + 1;
+  a.promo = codesParam(ctx, "promo_types", dictionaryCodes(ctx, "part", "p_type", Match::kPrefix, "PROMO"));
   a.sums = ctx.zeroed<unsigned long long>(2);
   q14Kernel<<<persistentBlocks(q14Kernel, kThreads), kThreads, 0, ctx.stream()>>>(a);
   SV_CUDA(cudaGetLastError());

@@ -21,10 +21,14 @@
 #include <set>
 
 #include <fmt/format.h>
+#include <fmt/ranges.h>
+#include <glog/logging.h>
 
 #include "velox/connectors/hive/FileTableHandle.h"
 #include "velox/core/Expressions.h"
+#include "velox/vector/ComplexVector.h"
 #include "velox/experimental/supervelox/exec/FusedQuery.h"
+#include "velox/experimental/supervelox/queries/Derived.h"
 
 namespace facebook::velox::supervelox {
 namespace {
@@ -62,13 +66,25 @@ struct Range {
   }
 };
 
-/// What a chain of projections and filters over a table scan computes: each
+/// What a tree of scans, projections, filters and joins computes: each
 /// output column as a canonical expression over table columns, and the
-/// filters as ranges of table columns.
+/// filters as ranges and value sets of table columns plus the conjuncts that
+/// are neither. TPC-H column names are unique across tables, so a table
+/// column is named by its own name.
 struct Relation {
-  std::string table;
+  std::set<std::string> tables;
   std::map<std::string, std::string> columns;
   std::map<std::string, Range> ranges;
+  /// Columns restricted to a list of string values.
+  std::map<std::string, std::set<std::string>> values;
+  /// Joins as `kind(left=right)`, and deduplications as `distinct(keys)`.
+  std::vector<std::string> joins;
+  /// Canonical text of the conjuncts that are not ranges, value sets or
+  /// disjunctions.
+  std::vector<std::string> residuals;
+  /// Conjuncts that are an OR of branches, each branch only ranges and value
+  /// sets.
+  std::vector<std::vector<Relation>> disjunctions;
 };
 
 /// An aggregation over a relation, its partial and final steps taken as one
@@ -76,6 +92,9 @@ struct Relation {
 struct Aggregation {
   std::vector<std::string> keys;
   std::vector<std::string> aggregates;
+  /// The columns the matched subtree produces: the keys and aggregates, or
+  /// a projection over them that the match takes in too.
+  std::vector<std::string> outputs;
   Relation input;
 };
 
@@ -142,6 +161,47 @@ std::optional<long double> literalValue(const core::TypedExprPtr& expr) {
   }
 }
 
+std::optional<std::string> stringLiteral(const core::TypedExprPtr& expr) {
+  const auto* constant = dynamic_cast<const core::ConstantTypedExpr*>(stripCasts(expr).get());
+  if (!constant || !constant->type()->isVarchar() || constant->hasValueVector() || constant->value().isNull()) {
+    return std::nullopt;
+  }
+  return constant->value().value<std::string>();
+}
+
+/// The strings of an array literal, as an IN list is given.
+std::optional<std::vector<std::string>> stringList(const core::TypedExprPtr& expr) {
+  if (const auto* call = dynamic_cast<const core::CallTypedExpr*>(expr.get())) {
+    if (functionName(call->name()) != "array_constructor") {
+      return std::nullopt;
+    }
+    std::vector<std::string> strings;
+    for (const auto& input : call->inputs()) {
+      auto text = stringLiteral(input);
+      if (!text) {
+        return std::nullopt;
+      }
+      strings.push_back(std::move(*text));
+    }
+    return strings;
+  }
+  const auto* constant = dynamic_cast<const core::ConstantTypedExpr*>(expr.get());
+  if (!constant || !constant->hasValueVector()) {
+    return std::nullopt;
+  }
+  const auto* array = constant->valueVector()->wrappedVector()->as<ArrayVector>();
+  if (!array || !array->elements()->type()->isVarchar()) {
+    return std::nullopt;
+  }
+  const auto index = constant->valueVector()->wrappedIndex(0);
+  auto* elements = array->elements()->as<SimpleVector<StringView>>();
+  std::vector<std::string> strings;
+  for (auto i = 0; i < array->sizeAt(index); ++i) {
+    strings.push_back(elements->valueAt(array->offsetAt(index) + i).str());
+  }
+  return strings;
+}
+
 /// `expr` as text that does not depend on how the plan named intermediate
 /// columns or where it placed casts: columns are replaced by what `columns`
 /// says they compute, casts are dropped and numbers are printed by value.
@@ -162,6 +222,9 @@ std::string canonical(const core::TypedExprPtr& expr, const std::map<std::string
   if (const auto* constant = dynamic_cast<const core::ConstantTypedExpr*>(expr.get())) {
     if (auto value = literalValue(expr)) {
       return fmt::format("{}", static_cast<double>(*value));
+    }
+    if (auto text = stringLiteral(expr)) {
+      return "'" + *text + "'";
     }
     return constant->toString();
   }
@@ -196,23 +259,43 @@ std::optional<std::string> tableColumn(const core::TypedExprPtr& expr, const Rel
   return it->second;
 }
 
-/// Adds the ranges `expr` puts on table columns. False when some part of it
-/// is not a comparison of a column with a literal.
-bool addConjuncts(const core::TypedExprPtr& expr, Relation& relation) {
+/// A BIGINT or short decimal constant at the int64 limits, which is how a
+/// range filter turned back into an expression writes an open side.
+bool isInt64Limit(const core::TypedExprPtr& expr) {
+  const auto* constant = dynamic_cast<const core::ConstantTypedExpr*>(expr.get());
+  if (!constant || constant->hasValueVector() || constant->value().isNull() ||
+      constant->type()->kind() != TypeKind::BIGINT) {
+    return false;
+  }
+  const auto value = constant->value().value<int64_t>();
+  return value <= std::numeric_limits<int64_t>::min() + 1 || value >= std::numeric_limits<int64_t>::max() - 1;
+}
+
+/// The values set `column` keeps, intersected with `values`.
+void restrictValues(Relation& relation, const std::string& column, const std::vector<std::string>& values) {
+  std::set<std::string> kept(values.begin(), values.end());
+  auto it = relation.values.find(column);
+  if (it != relation.values.end()) {
+    std::set<std::string> both;
+    for (const auto& value : kept) {
+      if (it->second.count(value)) {
+        both.insert(value);
+      }
+    }
+    kept = std::move(both);
+  }
+  relation.values[column] = std::move(kept);
+}
+
+/// A conjunct that compares a column with a literal, added as a range or a
+/// value set. False if `expr` is not one.
+bool addComparison(const core::TypedExprPtr& expr, Relation& relation) {
   const auto* call = dynamic_cast<const core::CallTypedExpr*>(expr.get());
   if (!call) {
     return false;
   }
   const std::string name = functionName(call->name());
   const auto& inputs = call->inputs();
-  if (name == "and") {
-    for (const auto& input : inputs) {
-      if (!addConjuncts(input, relation)) {
-        return false;
-      }
-    }
-    return true;
-  }
   if (name == "between" && inputs.size() == 3) {
     auto column = tableColumn(inputs[0], relation);
     auto low = literalValue(inputs[1]);
@@ -220,19 +303,32 @@ bool addConjuncts(const core::TypedExprPtr& expr, Relation& relation) {
     if (!column || !low || !high) {
       return false;
     }
-    relation.ranges[*column].atLeast(*low, false);
-    relation.ranges[*column].atMost(*high, false);
+    if (!isInt64Limit(stripCasts(inputs[1]))) {
+      relation.ranges[*column].atLeast(*low, false);
+    }
+    if (!isInt64Limit(stripCasts(inputs[2]))) {
+      relation.ranges[*column].atMost(*high, false);
+    }
+    return true;
+  }
+  if (name == "in" && inputs.size() == 2) {
+    auto column = tableColumn(inputs[0], relation);
+    auto strings = stringList(inputs[1]);
+    if (!column || !strings) {
+      return false;
+    }
+    restrictValues(relation, *column, *strings);
     return true;
   }
   if (inputs.size() != 2) {
     return false;
   }
   auto column = tableColumn(inputs[0], relation);
-  auto value = literalValue(inputs[1]);
+  auto literal = inputs[1];
   std::string op = name;
   if (!column) {
     column = tableColumn(inputs[1], relation);
-    value = literalValue(inputs[0]);
+    literal = inputs[0];
     static const std::map<std::string, std::string> kFlipped = {
         {"lt", "gt"}, {"lte", "gte"}, {"gt", "lt"}, {"gte", "lte"}, {"eq", "eq"}};
     auto it = kFlipped.find(name);
@@ -241,8 +337,19 @@ bool addConjuncts(const core::TypedExprPtr& expr, Relation& relation) {
     }
     op = it->second;
   }
-  if (!column || !value) {
+  if (!column) {
     return false;
+  }
+  if (auto text = stringLiteral(literal); text && op == "eq") {
+    restrictValues(relation, *column, {*text});
+    return true;
+  }
+  auto value = literalValue(literal);
+  if (!value) {
+    return false;
+  }
+  if (isInt64Limit(stripCasts(literal)) && op != "eq") {
+    return true;
   }
   Range& range = relation.ranges[*column];
   if (op == "lt" || op == "lte") {
@@ -258,6 +365,60 @@ bool addConjuncts(const core::TypedExprPtr& expr, Relation& relation) {
   return true;
 }
 
+/// Adds the conjuncts of `expr`: comparisons of a column with literals as
+/// ranges and value sets, and anything else as canonical text.
+void addConjuncts(const core::TypedExprPtr& expr, Relation& relation);
+
+void addDisjuncts(const core::TypedExprPtr& expr, std::vector<core::TypedExprPtr>& disjuncts) {
+  const auto* call = dynamic_cast<const core::CallTypedExpr*>(expr.get());
+  if (call && functionName(call->name()) == "or") {
+    for (const auto& input : call->inputs()) {
+      addDisjuncts(input, disjuncts);
+    }
+    return;
+  }
+  disjuncts.push_back(expr);
+}
+
+/// `expr` as branches of ranges and value sets, if it is an OR of those.
+std::optional<std::vector<Relation>> readDisjunction(const core::TypedExprPtr& expr, const Relation& relation) {
+  std::vector<core::TypedExprPtr> disjuncts;
+  addDisjuncts(expr, disjuncts);
+  if (disjuncts.size() < 2) {
+    return std::nullopt;
+  }
+  std::vector<Relation> branches;
+  for (const auto& disjunct : disjuncts) {
+    Relation branch;
+    branch.columns = relation.columns;
+    addConjuncts(disjunct, branch);
+    if (!branch.residuals.empty() || !branch.disjunctions.empty()) {
+      return std::nullopt;
+    }
+    branch.columns.clear();
+    branches.push_back(std::move(branch));
+  }
+  return branches;
+}
+
+void addConjuncts(const core::TypedExprPtr& expr, Relation& relation) {
+  const auto* call = dynamic_cast<const core::CallTypedExpr*>(expr.get());
+  if (call && functionName(call->name()) == "and") {
+    for (const auto& input : call->inputs()) {
+      addConjuncts(input, relation);
+    }
+    return;
+  }
+  if (addComparison(expr, relation)) {
+    return;
+  }
+  if (auto branches = readDisjunction(expr, relation)) {
+    relation.disjunctions.push_back(std::move(*branches));
+    return;
+  }
+  relation.residuals.push_back(canonical(expr, relation.columns));
+}
+
 /// Adds the ranges a connector's pushed-down filters put on table columns.
 bool addSubfieldFilters(const connector::hive::FileTableHandle& handle, const RowTypePtr& types, Relation& relation) {
   for (const auto& [subfield, filter] : handle.subfieldFilters()) {
@@ -267,6 +428,19 @@ bool addSubfieldFilters(const connector::hive::FileTableHandle& handle, const Ro
       return false;
     }
     const auto& type = types->childAt(*index);
+    if (filter->kind() == common::FilterKind::kBytesValues) {
+      const auto& values = static_cast<const common::BytesValues*>(filter.get())->values();
+      restrictValues(relation, column, std::vector<std::string>(values.begin(), values.end()));
+      continue;
+    }
+    if (filter->kind() == common::FilterKind::kBytesRange) {
+      const auto* bytes = static_cast<const common::BytesRange*>(filter.get());
+      if (!bytes->isSingleValue()) {
+        return false;
+      }
+      restrictValues(relation, column, {bytes->lower()});
+      continue;
+    }
     const long double unit = type->isDecimal() ? std::pow(10.0L, getDecimalPrecisionScale(*type).second) : 1.0L;
     Range& range = relation.ranges[column];
     switch (filter->kind()) {
@@ -311,6 +485,70 @@ const core::PlanNode* skipLocalExchanges(const core::PlanNode* node) {
   return node;
 }
 
+std::optional<Relation> readRelation(const core::PlanNode* node);
+
+/// The aggregation step that reads the input, from the final step of a
+/// partial and final pair or a single step.
+const core::AggregationNode* inputAggregation(const core::AggregationNode* top) {
+  if (!top->globalGroupingSets().empty() || top->groupId()) {
+    return nullptr;
+  }
+  if (top->step() == core::AggregationNode::Step::kSingle) {
+    return top;
+  }
+  if (top->step() != core::AggregationNode::Step::kFinal) {
+    return nullptr;
+  }
+  const auto* raw = dynamic_cast<const core::AggregationNode*>(skipLocalExchanges(top->sources()[0].get()));
+  return raw && raw->step() == core::AggregationNode::Step::kPartial ? raw : nullptr;
+}
+
+const char* joinKind(core::JoinType type) {
+  switch (type) {
+    case core::JoinType::kInner:
+      return "inner";
+    case core::JoinType::kLeftSemiFilter:
+      return "left_semi";
+    case core::JoinType::kRightSemiFilter:
+      return "right_semi";
+    default:
+      return nullptr;
+  }
+}
+
+/// Both sides of a join as one relation, restricted to the join's output.
+std::optional<Relation> readJoin(const core::HashJoinNode& join) {
+  const char* kind = joinKind(join.joinType());
+  auto left = readRelation(join.sources()[0].get());
+  auto right = readRelation(join.sources()[1].get());
+  if (!kind || !left || !right) {
+    return std::nullopt;
+  }
+  Relation relation = std::move(*left);
+  relation.tables.insert(right->tables.begin(), right->tables.end());
+  relation.ranges.insert(right->ranges.begin(), right->ranges.end());
+  relation.values.insert(right->values.begin(), right->values.end());
+  relation.joins.insert(relation.joins.end(), right->joins.begin(), right->joins.end());
+  relation.residuals.insert(relation.residuals.end(), right->residuals.begin(), right->residuals.end());
+  relation.disjunctions.insert(relation.disjunctions.end(), right->disjunctions.begin(), right->disjunctions.end());
+  std::map<std::string, std::string> both = relation.columns;
+  both.insert(right->columns.begin(), right->columns.end());
+  std::string keys;
+  for (size_t i = 0; i < join.leftKeys().size(); ++i) {
+    keys += (i ? "," : "") + canonical(join.leftKeys()[i], both) + "=" + canonical(join.rightKeys()[i], both);
+  }
+  relation.joins.push_back(std::string(kind) + "(" + keys + ")");
+  relation.columns = both;
+  if (join.filter()) {
+    addConjuncts(join.filter(), relation);
+  }
+  relation.columns.clear();
+  for (const auto& name : join.outputType()->names()) {
+    relation.columns[name] = both.at(name);
+  }
+  return relation;
+}
+
 std::optional<Relation> readRelation(const core::PlanNode* node) {
   node = skipLocalExchanges(node);
   if (const auto* scan = dynamic_cast<const core::TableScanNode*>(node)) {
@@ -320,7 +558,7 @@ std::optional<Relation> readRelation(const core::PlanNode* node) {
     }
     const auto& handle = *file;
     Relation relation;
-    relation.table = handle.name();
+    relation.tables.insert(handle.name());
     for (const auto& [name, column] : scan->assignments()) {
       relation.columns[name] = column->name();
     }
@@ -328,8 +566,8 @@ std::optional<Relation> readRelation(const core::PlanNode* node) {
     if (!addSubfieldFilters(handle, types, relation)) {
       return std::nullopt;
     }
-    if (const auto& remaining = handle.remainingFilter(); remaining && !addConjuncts(remaining, relation)) {
-      return std::nullopt;
+    if (const auto& remaining = handle.remainingFilter()) {
+      addConjuncts(remaining, relation);
     }
     return relation;
   }
@@ -347,26 +585,44 @@ std::optional<Relation> readRelation(const core::PlanNode* node) {
   }
   if (const auto* filter = dynamic_cast<const core::FilterNode*>(node)) {
     auto relation = readRelation(filter->sources()[0].get());
-    if (!relation || !addConjuncts(filter->filter(), *relation)) {
+    if (!relation) {
       return std::nullopt;
     }
+    addConjuncts(filter->filter(), *relation);
+    return relation;
+  }
+  if (const auto* join = dynamic_cast<const core::HashJoinNode*>(node)) {
+    return readJoin(*join);
+  }
+  if (const auto* top = dynamic_cast<const core::AggregationNode*>(node)) {
+    // Grouping with no aggregates keeps one row per key: a deduplication.
+    const auto* raw = inputAggregation(top);
+    if (!raw || !raw->aggregates().empty()) {
+      return std::nullopt;
+    }
+    auto relation = readRelation(raw->sources()[0].get());
+    if (!relation) {
+      return std::nullopt;
+    }
+    std::map<std::string, std::string> columns;
+    std::string keys;
+    for (const auto& key : raw->groupingKeys()) {
+      columns[key->name()] = canonical(key, relation->columns);
+      keys += (keys.empty() ? "" : ",") + columns[key->name()];
+    }
+    relation->joins.push_back("distinct(" + keys + ")");
+    relation->columns = std::move(columns);
     return relation;
   }
   return std::nullopt;
 }
 
-std::optional<Aggregation> readAggregation(const core::PlanNode* node) {
+/// The aggregation at `node`, and when `project` is given, the projection
+/// over it as the subtree's output.
+std::optional<Aggregation> readAggregation(const core::PlanNode* node, const core::ProjectNode* project = nullptr) {
   const auto* top = dynamic_cast<const core::AggregationNode*>(node);
-  if (!top || !top->globalGroupingSets().empty() || top->groupId()) {
-    return std::nullopt;
-  }
-  const core::AggregationNode* raw = top;
-  if (top->step() == core::AggregationNode::Step::kFinal) {
-    raw = dynamic_cast<const core::AggregationNode*>(skipLocalExchanges(top->sources()[0].get()));
-    if (!raw || raw->step() != core::AggregationNode::Step::kPartial) {
-      return std::nullopt;
-    }
-  } else if (top->step() != core::AggregationNode::Step::kSingle) {
+  const auto* raw = top ? inputAggregation(top) : nullptr;
+  if (!raw) {
     return std::nullopt;
   }
   auto input = readRelation(raw->sources()[0].get());
@@ -374,14 +630,26 @@ std::optional<Aggregation> readAggregation(const core::PlanNode* node) {
     return std::nullopt;
   }
   Aggregation aggregation;
+  std::map<std::string, std::string> named;
   for (const auto& key : raw->groupingKeys()) {
     aggregation.keys.push_back(canonical(key, input->columns));
+    named[key->name()] = aggregation.keys.back();
+    aggregation.outputs.push_back(aggregation.keys.back());
   }
-  for (const auto& aggregate : raw->aggregates()) {
+  for (size_t i = 0; i < raw->aggregates().size(); ++i) {
+    const auto& aggregate = raw->aggregates()[i];
     if (aggregate.mask || aggregate.distinct || !aggregate.sortingKeys.empty()) {
       return std::nullopt;
     }
     aggregation.aggregates.push_back(canonical(aggregate.call, input->columns));
+    named[raw->aggregateNames()[i]] = aggregation.aggregates.back();
+    aggregation.outputs.push_back(aggregation.aggregates.back());
+  }
+  if (project) {
+    aggregation.outputs.clear();
+    for (const auto& projection : project->projections()) {
+      aggregation.outputs.push_back(canonical(projection, named));
+    }
   }
   aggregation.input = std::move(*input);
   return aggregation;
@@ -416,6 +684,13 @@ int64_t storedMax(const Range& range, int32_t scale, int64_t unbounded) {
 constexpr int64_t kUnbounded = 1LL << 30;
 
 bool rangesOnly(const Aggregation& aggregation, const std::set<std::string>& columns) {
+  const Relation& input = aggregation.input;
+  std::vector<std::string> plain = aggregation.keys;
+  plain.insert(plain.end(), aggregation.aggregates.begin(), aggregation.aggregates.end());
+  if (!input.values.empty() || !input.joins.empty() || !input.residuals.empty() || !input.disjunctions.empty() ||
+      aggregation.outputs != plain) {
+    return false;
+  }
   for (const auto& [column, range] : aggregation.input.ranges) {
     if (!columns.count(column)) {
       return false;
@@ -440,7 +715,7 @@ std::optional<QueryParams> matchQ1(const Aggregation& aggregation, ColumnStore& 
       "avg(l_extendedprice)",
       "avg(l_discount)",
       "count()"};
-  if (aggregation.input.table != "lineitem" || aggregation.keys != kKeys || aggregation.aggregates != kAggregates ||
+  if (aggregation.input.tables != std::set<std::string>{"lineitem"} || aggregation.keys != kKeys || aggregation.aggregates != kAggregates ||
       !rangesOnly(aggregation, {"l_shipdate"})) {
     return std::nullopt;
   }
@@ -455,7 +730,7 @@ std::optional<QueryParams> matchQ1(const Aggregation& aggregation, ColumnStore& 
 
 std::optional<QueryParams> matchQ6(const Aggregation& aggregation, ColumnStore& store) {
   static const std::vector<std::string> kAggregates = {"sum(multiply(l_extendedprice,l_discount))"};
-  if (aggregation.input.table != "lineitem" || !aggregation.keys.empty() || aggregation.aggregates != kAggregates ||
+  if (aggregation.input.tables != std::set<std::string>{"lineitem"} || !aggregation.keys.empty() || aggregation.aggregates != kAggregates ||
       !rangesOnly(aggregation, {"l_shipdate", "l_discount", "l_quantity"})) {
     return std::nullopt;
   }
@@ -476,12 +751,254 @@ std::optional<QueryParams> matchQ6(const Aggregation& aggregation, ColumnStore& 
   return params;
 }
 
+/// Matches `text` against `pattern`, where each `?` in the pattern stands
+/// for one literal: a quoted string, given without its quotes, or a number.
+std::optional<std::vector<std::string>> matchPattern(const std::string& text, const std::string& pattern) {
+  std::vector<std::string> literals;
+  size_t t = 0;
+  for (size_t p = 0; p < pattern.size(); ++p) {
+    if (pattern[p] != '?') {
+      if (t >= text.size() || text[t] != pattern[p]) {
+        return std::nullopt;
+      }
+      ++t;
+      continue;
+    }
+    if (t < text.size() && text[t] == '\'') {
+      const size_t close = text.find('\'', t + 1);
+      if (close == std::string::npos) {
+        return std::nullopt;
+      }
+      literals.push_back(text.substr(t + 1, close - t - 1));
+      t = close + 1;
+    } else {
+      const size_t end = text.find_first_not_of("0123456789.-e", t);
+      if (end == t) {
+        return std::nullopt;
+      }
+      literals.push_back(text.substr(t, end - t));
+      t = end == std::string::npos ? text.size() : end;
+    }
+  }
+  if (t != text.size()) {
+    return std::nullopt;
+  }
+  return literals;
+}
+
+/// SQL LIKE with % and _, and no escapes.
+bool likeMatches(const char* value, const char* pattern) {
+  if (*pattern == '\0') {
+    return *value == '\0';
+  }
+  if (*pattern == '%') {
+    for (const char* rest = value;; ++rest) {
+      if (likeMatches(rest, pattern + 1)) {
+        return true;
+      }
+      if (*rest == '\0') {
+        return false;
+      }
+    }
+  }
+  return *value != '\0' && (*pattern == '_' || *pattern == *value) && likeMatches(value + 1, pattern + 1);
+}
+
+/// The dictionary codes of table.column whose values `keep` accepts, or
+/// nothing when the column has no dictionary small enough for a CodeSet.
+template <typename Keep>
+std::optional<CodeSet> codesWhere(ColumnStore& store, const std::string& table, const std::string& column, Keep keep) {
+  const Column& meta = store.metadata(table, column);
+  if (meta.dictionary.empty() || meta.dictionary.size() > 256) {
+    return std::nullopt;
+  }
+  CodeSet codes;
+  for (size_t i = 0; i < meta.dictionary.size(); ++i) {
+    if (keep(meta.dictionary[i])) {
+      codes.add(i);
+    }
+  }
+  return codes;
+}
+
+std::optional<CodeSet>
+codesOf(ColumnStore& store, const std::string& table, const std::string& column, const std::set<std::string>& values) {
+  return codesWhere(store, table, column, [&](const std::string& value) { return values.count(value) > 0; });
+}
+
+/// The one value a value set admits.
+std::optional<std::string> onlyValue(const Relation& relation, const std::string& column) {
+  auto it = relation.values.find(column);
+  if (it == relation.values.end() || it->second.size() != 1) {
+    return std::nullopt;
+  }
+  return *it->second.begin();
+}
+
+template <typename T>
+std::set<std::string> keysOf(const std::map<std::string, T>& map) {
+  std::set<std::string> keys;
+  for (const auto& entry : map) {
+    keys.insert(entry.first);
+  }
+  return keys;
+}
+
+const Range* rangeIn(const Relation& relation, const std::string& column) {
+  auto it = relation.ranges.find(column);
+  return it == relation.ranges.end() ? nullptr : &it->second;
+}
+
+std::optional<QueryParams> matchQ4(const Aggregation& aggregation, ColumnStore& /*store*/) {
+  const Relation& input = aggregation.input;
+  if (input.tables != std::set<std::string>{"lineitem", "orders"} ||
+      aggregation.keys != std::vector<std::string>{"o_orderpriority"} ||
+      aggregation.aggregates != std::vector<std::string>{"count()"} ||
+      aggregation.outputs != std::vector<std::string>{"o_orderpriority", "count()"} ||
+      input.joins != std::vector<std::string>{"distinct(l_orderkey)", "right_semi(l_orderkey=o_orderkey)"} ||
+      input.residuals != std::vector<std::string>{"lt(l_commitdate,l_receiptdate)"} || !input.values.empty() ||
+      !input.disjunctions.empty() || keysOf(input.ranges) != std::set<std::string>{"o_orderdate"}) {
+    return std::nullopt;
+  }
+  const Range& orderdate = input.ranges.at("o_orderdate");
+  QueryParams params;
+  params.values["orderdate_min"] = storedMin(orderdate, 0, -kUnbounded);
+  params.values["orderdate_max"] = storedMax(orderdate, 0, kUnbounded);
+  return params;
+}
+
+std::optional<QueryParams> matchQ12(const Aggregation& aggregation, ColumnStore& store) {
+  const Relation& input = aggregation.input;
+  if (input.tables != std::set<std::string>{"lineitem", "orders"} ||
+      aggregation.keys != std::vector<std::string>{"l_shipmode"} || aggregation.aggregates.size() != 2 ||
+      aggregation.outputs.size() != 3 || input.joins != std::vector<std::string>{"inner(o_orderkey=l_orderkey)"} ||
+      std::set<std::string>(input.residuals.begin(), input.residuals.end()) !=
+          std::set<std::string>{"lt(l_commitdate,l_receiptdate)", "lt(l_shipdate,l_commitdate)"} ||
+      keysOf(input.values) != std::set<std::string>{"l_shipmode"} || !input.disjunctions.empty()) {
+    return std::nullopt;
+  }
+  auto high = matchPattern(
+      aggregation.aggregates[0], "sum(if(or(eq(o_orderpriority,?),eq(o_orderpriority,?)),1,0))");
+  auto low = matchPattern(
+      aggregation.aggregates[1], "sum(if(and(neq(o_orderpriority,?),neq(o_orderpriority,?)),1,0))");
+  if (!high || !low || std::set<std::string>(high->begin(), high->end()) != std::set<std::string>(low->begin(), low->end())) {
+    return std::nullopt;
+  }
+  const Range* receipt = rangeIn(input, "l_receiptdate");
+  if (!receipt) {
+    return std::nullopt;
+  }
+  const int64_t receiptMax = storedMax(*receipt, 0, kUnbounded);
+  // Lines also need ship < commit < receipt, so bounds on the ship and commit
+  // dates that those and the receipt bound imply change nothing.
+  for (const auto& [column, implied] : std::map<std::string, int64_t>{
+           {"l_receiptdate", receiptMax}, {"l_commitdate", receiptMax - 1}, {"l_shipdate", receiptMax - 2}}) {
+    const Range* range = rangeIn(input, column);
+    if (range && column != "l_receiptdate" && (range->hasMin() || storedMax(*range, 0, kUnbounded) < implied)) {
+      return std::nullopt;
+    }
+  }
+  if (keysOf(input.ranges).size() > 3) {
+    return std::nullopt;
+  }
+  for (const auto& column : keysOf(input.ranges)) {
+    if (column != "l_receiptdate" && column != "l_commitdate" && column != "l_shipdate") {
+      return std::nullopt;
+    }
+  }
+  auto modes = codesOf(store, "lineitem", "l_shipmode", input.values.at("l_shipmode"));
+  auto priorities = codesOf(store, "orders", "o_orderpriority", {high->begin(), high->end()});
+  if (!modes || !priorities) {
+    return std::nullopt;
+  }
+  QueryParams params;
+  params.values["receiptdate_min"] = storedMin(*receipt, 0, -kUnbounded);
+  params.values["receiptdate_max"] = receiptMax;
+  putCodes(params, "shipmodes", *modes);
+  putCodes(params, "high_priorities", *priorities);
+  return params;
+}
+
+std::optional<QueryParams> matchQ14(const Aggregation& aggregation, ColumnStore& store) {
+  static const std::string kRevenue = "multiply(l_extendedprice,minus(1,l_discount))";
+  const Relation& input = aggregation.input;
+  if (input.tables != std::set<std::string>{"lineitem", "part"} || !aggregation.keys.empty() ||
+      aggregation.aggregates.size() != 2 || aggregation.aggregates[0] != "sum(" + kRevenue + ")" ||
+      input.joins != std::vector<std::string>{"inner(l_partkey=p_partkey)"} || !input.residuals.empty() ||
+      !input.values.empty() || !input.disjunctions.empty() ||
+      keysOf(input.ranges) != std::set<std::string>{"l_shipdate"} || aggregation.outputs.size() != 1) {
+    return std::nullopt;
+  }
+  auto like = matchPattern(aggregation.aggregates[1], "sum(if(like(p_type,?)," + kRevenue + ",0))");
+  if (!like ||
+      aggregation.outputs[0] != "divide(multiply(100," + aggregation.aggregates[1] + ")," + aggregation.aggregates[0] + ")") {
+    return std::nullopt;
+  }
+  const std::string pattern = (*like)[0];
+  auto promo = codesWhere(store, "part", "p_type", [&](const std::string& value) {
+    return likeMatches(value.c_str(), pattern.c_str());
+  });
+  if (!promo) {
+    return std::nullopt;
+  }
+  const Range& shipdate = input.ranges.at("l_shipdate");
+  QueryParams params;
+  params.values["shipdate_min"] = storedMin(shipdate, 0, -kUnbounded);
+  params.values["shipdate_max"] = storedMax(shipdate, 0, kUnbounded);
+  putCodes(params, "promo_types", *promo);
+  return params;
+}
+
+std::optional<QueryParams> matchQ19(const Aggregation& aggregation, ColumnStore& store) {
+  const Relation& input = aggregation.input;
+  if (input.tables != std::set<std::string>{"lineitem", "part"} || !aggregation.keys.empty() ||
+      aggregation.aggregates != std::vector<std::string>{"sum(multiply(l_extendedprice,minus(1,l_discount)))"} ||
+      aggregation.outputs != aggregation.aggregates ||
+      input.joins != std::vector<std::string>{"inner(l_partkey=p_partkey)"} || !input.residuals.empty() ||
+      !input.ranges.empty() || keysOf(input.values) != std::set<std::string>{"l_shipinstruct", "l_shipmode"} ||
+      input.disjunctions.size() != 1 || input.disjunctions[0].size() != 3) {
+    return std::nullopt;
+  }
+  auto instruct = onlyValue(input, "l_shipinstruct");
+  auto modes = codesOf(store, "lineitem", "l_shipmode", input.values.at("l_shipmode"));
+  if (!instruct || !modes) {
+    return std::nullopt;
+  }
+  const int32_t quantityScale = store.metadata("lineitem", "l_quantity").scale;
+  QueryParams params;
+  params.values["shipinstruct"] = store.metadata("lineitem", "l_shipinstruct").code(*instruct);
+  putCodes(params, "shipmodes", *modes);
+  for (size_t b = 0; b < 3; ++b) {
+    const Relation& branch = input.disjunctions[0][b];
+    const Range* quantity = rangeIn(branch, "l_quantity");
+    const Range* size = rangeIn(branch, "p_size");
+    auto brand = onlyValue(branch, "p_brand");
+    if (keysOf(branch.ranges) != std::set<std::string>{"l_quantity", "p_size"} ||
+        keysOf(branch.values) != std::set<std::string>{"p_brand", "p_container"} || !brand) {
+      return std::nullopt;
+    }
+    auto containers = codesOf(store, "part", "p_container", branch.values.at("p_container"));
+    if (!containers) {
+      return std::nullopt;
+    }
+    const std::string n = std::to_string(b);
+    params.values["brand" + n] = store.metadata("part", "p_brand").code(*brand);
+    putCodes(params, "containers" + n, *containers);
+    params.values["quantity_min" + n] = storedMin(*quantity, quantityScale, -kUnbounded);
+    params.values["quantity_max" + n] = storedMax(*quantity, quantityScale, kUnbounded);
+    params.values["size_min" + n] = storedMin(*size, 0, -kUnbounded);
+    params.values["size_max" + n] = storedMax(*size, 0, kUnbounded);
+  }
+  return params;
+}
+
 struct QueryMatcher {
   int32_t query;
   std::optional<QueryParams> (*match)(const Aggregation&, ColumnStore&);
 };
 
-const QueryMatcher kMatchers[] = {{1, matchQ1}, {6, matchQ6}};
+const QueryMatcher kMatchers[] = {
+    {1, matchQ1}, {4, matchQ4}, {6, matchQ6}, {12, matchQ12}, {14, matchQ14}, {19, matchQ19}};
 
 /// `node` with its sources replaced, for the node types a fused query is
 /// placed under; null for any other.
@@ -507,15 +1024,74 @@ core::PlanNodePtr withSources(const core::PlanNodePtr& node, const std::vector<c
   return nullptr;
 }
 
-core::PlanNodePtr rewrite(const core::PlanNodePtr& node, ColumnStore& store, std::vector<std::string>* log) {
-  if (auto aggregation = readAggregation(node.get())) {
-    for (const auto& matcher : kMatchers) {
-      if (auto params = matcher.match(*aggregation, store)) {
-        if (log) {
-          log->push_back(fmt::format("plan node {} ({}) becomes fused q{}", node->id(), node->name(), matcher.query));
-        }
-        return std::make_shared<FusedQueryNode>(node->id(), matcher.query, std::move(*params), node->outputType());
+std::string describeFilters(const Relation& input, const std::string& indent) {
+  std::string text;
+  for (const auto& [column, range] : input.ranges) {
+    text += fmt::format(
+        "{}range: {} {}{}, {}{}\n",
+        indent,
+        column,
+        range.minExclusive ? "(" : "[",
+        range.hasMin() ? fmt::format("{}", static_cast<double>(range.min)) : "-inf",
+        range.hasMax() ? fmt::format("{}", static_cast<double>(range.max)) : "inf",
+        range.maxExclusive ? ")" : "]");
+  }
+  for (const auto& [column, values] : input.values) {
+    text += fmt::format("{}values: {} {{{}}}\n", indent, column, fmt::join(values, ", "));
+  }
+  for (const auto& residual : input.residuals) {
+    text += fmt::format("{}residual: {}\n", indent, residual);
+  }
+  for (const auto& branches : input.disjunctions) {
+    text += indent + "or:\n";
+    for (const auto& branch : branches) {
+      text += indent + "  branch:\n" + describeFilters(branch, indent + "    ");
+    }
+  }
+  return text;
+}
+
+std::string describe(const Aggregation& aggregation) {
+  const Relation& input = aggregation.input;
+  return fmt::format(
+             "tables: {}\nkeys: {}\naggregates: {}\noutputs: {}\njoins: {}\n",
+             fmt::join(input.tables, " "),
+             fmt::join(aggregation.keys, " | "),
+             fmt::join(aggregation.aggregates, " | "),
+             fmt::join(aggregation.outputs, " | "),
+             fmt::join(input.joins, " ")) +
+      describeFilters(input, "");
+}
+
+std::optional<std::pair<int32_t, QueryParams>> match(const Aggregation& aggregation, ColumnStore& store) {
+  for (const auto& matcher : kMatchers) {
+    if (auto params = matcher.match(aggregation, store)) {
+      if (std::getenv("SV_EXPLAIN_MATCH")) {
+        LOG(INFO) << "q" << matcher.query << " params: " << fmt::format("{}", fmt::join(params->values, " "));
       }
+      return std::make_pair(matcher.query, std::move(*params));
+    }
+  }
+  if (std::getenv("SV_EXPLAIN_MATCH")) {
+    LOG(INFO) << "Unmatched aggregation:\n" << describe(aggregation);
+  }
+  return std::nullopt;
+}
+
+core::PlanNodePtr rewrite(const core::PlanNodePtr& node, ColumnStore& store, std::vector<std::string>* log) {
+  std::optional<Aggregation> aggregation;
+  if (const auto* project = dynamic_cast<const core::ProjectNode*>(node.get())) {
+    aggregation = readAggregation(skipLocalExchanges(project->sources()[0].get()), project);
+  }
+  if (!aggregation) {
+    aggregation = readAggregation(node.get());
+  }
+  if (aggregation) {
+    if (auto matched = match(*aggregation, store)) {
+      if (log) {
+        log->push_back(fmt::format("plan node {} ({}) becomes fused q{}", node->id(), node->name(), matched->first));
+      }
+      return std::make_shared<FusedQueryNode>(node->id(), matched->first, std::move(matched->second), node->outputType());
     }
   }
   std::vector<core::PlanNodePtr> sources;
