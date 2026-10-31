@@ -20,7 +20,9 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
+#include "velox/experimental/supervelox/queries/Derived.h"
 #include "velox/experimental/supervelox/queries/Query.h"
 
 // Versions of the fused queries built only from cuDF operators: the JIT
@@ -57,9 +59,32 @@ struct ZoneSplit {
 ZoneSplit
 splitZones(QueryContext& ctx, const std::string& table, const std::string& name, int64_t low, int64_t high);
 
+/// A zero-copy view of `rows` values of type `type` at `data`.
+cudf::column_view deviceView(cudf::type_id type, const void* data, int64_t rows);
+
 /// LTO-IR of CUDA source using the bundled cuDF headers, compiled once per
 /// distinct source.
 const cudf::compiled_fragment& compileFragment(const std::string& source);
+
+/// A device expression true when `code` is one of `codes`.
+std::string codeTest(const std::string& code, const CodeSet& codes);
+
+/// A reduction of rows to int64 sums in a dense table of groups, generated
+/// as one reduce_lto. `inputs` declares one device parameter per input
+/// column; `filter`, `group` and `values` are device expressions over them,
+/// after the statements of `prelude`.
+struct GroupedSums {
+  std::string inputs;
+  std::string filter;
+  std::string prelude;
+  std::string group = "0";
+  int32_t groups = 1;
+  std::vector<std::string> values;
+};
+
+/// The sums, `groups` times `values.size()`, group-major.
+std::vector<int64_t>
+sumGroups(QueryContext& ctx, const GroupedSums& sums, const std::vector<cudf::column_view>& columns);
 
 /// Registers the cuDF versions of the queries and makes cuDF allocate from
 /// the CUDA default memory pool the engine pre-grows.

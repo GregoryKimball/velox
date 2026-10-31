@@ -64,7 +64,11 @@ if(VELOX_ENABLE_CUDF)
     velox_supervelox_cudf
     cudf/CudfBackend.cpp
     cudf/CudfQ01.cpp
+    cudf/CudfQ04.cpp
     cudf/CudfQ06.cpp
+    cudf/CudfQ12.cpp
+    cudf/CudfQ14.cpp
+    cudf/CudfQ19.cpp
   )
   target_link_libraries(velox_supervelox_cudf velox_supervelox cudf::cudf fmt::fmt)
   target_link_libraries(sv_bench velox_supervelox_cudf)

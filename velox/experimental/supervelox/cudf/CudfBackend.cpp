@@ -15,6 +15,7 @@
  */
 #include "velox/experimental/supervelox/cudf/CudfBackend.h"
 
+#include <cudf/reduction.hpp>
 #include <rmm/mr/cuda_async_view_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
@@ -29,7 +30,11 @@
 namespace facebook::velox::supervelox::cudf_backend {
 
 Result q1(QueryContext& ctx);
+Result q4(QueryContext& ctx);
 Result q6(QueryContext& ctx);
+Result q12(QueryContext& ctx);
+Result q14(QueryContext& ctx);
+Result q19(QueryContext& ctx);
 
 namespace {
 
@@ -132,6 +137,93 @@ splitZones(QueryContext& ctx, const std::string& table, const std::string& name,
   return split;
 }
 
+cudf::column_view deviceView(cudf::type_id type, const void* data, int64_t rows) {
+  if (rows > std::numeric_limits<cudf::size_type>::max()) {
+    throw std::invalid_argument("cuDF columns hold at most 2^31 - 1 rows");
+  }
+  return cudf::column_view(cudf::data_type{type}, static_cast<cudf::size_type>(rows), data, nullptr, 0);
+}
+
+std::string codeTest(const std::string& code, const CodeSet& codes) {
+  std::string test;
+  for (int32_t c = 0; c < 256; ++c) {
+    if (codes.contains(c)) {
+      test += (test.empty() ? "" : " || ") + code + " == " + std::to_string(c);
+    }
+  }
+  return test.empty() ? "false" : "(" + test + ")";
+}
+
+std::vector<int64_t>
+sumGroups(QueryContext& ctx, const GroupedSums& sums, const std::vector<cudf::column_view>& columns) {
+  const int32_t fields = sums.groups * static_cast<int32_t>(sums.values.size());
+  auto list = [&](const std::string& type, const std::string& prefix) {
+    std::string text;
+    for (int32_t i = 0; i < fields; ++i) {
+      text += (i ? ", " : "") + type + " " + prefix + std::to_string(i);
+    }
+    return text;
+  };
+  std::string source = R"(
+#include <cudf/errc.hpp>
+#include <cudf/types.hpp>
+#include <cuda/std/cstdint>
+
+using cudf::errc;
+using cudf::size_type;
+using namespace cuda::std;
+
+extern "C" {
+)";
+  source += "__device__ errc sums_filter(size_type, bool* keep, " + sums.inputs + ") {\n" + sums.prelude +
+      "  *keep = " + sums.filter + ";\n  return errc::SUCCESS;\n}\n";
+  source += "__device__ errc sums_init(" + list("int64_t*", "s") + ") {\n";
+  for (int32_t i = 0; i < fields; ++i) {
+    source += "  *s" + std::to_string(i) + " = 0;\n";
+  }
+  source += "  return errc::SUCCESS;\n}\n";
+  source += "__device__ errc sums_update(size_type, " + list("int64_t*", "s") + ", " + sums.inputs + ") {\n" +
+      sums.prelude + "  const int group = " + sums.group + ";\n";
+  for (size_t k = 0; k < sums.values.size(); ++k) {
+    source += "  const int64_t v" + std::to_string(k) + " = " + sums.values[k] + ";\n";
+  }
+  for (int32_t g = 0; g < sums.groups; ++g) {
+    source += sums.groups == 1 ? "  {\n" : "  if (group == " + std::to_string(g) + ") {\n";
+    for (size_t k = 0; k < sums.values.size(); ++k) {
+      source += "    *s" + std::to_string(g * sums.values.size() + k) + " += v" + std::to_string(k) + ";\n";
+    }
+    source += "  }\n";
+  }
+  source += "  return errc::SUCCESS;\n}\n";
+  source += "__device__ errc sums_merge(" + list("int64_t*", "d") + ", " + list("int64_t", "s") + ") {\n";
+  for (int32_t i = 0; i < fields; ++i) {
+    source += "  *d" + std::to_string(i) + " += s" + std::to_string(i) + ";\n";
+  }
+  source += "  return errc::SUCCESS;\n}\n";
+  source += "__device__ errc sums_finalize(" + list("int64_t*", "o") + ", " + list("int64_t", "s") + ") {\n";
+  for (int32_t i = 0; i < fields; ++i) {
+    source += "  *o" + std::to_string(i) + " = s" + std::to_string(i) + ";\n";
+  }
+  source += "  return errc::SUCCESS;\n}\n}\n";
+
+  std::vector<int64_t> totals(fields, 0);
+  if (columns.empty() || columns[0].size() == 0) {
+    return totals;
+  }
+  const auto& fragment = compileFragment(source);
+  const std::vector<cudf::reduce_input> inputs(columns.begin(), columns.end());
+  const cudf::lto_fragment fragments[] = {{cudf::lto_binary_type::LTO_IR, fragment.view()}};
+  const cudf::reduce_udf udf{fragments, "sums_init", "sums_update", "sums_merge", "sums_finalize", "sums_filter"};
+  const std::vector<cudf::data_type> types(fields, cudf::data_type{cudf::type_id::INT64});
+  auto results = cudf::reduce_lto(udf, cudf::null_aware::NO, inputs, types, types, ctx.stream());
+  for (int32_t i = 0; i < fields; ++i) {
+    SV_CUDA(cudaMemcpyAsync(
+        &totals[i], results[i]->view().head(), sizeof(int64_t), cudaMemcpyDeviceToHost, ctx.stream()));
+  }
+  SV_CUDA(cudaStreamSynchronize(ctx.stream()));
+  return totals;
+}
+
 const cudf::compiled_fragment& compileFragment(const std::string& source) {
   static std::mutex mutex;
   static std::map<std::string, cudf::compiled_fragment> fragments;
@@ -148,7 +240,11 @@ void registerCudfBackend() {
   SV_CUDA(cudaDeviceGetDefaultMemPool(&pool, 0));
   rmm::mr::set_current_device_resource(rmm::mr::cuda_async_view_memory_resource(pool));
   registerImplementation(Backend::kCudf, 1, q1);
+  registerImplementation(Backend::kCudf, 4, q4);
   registerImplementation(Backend::kCudf, 6, q6);
+  registerImplementation(Backend::kCudf, 12, q12);
+  registerImplementation(Backend::kCudf, 14, q14);
+  registerImplementation(Backend::kCudf, 19, q19);
 }
 
 } // namespace facebook::velox::supervelox::cudf_backend
