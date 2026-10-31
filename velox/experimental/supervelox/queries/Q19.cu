@@ -42,6 +42,7 @@ struct Q19Args {
   const int8_t* brand;
   const int8_t* container;
   const int8_t* size;
+  int64_t firstRow;
   int64_t rows;
   int32_t instruct;
   CodeSet modes;
@@ -68,7 +69,7 @@ __device__ __forceinline__ long long q19Row(const Q19Args& a, int64_t row) {
 __global__ void __launch_bounds__(kThreads) q19Kernel(Q19Args a) {
   long long sum = 0;
   const int64_t stride = (int64_t)gridDim.x * kThreads * kRowsPerThread;
-  for (int64_t row = (blockIdx.x * (int64_t)kThreads + threadIdx.x) * kRowsPerThread; row < a.rows; row += stride) {
+  for (int64_t row = a.firstRow + (blockIdx.x * (int64_t)kThreads + threadIdx.x) * kRowsPerThread; row < a.rows; row += stride) {
     if (row + kRowsPerThread <= a.rows) {
       int8_t instruct[kRowsPerThread];
       int8_t mode[kRowsPerThread];
@@ -142,7 +143,17 @@ Result q19(QueryContext& ctx) {
         static_cast<int32_t>(ctx.param("size_max" + n, d.sizeHigh))};
   }
   a.revenue = ctx.zeroed<unsigned long long>(1);
-  q19Kernel<<<persistentBlocks(q19Kernel, kThreads), kThreads, 0, ctx.stream()>>>(a);
+  forBatches(
+      ctx,
+      0,
+      ctx.rows("lineitem"),
+      [&](int64_t first, int64_t last) {
+        a.firstRow = first;
+        a.rows = last;
+        q19Kernel<<<persistentBlocks(q19Kernel, kThreads), kThreads, 0, ctx.stream()>>>(a);
+      },
+      1,
+      QueryContext::kZoneRows);
   SV_CUDA(cudaGetLastError());
   Result result(kSchema);
   result.decimals[0].push_back(ctx.download(a.revenue, 1)[0]);

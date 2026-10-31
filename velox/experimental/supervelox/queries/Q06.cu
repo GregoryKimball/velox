@@ -28,6 +28,8 @@ struct Q6Args {
   const int32_t* price;
   const int2* zones;
   int64_t rows;
+  int64_t firstZone;
+  int64_t lastZone;
   int32_t dateLow;
   int32_t dateHigh;
   int32_t discountLow;
@@ -79,9 +81,8 @@ __device__ __forceinline__ long long q6Rows(const Q6Args& a, int64_t row, int64_
 
 __global__ void __launch_bounds__(kThreads) q6Kernel(Q6Args a, unsigned long long* out) {
   constexpr int64_t kZone = QueryContext::kZoneRows;
-  const int64_t zoneCount = (a.rows + kZone - 1) / kZone;
   long long sum = 0;
-  for (int64_t zone = blockIdx.x; zone < zoneCount; zone += gridDim.x) {
+  for (int64_t zone = a.firstZone + blockIdx.x; zone < a.lastZone; zone += gridDim.x) {
     const int2 range = a.zones[zone];
     if (range.y < a.dateLow || range.x >= a.dateHigh) {
       continue;
@@ -115,7 +116,17 @@ Result q6(QueryContext& ctx) {
   a.discountHigh = ctx.param("discount_max", 7);
   a.quantityLimit = ctx.param("quantity_max", 2399) + 1;
   auto* sum = ctx.zeroed<unsigned long long>(1);
-  q6Kernel<<<persistentBlocks(q6Kernel, kThreads), kThreads, 0, ctx.stream()>>>(a, sum);
+  constexpr int64_t kZone = QueryContext::kZoneRows;
+  forBatches(
+      ctx,
+      0,
+      (a.rows + kZone - 1) / kZone,
+      [&](int64_t first, int64_t last) {
+        a.firstZone = first;
+        a.lastZone = last;
+        q6Kernel<<<persistentBlocks(q6Kernel, kThreads), kThreads, 0, ctx.stream()>>>(a, sum);
+      },
+      kZone);
   SV_CUDA(cudaGetLastError());
   Result result(kSchema);
   result.decimals[0].push_back(ctx.download(sum, 1)[0]);

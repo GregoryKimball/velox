@@ -64,7 +64,10 @@ DEFINE_string(backend, "handwritten", "Who runs the fused queries: handwritten, 
 DEFINE_string(query_backends, "", "Per-query backends overriding --backend, as 1=cudf,6=handwritten");
 DEFINE_bool(compare_handwritten, false, "Also run each query with the hand-written kernels and compare answers");
 DEFINE_string(meld_library, "", "libmeld-velox.so to load for the meld backend");
-
+DEFINE_int64(
+    batch_rows,
+    0,
+    "Run the hand-written kernels batch by batch, about this many lineitem rows a batch; 0 runs each kernel once");
 using namespace facebook::velox;
 using namespace facebook::velox::supervelox;
 using exec::test::PlanBuilder;
@@ -236,6 +239,7 @@ int main(int argc, char** argv) {
       static_cast<size_t>(FLAGS_cache_gb * (1ULL << 30)),
       static_cast<size_t>(FLAGS_stage_gb * (1ULL << 30)));
   Engine::setInstance(&engine);
+  setBatchRows(FLAGS_batch_rows);
 #ifdef SUPERVELOX_CUDF
   cudf_backend::registerCudfBackend();
 #endif

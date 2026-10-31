@@ -30,6 +30,7 @@ struct Q21Args {
   const int16_t* commitdate;
   const int16_t* receiptdate;
   const int8_t* supplierNation;
+  int64_t firstOrder;
   int64_t orders;
   int32_t statusCode;
   int32_t nation;
@@ -37,7 +38,7 @@ struct Q21Args {
 };
 
 __global__ void q21Kernel(Q21Args a) {
-  for (int64_t o = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; o < a.orders; o += (int64_t)gridDim.x * blockDim.x) {
+  for (int64_t o = a.firstOrder + blockIdx.x * (int64_t)blockDim.x + threadIdx.x; o < a.orders; o += (int64_t)gridDim.x * blockDim.x) {
     if (a.status[o] != a.statusCode) {
       continue;
     }
@@ -95,12 +96,20 @@ Result q21(QueryContext& ctx) {
   a.commitdate = ctx.col<int16_t>("lineitem", "l_commitdate");
   a.receiptdate = ctx.col<int16_t>("lineitem", "l_receiptdate");
   a.supplierNation = ctx.col<int8_t>("supplier", "s_nationkey");
-  a.orders = ctx.rows("orders");
   a.statusCode = ctx.meta("orders", "o_orderstatus").code("F");
   a.nation = nationKey(ctx, "SAUDI ARABIA");
   const int64_t suppliers = ctx.rows("supplier");
   a.counts = ctx.zeroed<unsigned long long>(suppliers);
-  q21Kernel<<<4096, 256, 0, ctx.stream()>>>(a);
+  forBatches(
+      ctx,
+      0,
+      ctx.rows("orders"),
+      [&](int64_t first, int64_t last) {
+        a.firstOrder = first;
+        a.orders = last;
+        q21Kernel<<<4096, 256, 0, ctx.stream()>>>(a);
+      },
+      4);
   SV_CUDA(cudaGetLastError());
   auto candidates = topCandidates(ctx, reinterpret_cast<const int64_t*>(a.counts), suppliers, 100);
   const Column& name = ctx.meta("supplier", "s_name");

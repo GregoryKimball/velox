@@ -17,6 +17,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 
 #include "velox/experimental/supervelox/common/Cuda.h"
@@ -104,6 +105,24 @@ int persistentBlocks(Kernel kernel, int threads, size_t sharedBytes = 0) {
   int perSm = 0;
   SV_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&perSm, kernel, threads, sharedBytes));
   return smCount * (perSm > 0 ? perSm : 1);
+}
+
+/// Calls run(first, last) for consecutive pieces of the items [begin, end):
+/// all of them at once unless batchRows() is set, else pieces of about
+/// batchRows() rows, counting each item as 'rowsPerItem' rows and cutting
+/// only at multiples of 'align' items. Waits for each piece before the next.
+template <typename Run>
+void forBatches(QueryContext& ctx, int64_t begin, int64_t end, Run run, int64_t rowsPerItem = 1, int64_t align = 1) {
+  const int64_t items = batchRows() / rowsPerItem;
+  if (items <= 0 || end - begin <= items) {
+    run(begin, end);
+    return;
+  }
+  const int64_t step = (items + align - 1) / align * align;
+  for (int64_t first = begin; first < end; first += step) {
+    run(first, std::min(end, first + step));
+    SV_CUDA(cudaStreamSynchronize(ctx.stream()));
+  }
 }
 
 } // namespace facebook::velox::supervelox

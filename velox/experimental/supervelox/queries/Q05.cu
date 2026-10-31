@@ -82,7 +82,17 @@ Result q5(QueryContext& ctx) {
   a.end = end;
   a.nations = nationsInRegion(ctx, "ASIA");
   a.revenue = ctx.zeroed<unsigned long long>(kNations);
-  q5Kernel<<<2048, 256, 0, ctx.stream()>>>(a);
+  const std::pair<int64_t, int64_t> all{a.begin, a.end};
+  forBatches(
+      ctx,
+      all.first,
+      all.second,
+      [&](int64_t first, int64_t last) {
+        a.begin = first;
+        a.end = last;
+        q5Kernel<<<2048, 256, 0, ctx.stream()>>>(a);
+      },
+      4);
   SV_CUDA(cudaGetLastError());
   auto revenue = ctx.download(a.revenue, kNations);
   Result result(kSchema);

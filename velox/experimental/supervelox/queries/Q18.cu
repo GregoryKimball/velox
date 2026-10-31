@@ -24,12 +24,13 @@ namespace {
 __global__ void q18Kernel(
     const uint32_t* starts,
     const int16_t* quantity,
-    int64_t orders,
+    int64_t begin,
+    int64_t end,
     int32_t limit,
     Candidate* out,
     unsigned long long* count,
     unsigned long long capacity) {
-  for (int64_t o = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; o < orders; o += (int64_t)gridDim.x * blockDim.x) {
+  for (int64_t o = begin + blockIdx.x * (int64_t)blockDim.x + threadIdx.x; o < end; o += (int64_t)gridDim.x * blockDim.x) {
     int sum = 0;
     for (uint32_t line = starts[o]; line < starts[o + 1]; ++line) {
       sum += quantity[line];
@@ -60,7 +61,14 @@ Result q18(QueryContext& ctx) {
   for (unsigned long long capacity = 1 << 16;; capacity *= 16) {
     auto* out = ctx.scratch<Candidate>(capacity);
     auto* count = ctx.zeroed<unsigned long long>(1);
-    q18Kernel<<<4096, 256, 0, ctx.stream()>>>(starts, quantity, orders, 30000, out, count, capacity);
+    forBatches(
+        ctx,
+        0,
+        orders,
+        [&](int64_t first, int64_t last) {
+          q18Kernel<<<4096, 256, 0, ctx.stream()>>>(starts, quantity, first, last, 30000, out, count, capacity);
+        },
+        4);
     SV_CUDA(cudaGetLastError());
     const unsigned long long found = ctx.download(count, 1)[0];
     if (found <= capacity) {

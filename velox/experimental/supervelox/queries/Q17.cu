@@ -37,6 +37,7 @@ struct Q17Args {
   const int32_t* partkey;
   const int16_t* quantity;
   BitmapRanks parts;
+  int64_t firstRow;
   int64_t rows;
   unsigned* quantitySum;
   unsigned* lineCount;
@@ -57,7 +58,7 @@ __device__ __forceinline__ void q17Line(const Q17Args& a, int64_t row, int part)
 
 __global__ void __launch_bounds__(kThreads) q17Kernel(Q17Args a) {
   const int64_t stride = (int64_t)gridDim.x * kThreads * kRowsPerThread;
-  for (int64_t row = (blockIdx.x * (int64_t)kThreads + threadIdx.x) * kRowsPerThread; row < a.rows; row += stride) {
+  for (int64_t row = a.firstRow + (blockIdx.x * (int64_t)kThreads + threadIdx.x) * kRowsPerThread; row < a.rows; row += stride) {
     if (row + kRowsPerThread <= a.rows) {
       int32_t part[kRowsPerThread];
       loadVector(a.partkey + row, part);
@@ -117,7 +118,17 @@ Result q17(QueryContext& ctx) {
   // Lines per part are about rows / parts; leave room for skew.
   a.capacity = a.parts.count * (a.rows / parts + 1) * 2 + 1024;
   a.lines = ctx.scratch<uint32_t>(a.capacity);
-  q17Kernel<<<persistentBlocks(q17Kernel, kThreads), kThreads, 0, ctx.stream()>>>(a);
+  forBatches(
+      ctx,
+      0,
+      ctx.rows("lineitem"),
+      [&](int64_t first, int64_t last) {
+        a.firstRow = first;
+        a.rows = last;
+        q17Kernel<<<persistentBlocks(q17Kernel, kThreads), kThreads, 0, ctx.stream()>>>(a);
+      },
+      1,
+      QueryContext::kZoneRows);
   SV_CUDA(cudaGetLastError());
   const unsigned long long lineCount = ctx.download(a.lineTotal, 1)[0];
   if (lineCount > a.capacity) {

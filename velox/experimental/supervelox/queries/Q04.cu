@@ -63,14 +63,18 @@ Result q4(QueryContext& ctx) {
       ctx.param("orderdate_min", days(1993, 7, 1)),
       ctx.param("orderdate_max", days(1993, 10, 1) - 1) + 1);
   auto* counts = ctx.zeroed<unsigned long long>(kPriorities);
-  q4Kernel<<<1024, 256, 0, ctx.stream()>>>(
-      orderLineStarts(ctx),
-      ctx.col<int8_t>("orders", "o_orderpriority"),
-      ctx.col<int16_t>("lineitem", "l_commitdate"),
-      ctx.col<int16_t>("lineitem", "l_receiptdate"),
+  const uint32_t* starts = orderLineStarts(ctx);
+  const int8_t* priority = ctx.col<int8_t>("orders", "o_orderpriority");
+  const int16_t* commitdate = ctx.col<int16_t>("lineitem", "l_commitdate");
+  const int16_t* receiptdate = ctx.col<int16_t>("lineitem", "l_receiptdate");
+  forBatches(
+      ctx,
       begin,
       end,
-      counts);
+      [&](int64_t first, int64_t last) {
+        q4Kernel<<<1024, 256, 0, ctx.stream()>>>(starts, priority, commitdate, receiptdate, first, last, counts);
+      },
+      4);
   SV_CUDA(cudaGetLastError());
   auto host = ctx.download(counts, kPriorities);
   const auto& names = ctx.meta("orders", "o_orderpriority").dictionary;

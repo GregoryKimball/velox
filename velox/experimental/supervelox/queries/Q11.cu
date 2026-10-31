@@ -41,9 +41,9 @@ struct PartValue {
   }
 };
 
-__global__ void q11TotalKernel(PartValue value, int64_t parts, unsigned long long* total) {
+__global__ void q11TotalKernel(PartValue value, int64_t begin, int64_t end, unsigned long long* total) {
   unsigned long long sum = 0;
-  for (int64_t part = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; part < parts; part += (int64_t)gridDim.x * blockDim.x) {
+  for (int64_t part = begin + blockIdx.x * (int64_t)blockDim.x + threadIdx.x; part < end; part += (int64_t)gridDim.x * blockDim.x) {
     sum += value(part);
   }
   sum = warpSum(sum);
@@ -83,7 +83,12 @@ Result q11(QueryContext& ctx) {
   value.nation = nationKey(ctx, "GERMANY");
   const int64_t parts = ctx.rows("partsupp") / 4;
   auto* total = ctx.zeroed<unsigned long long>(1);
-  q11TotalKernel<<<2048, 256, 0, ctx.stream()>>>(value, parts, total);
+  forBatches(
+      ctx,
+      0,
+      parts,
+      [&](int64_t first, int64_t last) { q11TotalKernel<<<2048, 256, 0, ctx.stream()>>>(value, first, last, total); },
+      4);
   SV_CUDA(cudaGetLastError());
   AboveThreshold above{value, (__int128)ctx.download(total, 1)[0], ctx.rows("supplier")};
 

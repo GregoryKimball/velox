@@ -33,6 +33,8 @@ struct Q1Args {
   const int16_t* shipdate;
   const int2* zones;
   int64_t rows;
+  int64_t firstZone;
+  int64_t lastZone;
   int32_t dateLimit;
 };
 
@@ -113,9 +115,8 @@ __device__ __forceinline__ void q1Rows(const Q1Args& a, int64_t row, int64_t end
 
 __global__ void __launch_bounds__(kThreads) q1Kernel(Q1Args a, Totals* out) {
   constexpr int64_t kZone = QueryContext::kZoneRows;
-  const int64_t zoneCount = (a.rows + kZone - 1) / kZone;
   Accumulator acc;
-  for (int64_t zone = blockIdx.x; zone < zoneCount; zone += gridDim.x) {
+  for (int64_t zone = a.firstZone + blockIdx.x; zone < a.lastZone; zone += gridDim.x) {
     const int2 range = a.zones[zone];
     if (range.x > a.dateLimit) {
       continue;
@@ -198,7 +199,17 @@ Result q1(QueryContext& ctx) {
   a.rows = ctx.rows("lineitem");
   a.dateLimit = ctx.param("shipdate_max", days(1998, 9, 2));
   auto* totals = ctx.zeroed<Totals>(kGroups);
-  q1Kernel<<<persistentBlocks(q1Kernel, kThreads), kThreads, 0, ctx.stream()>>>(a, totals);
+  constexpr int64_t kZone = QueryContext::kZoneRows;
+  forBatches(
+      ctx,
+      0,
+      (a.rows + kZone - 1) / kZone,
+      [&](int64_t first, int64_t last) {
+        a.firstZone = first;
+        a.lastZone = last;
+        q1Kernel<<<persistentBlocks(q1Kernel, kThreads), kThreads, 0, ctx.stream()>>>(a, totals);
+      },
+      kZone);
   SV_CUDA(cudaGetLastError());
   auto host = ctx.download(totals, kGroups);
 

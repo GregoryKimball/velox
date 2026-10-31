@@ -30,6 +30,8 @@ struct Q15Args {
   const int8_t* discount;
   const int2* zones;
   int64_t rows;
+  int64_t firstZone;
+  int64_t lastZone;
   int32_t dateLow;
   int32_t dateHigh;
   unsigned long long* revenue;
@@ -37,8 +39,7 @@ struct Q15Args {
 
 __global__ void __launch_bounds__(kThreads) q15Kernel(Q15Args a) {
   constexpr int64_t kZone = QueryContext::kZoneRows;
-  const int64_t zoneCount = (a.rows + kZone - 1) / kZone;
-  for (int64_t zone = blockIdx.x; zone < zoneCount; zone += gridDim.x) {
+  for (int64_t zone = a.firstZone + blockIdx.x; zone < a.lastZone; zone += gridDim.x) {
     const int2 range = a.zones[zone];
     if (range.y < a.dateLow || range.x >= a.dateHigh) {
       continue;
@@ -73,7 +74,17 @@ Result q15(QueryContext& ctx) {
   a.dateHigh = days(1996, 4, 1);
   const int64_t suppliers = ctx.rows("supplier");
   a.revenue = ctx.zeroed<unsigned long long>(suppliers);
-  q15Kernel<<<persistentBlocks(q15Kernel, kThreads), kThreads, 0, ctx.stream()>>>(a);
+  constexpr int64_t kZone = QueryContext::kZoneRows;
+  forBatches(
+      ctx,
+      0,
+      (a.rows + kZone - 1) / kZone,
+      [&](int64_t first, int64_t last) {
+        a.firstZone = first;
+        a.lastZone = last;
+        q15Kernel<<<persistentBlocks(q15Kernel, kThreads), kThreads, 0, ctx.stream()>>>(a);
+      },
+      kZone);
   SV_CUDA(cudaGetLastError());
   auto candidates = topCandidates(ctx, reinterpret_cast<const int64_t*>(a.revenue), suppliers, 1);
   int64_t best = 0;

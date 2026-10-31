@@ -38,6 +38,7 @@ struct Q9Args {
   const int32_t* supplycost;
   const int8_t* supplierNation;
   const uint32_t* parts;
+  int64_t firstOrder;
   int64_t orders;
   unsigned long long* profit;
   unsigned long long* missing;
@@ -49,7 +50,7 @@ __global__ void q9Kernel(Q9Args a) {
     local[i] = 0;
   }
   __syncthreads();
-  for (int64_t o = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; o < a.orders; o += (int64_t)gridDim.x * blockDim.x) {
+  for (int64_t o = a.firstOrder + blockIdx.x * (int64_t)blockDim.x + threadIdx.x; o < a.orders; o += (int64_t)gridDim.x * blockDim.x) {
     const int year = yearOf(a.orderdate[o]) - kFirstYear;
     for (uint32_t line = a.starts[o]; line < a.starts[o + 1]; ++line) {
       const int part = a.partkey[line];
@@ -98,10 +99,18 @@ Result q9(QueryContext& ctx) {
   a.partsuppSuppkey = ctx.col<int32_t>("partsupp", "ps_suppkey");
   a.supplycost = ctx.col<int32_t>("partsupp", "ps_supplycost");
   a.supplierNation = ctx.col<int8_t>("supplier", "s_nationkey");
-  a.orders = ctx.rows("orders");
   a.profit = ctx.zeroed<unsigned long long>(kBins);
   a.missing = ctx.zeroed<unsigned long long>(1);
-  q9Kernel<<<4096, 256, 0, ctx.stream()>>>(a);
+  forBatches(
+      ctx,
+      0,
+      ctx.rows("orders"),
+      [&](int64_t first, int64_t last) {
+        a.firstOrder = first;
+        a.orders = last;
+        q9Kernel<<<4096, 256, 0, ctx.stream()>>>(a);
+      },
+      4);
   SV_CUDA(cudaGetLastError());
   auto profit = ctx.download(a.profit, kBins);
   if (ctx.download(a.missing, 1)[0]) {

@@ -87,7 +87,17 @@ Result q12(QueryContext& ctx) {
   a.modes = codesParam(ctx, "shipmodes", dictionaryCodes(ctx, "lineitem", "l_shipmode", {"MAIL", "SHIP"}));
   a.high = codesParam(ctx, "high_priorities", dictionaryCodes(ctx, "orders", "o_orderpriority", {"1-URGENT", "2-HIGH"}));
   a.counts = ctx.zeroed<unsigned long long>(kModes * 2);
-  q12Kernel<<<2048, 256, 0, ctx.stream()>>>(a);
+  const std::pair<int64_t, int64_t> all{a.begin, a.end};
+  forBatches(
+      ctx,
+      all.first,
+      all.second,
+      [&](int64_t first, int64_t last) {
+        a.begin = first;
+        a.end = last;
+        q12Kernel<<<2048, 256, 0, ctx.stream()>>>(a);
+      },
+      4);
   SV_CUDA(cudaGetLastError());
   auto counts = ctx.download(a.counts, kModes * 2);
   const auto& names = ctx.meta("lineitem", "l_shipmode").dictionary;

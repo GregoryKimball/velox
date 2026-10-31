@@ -60,16 +60,21 @@ Result q10(QueryContext& ctx) {
   const auto [begin, end] = sortedRange(ctx, "orders", "o_orderdate", days(1993, 10, 1), days(1994, 1, 1));
   const int64_t customers = ctx.rows("customer");
   auto* revenue = ctx.zeroed<unsigned long long>(customers);
-  q10Kernel<<<2048, 256, 0, ctx.stream()>>>(
-      orderLineStarts(ctx),
-      ctx.col<int32_t>("orders", "o_custkey"),
-      ctx.col<int8_t>("lineitem", "l_returnflag"),
-      ctx.col<int32_t>("lineitem", "l_extendedprice"),
-      ctx.col<int8_t>("lineitem", "l_discount"),
+  const uint32_t* starts = orderLineStarts(ctx);
+  const int32_t* custkey = ctx.col<int32_t>("orders", "o_custkey");
+  const int8_t* returnflag = ctx.col<int8_t>("lineitem", "l_returnflag");
+  const int32_t* price = ctx.col<int32_t>("lineitem", "l_extendedprice");
+  const int8_t* discount = ctx.col<int8_t>("lineitem", "l_discount");
+  const int32_t returned = ctx.meta("lineitem", "l_returnflag").code("R");
+  forBatches(
+      ctx,
       begin,
       end,
-      ctx.meta("lineitem", "l_returnflag").code("R"),
-      revenue);
+      [&](int64_t first, int64_t last) {
+        q10Kernel<<<2048, 256, 0, ctx.stream()>>>(
+            starts, custkey, returnflag, price, discount, first, last, returned, revenue);
+      },
+      4);
   SV_CUDA(cudaGetLastError());
   auto candidates = topCandidates(ctx, reinterpret_cast<const int64_t*>(revenue), customers, 20);
   std::sort(candidates.begin(), candidates.end(), [](const Candidate& x, const Candidate& y) {

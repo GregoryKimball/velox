@@ -34,6 +34,8 @@ struct Q20Args {
   const int2* zones;
   BitmapRanks parts;
   int64_t rows;
+  int64_t firstZone;
+  int64_t lastZone;
   int64_t partCount;
   int32_t dateLow;
   int32_t dateHigh;
@@ -45,8 +47,7 @@ struct Q20Args {
 
 __global__ void __launch_bounds__(kThreads) q20LineKernel(Q20Args a) {
   constexpr int64_t kZone = QueryContext::kZoneRows;
-  const int64_t zoneCount = (a.rows + kZone - 1) / kZone;
-  for (int64_t zone = blockIdx.x; zone < zoneCount; zone += gridDim.x) {
+  for (int64_t zone = a.firstZone + blockIdx.x; zone < a.lastZone; zone += gridDim.x) {
     const int2 range = a.zones[zone];
     if (range.y < a.dateLow || range.x >= a.dateHigh) {
       continue;
@@ -120,7 +121,17 @@ Result q20(QueryContext& ctx) {
   const int64_t supplierWords = (supplierCount + 31) / 32;
   a.suppliers = ctx.zeroed<uint32_t>(supplierWords);
   a.missing = ctx.zeroed<unsigned long long>(1);
-  q20LineKernel<<<persistentBlocks(q20LineKernel, kThreads), kThreads, 0, ctx.stream()>>>(a);
+  constexpr int64_t kZone = QueryContext::kZoneRows;
+  forBatches(
+      ctx,
+      0,
+      (a.rows + kZone - 1) / kZone,
+      [&](int64_t first, int64_t last) {
+        a.firstZone = first;
+        a.lastZone = last;
+        q20LineKernel<<<persistentBlocks(q20LineKernel, kThreads), kThreads, 0, ctx.stream()>>>(a);
+      },
+      kZone);
   SV_CUDA(cudaGetLastError());
   q20PartKernel<<<2048, 256, 0, ctx.stream()>>>(a);
   SV_CUDA(cudaGetLastError());

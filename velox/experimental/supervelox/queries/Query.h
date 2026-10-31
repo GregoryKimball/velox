@@ -175,6 +175,12 @@ class QueryContext {
   double lastMark_;
 };
 
+/// Lineitem-equivalent rows per batch when the hand-written queries run batch
+/// by batch, as a batched engine would; 0 (the default) runs each kernel once
+/// over all of its rows.
+void setBatchRows(int64_t rows);
+int64_t batchRows();
+
 using QueryFunction = Result (*)(QueryContext&);
 
 struct QuerySpec {

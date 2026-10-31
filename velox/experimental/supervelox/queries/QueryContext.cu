@@ -106,7 +106,17 @@ double nowMs() {
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+int64_t batchRowsSetting = 0;
+
 } // namespace
+
+void setBatchRows(int64_t rows) {
+  batchRowsSetting = rows;
+}
+
+int64_t batchRows() {
+  return batchRowsSetting;
+}
 
 QueryContext::QueryContext(
     ColumnStore& store,

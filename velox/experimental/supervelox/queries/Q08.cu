@@ -96,7 +96,17 @@ Result q8(QueryContext& ctx) {
   a.typeCode = ctx.meta("part", "p_type").code("ECONOMY ANODIZED STEEL");
   a.nation = nationKey(ctx, "BRAZIL");
   a.volume = ctx.zeroed<unsigned long long>(kBins);
-  q8Kernel<<<2048, 256, 0, ctx.stream()>>>(a);
+  const std::pair<int64_t, int64_t> all{a.begin, a.end};
+  forBatches(
+      ctx,
+      all.first,
+      all.second,
+      [&](int64_t first, int64_t last) {
+        a.begin = first;
+        a.end = last;
+        q8Kernel<<<2048, 256, 0, ctx.stream()>>>(a);
+      },
+      4);
   SV_CUDA(cudaGetLastError());
   auto volume = ctx.download(a.volume, kBins);
   Result result(kSchema);

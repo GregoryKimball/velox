@@ -34,6 +34,7 @@ struct Q16Args {
   const int8_t* size;
   const int32_t* suppkey;
   const uint32_t* complaints;
+  int64_t firstPart;
   int64_t parts;
   int32_t excludedBrand;
   CodeSet excludedTypes;
@@ -61,7 +62,7 @@ __device__ __forceinline__ int q16Group(const Q16Args& a, int64_t part) {
 
 template <bool kScatter>
 __global__ void q16PartKernel(Q16Args a) {
-  for (int64_t part = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; part < a.parts; part += (int64_t)gridDim.x * blockDim.x) {
+  for (int64_t part = a.firstPart + blockIdx.x * (int64_t)blockDim.x + threadIdx.x; part < a.parts; part += (int64_t)gridDim.x * blockDim.x) {
     const int group = q16Group(a, part);
     if (group < 0) {
       continue;
@@ -178,7 +179,16 @@ Result q16(QueryContext& ctx) {
   a.groupCount = ctx.zeroed<unsigned>(groups);
   a.groupCursor = ctx.zeroed<unsigned>(groups);
   ctx.mark("q16 setup");
-  q16PartKernel<false><<<2048, 256, 0, ctx.stream()>>>(a);
+  forBatches(
+      ctx,
+      0,
+      ctx.rows("part"),
+      [&](int64_t first, int64_t last) {
+        a.firstPart = first;
+        a.parts = last;
+        q16PartKernel<false><<<2048, 256, 0, ctx.stream()>>>(a);
+      },
+      4);
   SV_CUDA(cudaGetLastError());
   ctx.mark("q16 count");
   auto* offsets = ctx.scratch<unsigned>(groups);
@@ -190,7 +200,16 @@ Result q16(QueryContext& ctx) {
   const unsigned members = ctx.download(offsets + groups - 1, 1)[0] + ctx.download(a.groupCount + groups - 1, 1)[0];
   a.members = ctx.scratch<int32_t>(members);
   ctx.mark("q16 scan");
-  q16PartKernel<true><<<2048, 256, 0, ctx.stream()>>>(a);
+  forBatches(
+      ctx,
+      0,
+      ctx.rows("part"),
+      [&](int64_t first, int64_t last) {
+        a.firstPart = first;
+        a.parts = last;
+        q16PartKernel<true><<<2048, 256, 0, ctx.stream()>>>(a);
+      },
+      4);
   SV_CUDA(cudaGetLastError());
   ctx.mark("q16 scatter");
   auto* distinct = ctx.zeroed<unsigned>(groups);

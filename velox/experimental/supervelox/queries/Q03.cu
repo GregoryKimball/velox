@@ -73,7 +73,20 @@ Result q3(QueryContext& ctx) {
   a.segmentCode = ctx.meta("customer", "c_mktsegment").code("BUILDING");
   a.date = date;
   a.revenue = ctx.scratch<int64_t>(std::max<int64_t>(end - begin, 1));
-  q3Kernel<<<2048, 256, 0, ctx.stream()>>>(a);
+  const std::pair<int64_t, int64_t> all{a.begin, a.end};
+  auto* revenue = a.revenue;
+  forBatches(
+      ctx,
+      all.first,
+      all.second,
+      [&](int64_t first, int64_t last) {
+        a.begin = first;
+        a.end = last;
+        a.revenue = revenue + (first - all.first);
+        q3Kernel<<<2048, 256, 0, ctx.stream()>>>(a);
+      },
+      4);
+  a.revenue = revenue;
   SV_CUDA(cudaGetLastError());
 
   auto candidates = topCandidates(ctx, a.revenue, end - begin, 10);

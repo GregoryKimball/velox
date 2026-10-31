@@ -33,6 +33,7 @@ struct Q2Args {
   const int32_t* supplycost;
   const int8_t* supplierNation;
   const int32_t* acctbal;
+  int64_t firstPart;
   int64_t parts;
   int32_t sizeValue;
   CodeSet types;
@@ -44,7 +45,7 @@ struct Q2Args {
 
 template <bool kEmit>
 __global__ void q2Kernel(Q2Args a) {
-  for (int64_t part = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; part < a.parts; part += (int64_t)gridDim.x * blockDim.x) {
+  for (int64_t part = a.firstPart + blockIdx.x * (int64_t)blockDim.x + threadIdx.x; part < a.parts; part += (int64_t)gridDim.x * blockDim.x) {
     if (a.size[part] != a.sizeValue || !a.types.contains(a.type[part])) {
       continue;
     }
@@ -98,13 +99,31 @@ Result q2(QueryContext& ctx) {
   a.types = dictionaryCodes(ctx, "part", "p_type", Match::kSuffix, "BRASS");
   a.nations = nationsInRegion(ctx, "EUROPE");
   a.count = ctx.zeroed<unsigned long long>(1);
-  q2Kernel<false><<<2048, 256, 0, ctx.stream()>>>(a);
+  forBatches(
+      ctx,
+      0,
+      ctx.rows("part"),
+      [&](int64_t first, int64_t last) {
+        a.firstPart = first;
+        a.parts = last;
+        q2Kernel<false><<<2048, 256, 0, ctx.stream()>>>(a);
+      },
+      4);
   SV_CUDA(cudaGetLastError());
   const int64_t count = ctx.download(a.count, 1)[0];
   a.balances = ctx.scratch<int64_t>(count);
   a.partsuppRows = ctx.scratch<int64_t>(count);
   SV_CUDA(cudaMemsetAsync(a.count, 0, sizeof(unsigned long long), ctx.stream()));
-  q2Kernel<true><<<2048, 256, 0, ctx.stream()>>>(a);
+  forBatches(
+      ctx,
+      0,
+      ctx.rows("part"),
+      [&](int64_t first, int64_t last) {
+        a.firstPart = first;
+        a.parts = last;
+        q2Kernel<true><<<2048, 256, 0, ctx.stream()>>>(a);
+      },
+      4);
   SV_CUDA(cudaGetLastError());
   auto candidates = topCandidates(ctx, a.balances, count, 100);
   const auto partsuppRows = ctx.download(a.partsuppRows, count);

@@ -54,13 +54,14 @@ __global__ void commentKernel(
     const int64_t* offsets,
     int64_t rows,
     const uint32_t* blockRows,
+    int64_t firstChunk,
+    int64_t lastChunk,
     uint32_t* excluded) {
   constexpr char kFirst[] = "special";
   constexpr char kSecond[] = "requests";
   constexpr int kFirstLength = 7;
   constexpr int kSecondLength = 8;
-  const int64_t chunks = (bytes + kChunk - 1) / kChunk;
-  for (int64_t chunk = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; chunk < chunks;
+  for (int64_t chunk = firstChunk + blockIdx.x * (int64_t)blockDim.x + threadIdx.x; chunk < lastChunk;
        chunk += (int64_t)gridDim.x * blockDim.x) {
     const int64_t begin = chunk * kChunk;
     uint4 data;
@@ -110,8 +111,8 @@ __global__ void commentKernel(
 }
 
 /// Customers' order counts are bytes packed four to a word.
-__global__ void q13OrdersKernel(const int32_t* custkey, const uint32_t* excluded, int64_t orders, uint32_t* counts) {
-  for (int64_t o = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; o < orders; o += (int64_t)gridDim.x * blockDim.x) {
+__global__ void q13OrdersKernel(const int32_t* custkey, const uint32_t* excluded, int64_t begin, int64_t end, uint32_t* counts) {
+  for (int64_t o = begin + blockIdx.x * (int64_t)blockDim.x + threadIdx.x; o < end; o += (int64_t)gridDim.x * blockDim.x) {
     if (!testBit(excluded, o)) {
       const int c = custkey[o] - 1;
       atomicAdd(&counts[c >> 2], 1u << ((c & 3) * 8));
@@ -152,11 +153,22 @@ Result q13(QueryContext& ctx) {
       },
       ctx.stream()));
   auto* excluded = ctx.zeroed<uint32_t>((orders + 31) / 32);
-  commentKernel<<<persistentBlocks(commentKernel, 256), 256, 0, ctx.stream()>>>(
-      ctx.chars("orders", "o_comment"), comment.bytes, offsets, orders, blockRows, excluded);
+  const char* chars = ctx.chars("orders", "o_comment");
+  forBatches(ctx, 0, (comment.bytes + kChunk - 1) / kChunk, [&](int64_t first, int64_t last) {
+    commentKernel<<<persistentBlocks(commentKernel, 256), 256, 0, ctx.stream()>>>(
+        chars, comment.bytes, offsets, orders, blockRows, first, last, excluded);
+  });
   SV_CUDA(cudaGetLastError());
   auto* counts = ctx.zeroed<uint32_t>((customers + 3) / 4);
-  q13OrdersKernel<<<4096, 256, 0, ctx.stream()>>>(ctx.col<int32_t>("orders", "o_custkey"), excluded, orders, counts);
+  const int32_t* custkey = ctx.col<int32_t>("orders", "o_custkey");
+  forBatches(
+      ctx,
+      0,
+      orders,
+      [&](int64_t first, int64_t last) {
+        q13OrdersKernel<<<4096, 256, 0, ctx.stream()>>>(custkey, excluded, first, last, counts);
+      },
+      4);
   SV_CUDA(cudaGetLastError());
   auto* histogram = ctx.zeroed<unsigned long long>(kMaxCount);
   q13HistogramKernel<<<1024, kMaxCount, 0, ctx.stream()>>>(counts, customers, histogram);

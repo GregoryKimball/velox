@@ -31,7 +31,9 @@ struct Q22Args {
   const int64_t* phoneOffsets;
   const char* phoneChars;
   const int32_t* acctbal;
+  int64_t firstOrder;
   int64_t orders;
+  int64_t firstCustomer;
   int64_t customers;
   int8_t codeIndex[100];
   uint32_t* hasOrders;
@@ -40,7 +42,7 @@ struct Q22Args {
 };
 
 __global__ void q22OrdersKernel(Q22Args a) {
-  for (int64_t o = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; o < a.orders; o += (int64_t)gridDim.x * blockDim.x) {
+  for (int64_t o = a.firstOrder + blockIdx.x * (int64_t)blockDim.x + threadIdx.x; o < a.orders; o += (int64_t)gridDim.x * blockDim.x) {
     const int c = a.custkey[o] - 1;
     const uint32_t bit = 1u << (c & 31);
     if (!(a.hasOrders[c >> 5] & bit)) {
@@ -58,7 +60,7 @@ __device__ __forceinline__ int q22Code(const Q22Args& a, int64_t c) {
 __global__ void q22AverageKernel(Q22Args a) {
   unsigned long long sum = 0;
   unsigned long long count = 0;
-  for (int64_t c = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; c < a.customers; c += (int64_t)gridDim.x * blockDim.x) {
+  for (int64_t c = a.firstCustomer + blockIdx.x * (int64_t)blockDim.x + threadIdx.x; c < a.customers; c += (int64_t)gridDim.x * blockDim.x) {
     const int balance = a.acctbal[c];
     if (balance > 0 && q22Code(a, c) >= 0) {
       sum += balance;
@@ -81,7 +83,7 @@ __global__ void q22Kernel(Q22Args a) {
   __syncthreads();
   const unsigned long long sum = a.positive[0];
   const unsigned long long count = a.positive[1];
-  for (int64_t c = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; c < a.customers; c += (int64_t)gridDim.x * blockDim.x) {
+  for (int64_t c = a.firstCustomer + blockIdx.x * (int64_t)blockDim.x + threadIdx.x; c < a.customers; c += (int64_t)gridDim.x * blockDim.x) {
     const int balance = a.acctbal[c];
     // balance > avg, kept in integers.
     if (balance <= 0 || (unsigned long long)balance * count <= sum || ((a.hasOrders[c >> 5] >> (c & 31)) & 1)) {
@@ -111,18 +113,33 @@ Result q22(QueryContext& ctx) {
   a.phoneOffsets = ctx.offsets("customer", "c_phone");
   a.phoneChars = ctx.chars("customer", "c_phone");
   a.acctbal = ctx.col<int32_t>("customer", "c_acctbal");
-  a.orders = ctx.rows("orders");
-  a.customers = ctx.rows("customer");
   std::fill(a.codeIndex, a.codeIndex + 100, -1);
   for (int i = 0; i < kCodes; ++i) {
     a.codeIndex[kCountryCodes[i]] = i;
   }
-  a.hasOrders = ctx.zeroed<uint32_t>((a.customers + 31) / 32);
+  const int64_t customers = ctx.rows("customer");
+  a.hasOrders = ctx.zeroed<uint32_t>((customers + 31) / 32);
   a.positive = ctx.zeroed<unsigned long long>(2);
   a.bins = ctx.zeroed<unsigned long long>(kCodes * 2);
-  q22OrdersKernel<<<4096, 256, 0, ctx.stream()>>>(a);
-  q22AverageKernel<<<1024, 256, 0, ctx.stream()>>>(a);
-  q22Kernel<<<1024, 256, 0, ctx.stream()>>>(a);
+  forBatches(
+      ctx,
+      0,
+      ctx.rows("orders"),
+      [&](int64_t first, int64_t last) {
+        a.firstOrder = first;
+        a.orders = last;
+        q22OrdersKernel<<<4096, 256, 0, ctx.stream()>>>(a);
+      },
+      4);
+  const auto customerBatches = [&](auto launch) {
+    forBatches(ctx, 0, customers, [&](int64_t first, int64_t last) {
+      a.firstCustomer = first;
+      a.customers = last;
+      launch();
+    });
+  };
+  customerBatches([&] { q22AverageKernel<<<1024, 256, 0, ctx.stream()>>>(a); });
+  customerBatches([&] { q22Kernel<<<1024, 256, 0, ctx.stream()>>>(a); });
   SV_CUDA(cudaGetLastError());
   auto bins = ctx.download(a.bins, kCodes * 2);
   std::vector<std::pair<int, int>> codes;

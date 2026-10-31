@@ -29,6 +29,8 @@ struct Q14Args {
   const int16_t* partType;
   const int2* zones;
   int64_t rows;
+  int64_t firstZone;
+  int64_t lastZone;
   int32_t dateLow;
   int32_t dateHigh;
   CodeSet promo;
@@ -37,10 +39,9 @@ struct Q14Args {
 
 __global__ void __launch_bounds__(kThreads) q14Kernel(Q14Args a) {
   constexpr int64_t kZone = QueryContext::kZoneRows;
-  const int64_t zoneCount = (a.rows + kZone - 1) / kZone;
   unsigned long long total = 0;
   unsigned long long promo = 0;
-  for (int64_t zone = blockIdx.x; zone < zoneCount; zone += gridDim.x) {
+  for (int64_t zone = a.firstZone + blockIdx.x; zone < a.lastZone; zone += gridDim.x) {
     const int2 range = a.zones[zone];
     if (range.y < a.dateLow || range.x >= a.dateHigh) {
       continue;
@@ -81,7 +82,17 @@ Result q14(QueryContext& ctx) {
   a.dateHigh = ctx.param("shipdate_max", days(1995, 10, 1) - 1) + 1;
   a.promo = codesParam(ctx, "promo_types", dictionaryCodes(ctx, "part", "p_type", Match::kPrefix, "PROMO"));
   a.sums = ctx.zeroed<unsigned long long>(2);
-  q14Kernel<<<persistentBlocks(q14Kernel, kThreads), kThreads, 0, ctx.stream()>>>(a);
+  constexpr int64_t kZone = QueryContext::kZoneRows;
+  forBatches(
+      ctx,
+      0,
+      (a.rows + kZone - 1) / kZone,
+      [&](int64_t first, int64_t last) {
+        a.firstZone = first;
+        a.lastZone = last;
+        q14Kernel<<<persistentBlocks(q14Kernel, kThreads), kThreads, 0, ctx.stream()>>>(a);
+      },
+      kZone);
   SV_CUDA(cudaGetLastError());
   auto sums = ctx.download(a.sums, 2);
   Result result(kSchema);
