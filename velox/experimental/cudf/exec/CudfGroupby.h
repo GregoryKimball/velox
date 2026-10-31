@@ -15,6 +15,8 @@
  */
 #pragma once
 
+#include <deque>
+
 #include "velox/experimental/cudf/exec/CudfAggregation.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
 
@@ -204,7 +206,15 @@ class CudfGroupby : public CudfOperatorBase {
       std::vector<std::unique_ptr<GroupbyAggregator>>& aggregators,
       TypePtr const& outputType,
       cuda::stream_ref stream,
-      rmm::device_async_resource_ref mr);
+      rmm::device_async_resource_ref mr,
+      cudf::sorted keysSorted = cudf::sorted::NO);
+
+  // Aggregates the groups of 'input' that end within it and holds back the
+  // rows of its last group, which the next batch may continue.
+  void computePreGroupedGroupby(CudfVectorPtr input);
+
+  // Aggregates the held back rows of the last group.
+  void flushPreGroupedGroupby();
 
   // Converts the merged per-key states in 'bufferedResult_' to final output
   // without regrouping. Keeps key columns as-is.
@@ -247,6 +257,12 @@ class CudfGroupby : public CudfOperatorBase {
 
   const bool isPartialOutput_;
   const bool isSingleStep_;
+  // A single step over input grouped by all the grouping keys, as a scan of a
+  // table clustered by them gives. Each batch is aggregated on arrival by a
+  // sort based groupby that skips the sort.
+  const bool preGrouped_;
+  CudfVectorPtr preGroupedTail_;
+  std::deque<CudfVectorPtr> preGroupedOutputs_;
   // Incremental aggregation is disabled if companion aggregates are present.
   bool incrementalAggregationEnabled_{true};
   bool streamingGroupbyEnabled_{false};

@@ -62,6 +62,8 @@ endif()
 if(VELOX_ENABLE_CUDF)
   add_library(
     velox_supervelox_cudf
+    cudf/CacheConnector.cpp
+    cudf/PreGroupedAggregation.cpp
     cudf/CudfBackend.cpp
     cudf/CudfQ01.cpp
     cudf/CudfQ02.cpp
@@ -86,7 +88,7 @@ if(VELOX_ENABLE_CUDF)
     cudf/CudfQ21.cpp
     cudf/CudfQ22.cpp
   )
-  target_link_libraries(velox_supervelox_cudf velox_supervelox cudf::cudf fmt::fmt)
+  target_link_libraries(velox_supervelox_cudf velox_supervelox velox_cudf_exec cudf::cudf fmt::fmt)
   target_link_libraries(sv_bench velox_supervelox_cudf)
   target_compile_definitions(sv_bench PRIVATE SUPERVELOX_CUDF)
 endif()

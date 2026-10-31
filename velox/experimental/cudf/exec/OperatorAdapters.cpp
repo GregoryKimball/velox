@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/connectors/GpuConnector.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
 #include "velox/experimental/cudf/connectors/hive/iceberg/CudfIcebergConnector.h"
 #include "velox/experimental/cudf/exec/CudfAggregation.h"
@@ -173,12 +174,15 @@ class TableScanAdapter : public OperatorAdapter {
         std::dynamic_pointer_cast<facebook::velox::cudf_velox::connector::hive::
                                       iceberg::CudfIcebergConnector>(connector);
 
-    bool canRunOnGPU =
-        cudfHiveConnector != nullptr or cudfIcebergConnector != nullptr;
+    auto gpuConnector = std::dynamic_pointer_cast<
+        facebook::velox::cudf_velox::connector::GpuConnector>(connector);
+
+    bool canRunOnGPU = cudfHiveConnector != nullptr or
+        cudfIcebergConnector != nullptr or gpuConnector != nullptr;
 
     if (!canRunOnGPU) {
       LOG_FALLBACK(
-          "TableScan connector is not CudfHiveConnector or CudfIcebergConnector, PlanNode id: {}",
+          "TableScan connector is not CudfHiveConnector, CudfIcebergConnector or a GpuConnector, PlanNode id: {}",
           planNode->id());
     }
 

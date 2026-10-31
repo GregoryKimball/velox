@@ -158,6 +158,8 @@ const void* DeviceCache::get(
   Entry entry{device, nullptr, bytes, query_};
   if (bytes < stageBytes_) {
     SV_CUDA(cudaMemcpyAsync(device, host, bytes, cudaMemcpyHostToDevice, stream));
+    // Callers on other streams may read the buffer as soon as it is cached.
+    SV_CUDA(cudaStreamSynchronize(stream));
     stats_.copiedBytes += bytes;
     entries_[key] = entry;
     return device;

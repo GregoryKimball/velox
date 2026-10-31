@@ -35,6 +35,12 @@
 #include "velox/experimental/supervelox/exec/FusedQuery.h"
 #include "velox/experimental/supervelox/exec/PlanMatcher.h"
 #ifdef SUPERVELOX_CUDF
+#include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/CudfConversion.h"
+#include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/expression/PrestoFunctions.h"
+#include "velox/experimental/supervelox/cudf/CacheConnector.h"
+#include "velox/experimental/supervelox/cudf/PreGroupedAggregation.h"
 #include "velox/experimental/supervelox/cudf/CudfBackend.h"
 #endif
 #ifdef SUPERVELOX_MELD
@@ -68,6 +74,20 @@ DEFINE_int64(
     batch_rows,
     0,
     "Run the hand-written kernels batch by batch, about this many lineitem rows a batch; 0 runs each kernel once");
+DEFINE_bool(
+    velox_cudf,
+    false,
+    "With --tpch_plans, run the plans unchanged on the Velox-cuDF operators, scanning the HBM cache instead of "
+    "Parquet");
+DEFINE_int64(scan_rows, 1 << 24, "With --velox_cudf, rows per table scan split, each one batch");
+DEFINE_int32(drivers, 16, "Drivers per pipeline for --tpch_plans");
+DEFINE_bool(
+    pregroup,
+    true,
+    "With --velox_cudf, aggregate in one step over pre-grouped input where a scanned table keeps rows "
+    "with equal grouping keys adjacent");
+DEFINE_bool(cudf_debug, false, "With --velox_cudf, log which operators Velox-cuDF replaces");
+DEFINE_int32(cudf_memory_percent, 50, "With --velox_cudf, percent of GPU memory the cuDF memory pool starts with");
 using namespace facebook::velox;
 using namespace facebook::velox::supervelox;
 using exec::test::PlanBuilder;
@@ -166,22 +186,61 @@ void collectScans(const core::PlanNodePtr& node, std::vector<core::PlanNodeId>& 
   }
 }
 
+const core::TableScanNode* findScan(const core::PlanNodePtr& node, const core::PlanNodeId& id) {
+  if (node->id() == id) {
+    return dynamic_cast<const core::TableScanNode*>(node.get());
+  }
+  for (const auto& source : node->sources()) {
+    if (auto* scan = findScan(source, id)) {
+      return scan;
+    }
+  }
+  return nullptr;
+}
+
+/// The connector that plans' table scans name, swapped between Parquet and
+/// the HBM cache.
+void useConnector(const std::shared_ptr<connector::Connector>& connector) {
+  connector::ConnectorRegistry::global().erase(connector->connectorId());
+  connector::ConnectorRegistry::global().insert(connector->connectorId(), connector);
+}
+
 /// Runs `plan`, giving each table scan left in it the Parquet files that
-/// `tables` lists for it.
-RowVectorPtr execute(const core::PlanNodePtr& plan, const exec::test::TpchPlan& tables, memory::MemoryPool* pool) {
+/// `tables` lists for it, or with `splits` set, the splits it returns for the
+/// scanned table. `cudf` says whether Velox-cuDF may take over the plan.
+RowVectorPtr execute(
+    const core::PlanNodePtr& plan,
+    const exec::test::TpchPlan& tables,
+    memory::MemoryPool* pool,
+    const std::function<std::vector<std::shared_ptr<connector::ConnectorSplit>>(const std::string&)>& splits = nullptr,
+    bool cudf = true) {
   exec::test::AssertQueryBuilder builder(plan);
   std::vector<core::PlanNodeId> scans;
   collectScans(plan, scans);
   for (const auto& id : scans) {
-    std::vector<std::shared_ptr<connector::ConnectorSplit>> splits;
+    if (splits) {
+      builder.splits(id, splits(findScan(plan, id)->tableHandle()->name()));
+      continue;
+    }
+    std::vector<std::shared_ptr<connector::ConnectorSplit>> files;
     for (const auto& file : tables.dataFiles.at(id)) {
       for (auto& split : exec::test::HiveConnectorTestBase::makeHiveConnectorSplits(file, 1, tables.dataFileFormat)) {
-        splits.push_back(split);
+        files.push_back(split);
       }
     }
-    builder.splits(id, splits);
+    builder.splits(id, files);
   }
-  return builder.maxDrivers(scans.empty() ? 1 : 16).copyResults(pool);
+  if (!cudf) {
+    builder.config("cudf.enabled", "false");
+  }
+#ifdef SUPERVELOX_CUDF
+  if (FLAGS_velox_cudf && cudf) {
+    // As the Velox-cuDF TPC-H benchmark that measured the Parquet baseline.
+    builder.config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, "100000");
+    builder.config(core::QueryConfig::kMaxLocalExchangeBufferSize, std::to_string(1UL << 30));
+  }
+#endif
+  return builder.maxDrivers(scans.empty() ? 1 : FLAGS_drivers).copyResults(pool);
 }
 
 std::vector<int32_t> queryList() {
@@ -218,6 +277,7 @@ int main(int argc, char** argv) {
 
   std::unique_ptr<folly::IOThreadPoolExecutor> ioExecutor;
   std::unique_ptr<exec::test::TpchQueryBuilder> tpch;
+  std::shared_ptr<connector::Connector> parquetConnector;
   if (!FLAGS_tpch_plans.empty()) {
     filesystems::registerLocalFileSystem();
     parquet::registerParquetReaderFactory();
@@ -226,6 +286,7 @@ int main(int argc, char** argv) {
         exec::test::kHiveConnectorId,
         std::make_shared<config::ConfigBase>(std::unordered_map<std::string, std::string>()),
         ioExecutor.get());
+    parquetConnector = hive;
     connector::ConnectorRegistry::global().insert(hive->connectorId(), hive);
     tpch = std::make_unique<exec::test::TpchQueryBuilder>(dwio::common::FileFormat::PARQUET, FLAGS_filters_as_node);
     tpch->initialize(FLAGS_tpch_plans);
@@ -250,6 +311,26 @@ int main(int argc, char** argv) {
   }
 #endif
   engine.setBackend(parseBackend(FLAGS_backend));
+  std::shared_ptr<connector::Connector> cacheConnector;
+#ifdef SUPERVELOX_CUDF
+  std::shared_ptr<cudf_backend::CacheConnector> cache;
+#endif
+  if (FLAGS_velox_cudf) {
+#ifdef SUPERVELOX_CUDF
+    VELOX_CHECK(tpch != nullptr, "--velox_cudf needs --tpch_plans");
+    cudf_velox::CudfConfig::getInstance().initialize(
+        {{cudf_velox::CudfConfig::kCudfMemoryPercent, std::to_string(FLAGS_cudf_memory_percent)},
+         {cudf_velox::CudfConfig::kCudfDebugEnabled, FLAGS_cudf_debug ? "true" : "false"}});
+    cudf_velox::registerCudf();
+    cudf_velox::registerPrestoFunctions(cudf_velox::CudfConfig::getInstance().functionNamePrefix);
+    cache = std::make_shared<cudf_backend::CacheConnector>(
+        exec::test::kHiveConnectorId, engine.store(), engine.cache(), FLAGS_scan_rows);
+    cacheConnector = cache;
+    useConnector(cacheConnector);
+#else
+    VELOX_FAIL("--velox_cudf needs the cuDF build");
+#endif
+  }
   {
     std::stringstream overrides(FLAGS_query_backends);
     std::string item;
@@ -274,8 +355,30 @@ int main(int argc, char** argv) {
   for (int32_t query : queryList()) {
     core::PlanNodePtr planNode;
     exec::test::TpchPlan tables;
+    std::function<std::vector<std::shared_ptr<connector::ConnectorSplit>>(const std::string&)> cacheSplits;
     if (tpch) {
       tables = tpch->getQueryPlan(query);
+#ifdef SUPERVELOX_CUDF
+      if (cache) {
+        planNode = tables.plan;
+        std::map<std::string, std::vector<std::string>> splitKeys;
+        if (FLAGS_pregroup) {
+          auto grouping = cudf_backend::preGroupAggregations(tables.plan, *cache);
+          planNode = grouping.plan;
+          splitKeys = std::move(grouping.splitKeys);
+          for (const auto& line : grouping.log) {
+            printf("q%d: %s\n", query, line.c_str());
+          }
+        }
+        cacheSplits = [cache, splitKeys](const std::string& table) {
+          const auto keys = splitKeys.find(table);
+          return cache->splits(table, keys == splitKeys.end() ? std::vector<std::string>{} : keys->second);
+        };
+        printf("q%d: Velox-cuDF over the HBM cache\n", query);
+      }
+#endif
+    }
+    if (tpch && !cacheConnector) {
       std::vector<std::string> log;
       planNode = rewriteWithFusedQueries(tables.plan, engine.store(), &log);
       for (const auto& line : log) {
@@ -284,25 +387,34 @@ int main(int argc, char** argv) {
       std::vector<core::PlanNodeId> scans;
       collectScans(planNode, scans);
       printf("q%d: %s\n", query, scans.empty() ? "fully fused" : "runs on the CPU over Parquet");
-    } else {
+    } else if (!tpch) {
       planNode = plan(query);
     }
     double best = 1e30;
     double bestGpu = 1e30;
     RowVectorPtr result;
     for (int32_t run = 0; run < FLAGS_runs; ++run) {
+      Engine::Run cacheRun;
+      if (cacheConnector) {
+        engine.cache().beginQuery();
+        engine.cache().resetStats();
+      }
       const auto start = std::chrono::steady_clock::now();
-      result = tpch ? execute(planNode, tables, pool.get())
+      result = tpch ? execute(planNode, tables, pool.get(), cacheSplits)
                     : exec::test::AssertQueryBuilder(planNode).maxDrivers(1).copyResults(pool.get());
       const double ms =
           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-      const auto& last = engine.lastRun();
+      if (cacheConnector) {
+        cacheRun.gpuMs = ms;
+        cacheRun.cache = engine.cache().stats();
+      }
+      const auto& last = cacheConnector ? cacheRun : engine.lastRun();
       printf(
           "q%d run %d: %.2f ms (%s gpu %.2f ms) copied %.2f GB staged %.2f GB host %.2f GB built %.2f GB resident %.1f GB\n",
           query,
           run,
           ms,
-          backendName(last.backend),
+          cacheConnector ? "velox-cudf" : backendName(last.backend),
           last.gpuMs,
           last.cache.copiedBytes / 1e9,
           last.cache.stagedBytes / 1e9,
@@ -318,7 +430,13 @@ int main(int argc, char** argv) {
     totalBest += best;
     printf("q%d best %.2f ms (gpu %.2f ms) rows %d\n", query, best, bestGpu, result->size());
     if (tpch && FLAGS_verify_cpu) {
-      auto expected = execute(tables.plan, tables, pool.get());
+      if (cacheConnector) {
+        useConnector(parquetConnector);
+      }
+      auto expected = execute(tables.plan, tables, pool.get(), nullptr, false);
+      if (cacheConnector) {
+        useConnector(cacheConnector);
+      }
       const bool same = exec::test::assertEqualResults({expected}, {result});
       printf("q%d matches the CPU plan: %s\n", query, same ? "yes" : "NO");
     }
