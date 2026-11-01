@@ -328,6 +328,12 @@ class AggregationAdapter : public OperatorAdapter {
       return false;
     }
 
+    // A CPU aggregation over a dense node would see each driver's share of
+    // every group.
+    if (dynamic_cast<const DenseAggregationNode*>(aggregationPlanNode.get())) {
+      return true;
+    }
+
     bool canEvaluate = canBeEvaluatedByCudf(
         *aggregationPlanNode, ctx->task->queryCtx().get(), op->pool());
     if (!canEvaluate) {

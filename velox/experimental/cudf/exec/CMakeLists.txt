@@ -39,8 +39,10 @@ add_library(
   CudfWindow.cpp
   DebugUtil.cpp
   DecimalAggregationDevice.cu
+  DenseGroupby.cu
   DecimalAggregationHostOps.cpp
   DecimalAggregationState.cpp
+  DenseGroupby.cpp
   GpuCapabilities.cpp
   GpuResources.cpp
   OperatorAdapters.cpp

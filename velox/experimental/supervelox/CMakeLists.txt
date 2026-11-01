@@ -63,7 +63,7 @@ if(VELOX_ENABLE_CUDF)
   add_library(
     velox_supervelox_cudf
     cudf/CacheConnector.cpp
-    cudf/PreGroupedAggregation.cpp
+    cudf/AggregationRules.cpp
     cudf/CudfBackend.cpp
     cudf/CudfQ01.cpp
     cudf/CudfQ02.cpp

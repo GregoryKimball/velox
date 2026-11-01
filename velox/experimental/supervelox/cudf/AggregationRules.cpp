@@ -13,12 +13,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "velox/experimental/supervelox/cudf/PreGroupedAggregation.h"
+#include "velox/experimental/supervelox/cudf/AggregationRules.h"
 
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
 #include "velox/core/Expressions.h"
+#include "velox/experimental/cudf/exec/DenseGroupby.h"
 
 namespace facebook::velox::supervelox::cudf_backend {
 namespace {
@@ -107,69 +108,172 @@ core::PlanNodePtr withSources(const core::PlanNodePtr& node, const std::vector<c
   return nullptr;
 }
 
-/// 'node' as a single step aggregation over pre-grouped input, or 'node'.
-core::PlanNodePtr preGroup(const core::PlanNodePtr& node, CacheConnector& connector, PreGrouping& out) {
+/// An aggregation that computes its result in one step from 'raw' input,
+/// either itself or a final step over a local partition of a partial step.
+struct OneStep {
+  const AggregationNode* aggregation;
+  const AggregationNode* raw;
+  /// The raw inputs of 'raw' with the result types of 'aggregation'.
+  std::vector<AggregationNode::Aggregate> aggregates;
+};
+
+std::optional<OneStep> oneStep(const core::PlanNodePtr& node) {
   const auto* aggregation = dynamic_cast<const AggregationNode*>(node.get());
   if (aggregation == nullptr || aggregation->groupingKeys().empty() || aggregation->isPreGrouped() ||
       aggregation->groupId().has_value()) {
-    return node;
+    return std::nullopt;
   }
   const AggregationNode* raw = aggregation;
   if (aggregation->step() == AggregationNode::Step::kFinal) {
     const auto* exchange = dynamic_cast<const core::LocalPartitionNode*>(aggregation->sources()[0].get());
     if (exchange == nullptr || exchange->sources().size() != 1) {
-      return node;
+      return std::nullopt;
     }
     raw = dynamic_cast<const AggregationNode*>(exchange->sources()[0].get());
     if (raw == nullptr || raw->step() != AggregationNode::Step::kPartial ||
         names(raw->groupingKeys()) != names(aggregation->groupingKeys())) {
-      return node;
+      return std::nullopt;
     }
   } else if (aggregation->step() != AggregationNode::Step::kSingle) {
-    return node;
+    return std::nullopt;
   }
-  auto columns = names(raw->groupingKeys());
-  const auto* scan = traceToScan(raw->sources()[0], columns);
+  OneStep out{aggregation, raw, raw->aggregates()};
+  for (size_t i = 0; i < out.aggregates.size(); ++i) {
+    const auto& call = out.aggregates[i].call;
+    out.aggregates[i].call = std::make_shared<core::CallTypedExpr>(
+        aggregation->aggregates()[i].call->type(), call->inputs(), call->name());
+  }
+  return out;
+}
+
+/// 'step' as a single step aggregation over pre-grouped input, or null.
+core::PlanNodePtr preGroup(const OneStep& step, CacheConnector& connector, AggregationRewrite& out) {
+  auto columns = names(step.raw->groupingKeys());
+  const auto* scan = traceToScan(step.raw->sources()[0], columns);
   if (scan == nullptr || scan->tableHandle()->connectorId() != connector.connectorId()) {
-    return node;
+    return nullptr;
   }
   const auto& table = scan->tableHandle()->name();
   for (const auto& column : columns) {
     if (!connector.clustered(table, column)) {
-      return node;
+      return nullptr;
     }
-  }
-  // The raw inputs of the partial step with the result types of the final.
-  std::vector<AggregationNode::Aggregate> aggregates = raw->aggregates();
-  for (size_t i = 0; i < aggregates.size(); ++i) {
-    const auto& call = aggregates[i].call;
-    aggregates[i].call = std::make_shared<core::CallTypedExpr>(
-        aggregation->aggregates()[i].call->type(), call->inputs(), call->name());
   }
   out.splitKeys[table] = columns;
   out.log.push_back(fmt::format(
       "aggregation {} grouped by {} of {}, whose equal values are adjacent, is one step over pre-grouped input",
-      aggregation->id(),
+      step.aggregation->id(),
       fmt::join(columns, ", "),
       table));
   return std::make_shared<AggregationNode>(
-      aggregation->id(),
+      step.aggregation->id(),
       AggregationNode::Step::kSingle,
-      raw->groupingKeys(),
-      raw->groupingKeys(),
-      raw->aggregateNames(),
-      aggregates,
-      raw->ignoreNullKeys(),
+      step.raw->groupingKeys(),
+      step.raw->groupingKeys(),
+      step.raw->aggregateNames(),
+      step.aggregates,
+      step.raw->ignoreNullKeys(),
       /*noGroupsSpanBatches=*/false,
       std::nullopt,
-      raw->sources()[0]);
+      step.raw->sources()[0]);
 }
 
-core::PlanNodePtr rewrite(const core::PlanNodePtr& node, CacheConnector& connector, PreGrouping& out) {
+struct KeySource {
+  std::string table;
+  std::string column;
+};
+
+/// The stored column that 'column' of 'node' takes its values from, through
+/// filters, projections passing it through and joins, none of which add
+/// values.
+std::optional<KeySource> traceValues(const core::PlanNodePtr& node, const std::string& column) {
+  if (const auto* scan = dynamic_cast<const core::TableScanNode*>(node.get())) {
+    const auto found = scan->assignments().find(column);
+    if (found == scan->assignments().end()) {
+      return std::nullopt;
+    }
+    return KeySource{scan->tableHandle()->name(), found->second->name()};
+  }
+  if (dynamic_cast<const core::FilterNode*>(node.get())) {
+    return traceValues(node->sources()[0], column);
+  }
+  if (const auto* project = dynamic_cast<const core::ProjectNode*>(node.get())) {
+    const auto index = project->outputType()->getChildIdxIfExists(column);
+    if (!index.has_value()) {
+      return std::nullopt;
+    }
+    const auto field = std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(project->projections()[*index]);
+    if (field == nullptr || !field->isInputColumn()) {
+      return std::nullopt;
+    }
+    return traceValues(node->sources()[0], field->name());
+  }
+  if (const auto* join = dynamic_cast<const core::AbstractJoinNode*>(node.get())) {
+    if (join->isLeftJoin() || join->isRightJoin() || join->isFullJoin()) {
+      return std::nullopt;
+    }
+    for (const auto& source : join->sources()) {
+      if (source->outputType()->containsChild(column)) {
+        return traceValues(source, column);
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+/// 'step' as a dense aggregation, or null.
+core::PlanNodePtr dense(const OneStep& step, CacheConnector& connector, AggregationRewrite& out) {
+  constexpr int64_t kMaxSlots = int64_t{1} << 28;
+  if (step.raw->groupingKeys().size() != 1 || step.aggregates.empty()) {
+    return nullptr;
+  }
+  for (const auto& aggregate : step.aggregates) {
+    if (!cudf_velox::isDenseAggregate(aggregate)) {
+      return nullptr;
+    }
+  }
+  const auto& key = step.raw->groupingKeys()[0];
+  if (!(key->type()->isBigint() || key->type()->isInteger() || key->type()->isDate())) {
+    return nullptr;
+  }
+  const auto source = traceValues(step.raw->sources()[0], key->name());
+  if (!source.has_value()) {
+    return nullptr;
+  }
+  const Column& column = connector.store().metadata(source->table, source->column);
+  const int64_t slots = column.max - column.min + 1;
+  if ((column.kind != Kind::kInt && column.kind != Kind::kDate) || slots > kMaxSlots ||
+      slots > connector.store().rows(source->table)) {
+    return nullptr;
+  }
+  out.log.push_back(fmt::format(
+      "aggregation {} grouped by {}, which takes the values {}..{} of {}.{}, adds into {} slots indexed by key",
+      step.aggregation->id(),
+      key->name(),
+      column.min,
+      column.max,
+      source->table,
+      source->column,
+      slots));
+  return std::make_shared<cudf_velox::DenseAggregationNode>(
+      step.aggregation->id(),
+      step.raw->groupingKeys(),
+      step.raw->aggregateNames(),
+      step.aggregates,
+      step.raw->sources()[0],
+      column.min,
+      column.max);
+}
+
+core::PlanNodePtr rewrite(
+    const core::PlanNodePtr& node,
+    CacheConnector& connector,
+    const AggregationRules& rules,
+    AggregationRewrite& out) {
   std::vector<core::PlanNodePtr> sources;
   bool changed = false;
   for (const auto& source : node->sources()) {
-    sources.push_back(rewrite(source, connector, out));
+    sources.push_back(rewrite(source, connector, rules, out));
     changed |= sources.back() != source;
   }
   auto current = node;
@@ -180,14 +284,31 @@ core::PlanNodePtr rewrite(const core::PlanNodePtr& node, CacheConnector& connect
       out.log.push_back(fmt::format("cannot rebuild {} over rewritten inputs", node->toString()));
     }
   }
-  return preGroup(current, connector, out);
+  const auto step = oneStep(current);
+  if (!step.has_value()) {
+    return current;
+  }
+  if (rules.preGroup) {
+    if (auto grouped = preGroup(*step, connector, out)) {
+      return grouped;
+    }
+  }
+  if (rules.dense) {
+    if (auto indexed = dense(*step, connector, out)) {
+      return indexed;
+    }
+  }
+  return current;
 }
 
 } // namespace
 
-PreGrouping preGroupAggregations(const core::PlanNodePtr& plan, CacheConnector& connector) {
-  PreGrouping out;
-  out.plan = rewrite(plan, connector, out);
+AggregationRewrite rewriteAggregations(
+    const core::PlanNodePtr& plan,
+    CacheConnector& connector,
+    const AggregationRules& rules) {
+  AggregationRewrite out;
+  out.plan = rewrite(plan, connector, rules, out);
   return out;
 }
 

@@ -27,6 +27,7 @@
 #include "velox/connectors/ConnectorRegistry.h"
 #include "velox/connectors/hive/HiveConnector.h"
 #include "velox/dwio/parquet/RegisterParquetReader.h"
+#include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
@@ -40,7 +41,7 @@
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/expression/PrestoFunctions.h"
 #include "velox/experimental/supervelox/cudf/CacheConnector.h"
-#include "velox/experimental/supervelox/cudf/PreGroupedAggregation.h"
+#include "velox/experimental/supervelox/cudf/AggregationRules.h"
 #include "velox/experimental/supervelox/cudf/CudfBackend.h"
 #endif
 #ifdef SUPERVELOX_MELD
@@ -86,6 +87,12 @@ DEFINE_bool(
     true,
     "With --velox_cudf, aggregate in one step over pre-grouped input where a scanned table keeps rows "
     "with equal grouping keys adjacent");
+DEFINE_bool(plan_stats, false, "With --tpch_plans, print each run's plan with the time and rows of every node");
+DEFINE_bool(
+    dense_aggregation,
+    true,
+    "With --velox_cudf, aggregate by one integer key that the store bounds to a small range into slots indexed by key");
+DEFINE_string(cudf_config, "", "With --velox_cudf, more CudfConfig entries as key=value,key=value");
 DEFINE_bool(cudf_debug, false, "With --velox_cudf, log which operators Velox-cuDF replaces");
 DEFINE_int32(cudf_memory_percent, 50, "With --velox_cudf, percent of GPU memory the cuDF memory pool starts with");
 using namespace facebook::velox;
@@ -240,7 +247,12 @@ RowVectorPtr execute(
     builder.config(core::QueryConfig::kMaxLocalExchangeBufferSize, std::to_string(1UL << 30));
   }
 #endif
-  return builder.maxDrivers(scans.empty() ? 1 : FLAGS_drivers).copyResults(pool);
+  std::shared_ptr<exec::Task> task;
+  auto result = builder.maxDrivers(scans.empty() ? 1 : FLAGS_drivers).copyResults(pool, task);
+  if (FLAGS_plan_stats) {
+    printf("%s\n", exec::printPlanWithStats(*plan, task->taskStats(), true).c_str());
+  }
+  return result;
 }
 
 std::vector<int32_t> queryList() {
@@ -318,9 +330,17 @@ int main(int argc, char** argv) {
   if (FLAGS_velox_cudf) {
 #ifdef SUPERVELOX_CUDF
     VELOX_CHECK(tpch != nullptr, "--velox_cudf needs --tpch_plans");
-    cudf_velox::CudfConfig::getInstance().initialize(
-        {{cudf_velox::CudfConfig::kCudfMemoryPercent, std::to_string(FLAGS_cudf_memory_percent)},
-         {cudf_velox::CudfConfig::kCudfDebugEnabled, FLAGS_cudf_debug ? "true" : "false"}});
+    std::unordered_map<std::string, std::string> cudfConfig{
+        {cudf_velox::CudfConfig::kCudfMemoryPercent, std::to_string(FLAGS_cudf_memory_percent)},
+        {cudf_velox::CudfConfig::kCudfDebugEnabled, FLAGS_cudf_debug ? "true" : "false"}};
+    std::stringstream entries(FLAGS_cudf_config);
+    std::string entry;
+    while (std::getline(entries, entry, ',')) {
+      const auto equals = entry.find('=');
+      VELOX_CHECK_NE(equals, std::string::npos, "--cudf_config entry {} is not key=value", entry);
+      cudfConfig[entry.substr(0, equals)] = entry.substr(equals + 1);
+    }
+    cudf_velox::CudfConfig::getInstance().initialize(std::move(cudfConfig));
     cudf_velox::registerCudf();
     cudf_velox::registerPrestoFunctions(cudf_velox::CudfConfig::getInstance().functionNamePrefix);
     cache = std::make_shared<cudf_backend::CacheConnector>(
@@ -362,13 +382,12 @@ int main(int argc, char** argv) {
       if (cache) {
         planNode = tables.plan;
         std::map<std::string, std::vector<std::string>> splitKeys;
-        if (FLAGS_pregroup) {
-          auto grouping = cudf_backend::preGroupAggregations(tables.plan, *cache);
-          planNode = grouping.plan;
-          splitKeys = std::move(grouping.splitKeys);
-          for (const auto& line : grouping.log) {
-            printf("q%d: %s\n", query, line.c_str());
-          }
+        auto rewrite = cudf_backend::rewriteAggregations(
+            tables.plan, *cache, {.preGroup = FLAGS_pregroup, .dense = FLAGS_dense_aggregation});
+        planNode = rewrite.plan;
+        splitKeys = std::move(rewrite.splitKeys);
+        for (const auto& line : rewrite.log) {
+          printf("q%d: %s\n", query, line.c_str());
         }
         cacheSplits = [cache, splitKeys](const std::string& table) {
           const auto keys = splitKeys.find(table);

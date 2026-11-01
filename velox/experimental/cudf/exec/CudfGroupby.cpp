@@ -1452,6 +1452,8 @@ CudfGroupby::CudfGroupby(
       isSingleStep_(
           aggregationNode->step() == core::AggregationNode::Step::kSingle),
       preGrouped_(isSingleStep_ && aggregationNode->isPreGrouped()),
+      denseNode_(
+          dynamic_cast<const DenseAggregationNode*>(aggregationNode.get())),
       maxPartialAggregationMemoryUsage_(
           driverCtx->queryConfig().maxPartialAggregationMemoryUsage()) {}
 
@@ -1692,6 +1694,28 @@ void CudfGroupby::initialize() {
 
   inputType_ = aggregationNode_->sources()[0]->outputType();
   ignoreNullKeys_ = aggregationNode_->ignoreNullKeys();
+  if (denseNode_ != nullptr) {
+    const auto inputRow = asRowType(inputType_);
+    VELOX_CHECK_EQ(denseNode_->groupingKeys().size(), 1);
+    denseKeyChannel_ =
+        inputRow->getChildIdx(denseNode_->groupingKeys()[0]->name());
+    auto aggregates = DenseGroupby::aggregates(*denseNode_, inputRow);
+    const auto low = denseNode_->low();
+    const auto high = denseNode_->high();
+    auto keyType = inputRow->childAt(denseKeyChannel_);
+    dense_ = DenseGroupby::shared(
+        operatorCtx_->task().get(), planNodeId(), [&]() {
+          return std::make_shared<DenseGroupby>(
+              low,
+              high,
+              keyType,
+              std::move(aggregates),
+              cudfGlobalStreamPool().get_stream(),
+              get_output_mr());
+        });
+    aggregationNode_.reset();
+    return;
+  }
   setupGroupingKeyChannelProjections(
       *aggregationNode_, groupingKeyInputChannels_, groupingKeyOutputChannels_);
 
@@ -1927,6 +1951,18 @@ void CudfGroupby::doAddInput(RowVectorPtr input) {
     return;
   }
 
+  if (dense_) {
+    const auto view = cudfInput->getTableView();
+    dense_->add(
+        std::vector<cudf::column_view>(view.begin(), view.end()),
+        denseKeyChannel_,
+        cudfInput->stream());
+    // The shared accumulators outlive this batch and are read by another
+    // driver's stream.
+    cudfInput->stream().sync();
+    return;
+  }
+
   if (streamingGroupbyEnabled_) {
     computeFinalGroupbyStreaming(std::move(cudfInput));
     return;
@@ -2119,6 +2155,26 @@ CudfVectorPtr CudfGroupby::releaseAndResetBufferedResult() {
 }
 
 RowVectorPtr CudfGroupby::doGetOutput() {
+  if (dense_) {
+    if (!denseEmits_ || finished_) {
+      return nullptr;
+    }
+    finished_ = true;
+    auto stream = cudfGlobalStreamPool().get_stream();
+    auto columns = dense_->release(stream, get_output_mr());
+    DenseGroupby::forget(operatorCtx_->task().get(), planNodeId());
+    dense_.reset();
+    const auto rows = columns.front()->size();
+    if (rows == 0) {
+      return nullptr;
+    }
+    return std::make_shared<CudfVector>(
+        pool(),
+        outputType_,
+        rows,
+        std::make_unique<cudf::table>(std::move(columns)),
+        stream);
+  }
   if (preGrouped_) {
     if (noMoreInput_) {
       flushPreGroupedGroupby();
@@ -2209,6 +2265,18 @@ RowVectorPtr CudfGroupby::doGetOutput() {
 
 void CudfGroupby::doNoMoreInput() {
   Operator::noMoreInput();
+  if (dense_) {
+    ContinueFuture future;
+    std::vector<ContinuePromise> promises;
+    std::vector<std::shared_ptr<exec::Driver>> peers;
+    denseEmits_ = operatorCtx_->task()->allPeersFinished(
+        planNodeId(), operatorCtx_->driver(), &future, promises, peers);
+    for (auto& promise : promises) {
+      promise.setValue();
+    }
+    finished_ = !denseEmits_;
+    return;
+  }
   if (isPartialOutput_ && inputs_.empty()) {
     finished_ = true;
   }
@@ -2229,6 +2297,7 @@ void CudfGroupby::doClose() {
   bufferedResult_.reset();
   preGroupedTail_.reset();
   preGroupedOutputs_.clear();
+  dense_.reset();
   aggregators_.clear();
   intermediateAggregators_.clear();
   partialAggregators_.clear();

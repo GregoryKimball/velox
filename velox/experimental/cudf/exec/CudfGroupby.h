@@ -17,6 +17,8 @@
 
 #include <deque>
 
+#include "velox/experimental/cudf/exec/DenseGroupby.h"
+
 #include "velox/experimental/cudf/exec/CudfAggregation.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
 
@@ -261,6 +263,12 @@ class CudfGroupby : public CudfOperatorBase {
   // table clustered by them gives. Each batch is aggregated on arrival by a
   // sort based groupby that skips the sort.
   const bool preGrouped_;
+  // Set for a DenseAggregationNode: all drivers add into 'dense_', and the
+  // last one to finish emits the groups.
+  const DenseAggregationNode* denseNode_{nullptr};
+  std::shared_ptr<DenseGroupby> dense_;
+  column_index_t denseKeyChannel_{0};
+  bool denseEmits_{false};
   CudfVectorPtr preGroupedTail_;
   std::deque<CudfVectorPtr> preGroupedOutputs_;
   // Incremental aggregation is disabled if companion aggregates are present.
