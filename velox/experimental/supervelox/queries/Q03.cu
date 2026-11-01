@@ -23,6 +23,7 @@ namespace {
 
 struct Q3Args {
   const uint32_t* starts;
+  int64_t lineBase;
   const int32_t* custkey;
   const int8_t* segment;
   const int16_t* shipdate;
@@ -40,7 +41,7 @@ __global__ void q3Kernel(Q3Args a) {
        o += (int64_t)gridDim.x * blockDim.x) {
     long long revenue = 0;
     if (a.segment[a.custkey[o] - 1] == a.segmentCode) {
-      for (uint32_t line = a.starts[o]; line < a.starts[o + 1]; ++line) {
+      for (int64_t line = a.lineBase + a.starts[o]; line < a.lineBase + a.starts[o + 1]; ++line) {
         if (a.shipdate[line] > a.date) {
           revenue += (long long)a.price[line] * (100 - a.discount[line]);
         }
@@ -62,51 +63,49 @@ Result q3(QueryContext& ctx) {
   const auto lag = lineDateLag(ctx, "l_shipdate");
   const auto [begin, end] = sortedRange(ctx, "orders", "o_orderdate", date - lag.second + 1, date);
   Q3Args a;
-  a.starts = orderLineStarts(ctx);
-  a.custkey = ctx.col<int32_t>("orders", "o_custkey");
   a.segment = ctx.col<int8_t>("customer", "c_mktsegment");
-  a.shipdate = ctx.col<int16_t>("lineitem", "l_shipdate");
-  a.price = ctx.col<int32_t>("lineitem", "l_extendedprice");
-  a.discount = ctx.col<int8_t>("lineitem", "l_discount");
-  a.begin = begin;
-  a.end = end;
-  a.segmentCode = ctx.meta("customer", "c_mktsegment").code("BUILDING");
+  a.segmentCode = ctx.info("customer", "c_mktsegment").code("BUILDING");
   a.date = date;
-  a.revenue = ctx.scratch<int64_t>(std::max<int64_t>(end - begin, 1));
-  const std::pair<int64_t, int64_t> all{a.begin, a.end};
-  auto* revenue = a.revenue;
+  std::vector<Candidate> candidates;
   forBatches(
       ctx,
-      all.first,
-      all.second,
+      begin,
+      end,
       [&](int64_t first, int64_t last) {
+        const LineRange lines = lineRange(ctx, first, last);
+        a.starts = lines.starts;
+        a.lineBase = lines.base;
+        a.custkey = ctx.rows<int32_t>("orders", "o_custkey", first, last);
+        a.shipdate = ctx.rows<int16_t>("lineitem", "l_shipdate", lines.firstLine, lines.lastLine);
+        a.price = ctx.rows<int32_t>("lineitem", "l_extendedprice", lines.firstLine, lines.lastLine);
+        a.discount = ctx.rows<int8_t>("lineitem", "l_discount", lines.firstLine, lines.lastLine);
         a.begin = first;
         a.end = last;
-        a.revenue = revenue + (first - all.first);
+        a.revenue = ctx.batchScratch<int64_t>(std::max<int64_t>(last - first, 1));
         q3Kernel<<<2048, 256, 0, ctx.stream()>>>(a);
+        SV_CUDA(cudaGetLastError());
+        for (Candidate c : topCandidates(ctx, a.revenue, last - first, 10)) {
+          c.index += first;
+          candidates.push_back(c);
+        }
       },
       4);
-  a.revenue = revenue;
-  SV_CUDA(cudaGetLastError());
 
-  auto candidates = topCandidates(ctx, a.revenue, end - begin, 10);
-  const Column& orderdate = ctx.meta("orders", "o_orderdate");
+  auto orderdate = [&](int64_t row) { return ctx.value("orders", "o_orderdate", row); };
   std::sort(candidates.begin(), candidates.end(), [&](const Candidate& x, const Candidate& y) {
     if (x.value != y.value) {
       return x.value > y.value;
     }
-    return orderdate.value(begin + x.index) < orderdate.value(begin + y.index);
+    return orderdate(x.index) < orderdate(y.index);
   });
   candidates.resize(std::min<size_t>(candidates.size(), 10));
-  const Column& orderkey = ctx.meta("orders", "o_orderkey");
-  const Column& shippriority = ctx.meta("orders", "o_shippriority");
   Result result(kSchema);
   for (const auto& c : candidates) {
-    const int64_t row = begin + c.index;
-    result.ints[0].push_back(orderkey.value(row));
+    const int64_t row = c.index;
+    result.ints[0].push_back(ctx.value("orders", "o_orderkey", row));
     result.decimals[1].push_back(c.value);
-    result.ints[2].push_back(orderdate.value(row));
-    result.ints[3].push_back(shippriority.value(row));
+    result.ints[2].push_back(orderdate(row));
+    result.ints[3].push_back(ctx.value("orders", "o_shippriority", row));
   }
   return result;
 }

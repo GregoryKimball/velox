@@ -33,15 +33,24 @@ __global__ void partKernel(const int8_t* brand, const int8_t* container, int64_t
   }
 }
 
+/// A line of a qualifying part, kept so that the second pass needs no
+/// lineitem columns.
+struct PartLine {
+  uint32_t slot;
+  int32_t quantity;
+  int32_t price;
+};
+
 struct Q17Args {
   const int32_t* partkey;
   const int16_t* quantity;
+  const int32_t* price;
   BitmapRanks parts;
   int64_t firstRow;
   int64_t rows;
   unsigned* quantitySum;
   unsigned* lineCount;
-  uint32_t* lines;
+  PartLine* lines;
   unsigned long long* lineTotal;
   unsigned long long capacity;
 };
@@ -52,7 +61,7 @@ __device__ __forceinline__ void q17Line(const Q17Args& a, int64_t row, int part)
   atomicAdd(&a.lineCount[slot], 1u);
   const unsigned long long index = atomicAdd(a.lineTotal, 1ULL);
   if (index < a.capacity) {
-    a.lines[index] = row;
+    a.lines[index] = {static_cast<uint32_t>(slot), a.quantity[row], a.price[row]};
   }
 }
 
@@ -78,14 +87,13 @@ __global__ void __launch_bounds__(kThreads) q17Kernel(Q17Args a) {
   }
 }
 
-__global__ void q17SumKernel(Q17Args a, const int32_t* price, int64_t lineCount, unsigned long long* total) {
+__global__ void q17SumKernel(Q17Args a, int64_t lineCount, unsigned long long* total) {
   unsigned long long sum = 0;
   for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < lineCount; i += (int64_t)gridDim.x * blockDim.x) {
-    const uint32_t row = a.lines[i];
-    const int64_t slot = bitRank(a.parts, a.partkey[row] - 1);
+    const PartLine line = a.lines[i];
     // quantity < 0.2 * avg(quantity), kept in integers.
-    if (5ULL * a.quantity[row] * a.lineCount[slot] < a.quantitySum[slot]) {
-      sum += price[row];
+    if (5ULL * line.quantity * a.lineCount[line.slot] < a.quantitySum[line.slot]) {
+      sum += line.price;
     }
   }
   sum = warpSum(sum);
@@ -103,21 +111,19 @@ Result q17(QueryContext& ctx) {
       ctx.col<int8_t>("part", "p_brand"),
       ctx.col<int8_t>("part", "p_container"),
       parts,
-      ctx.meta("part", "p_brand").code("Brand#23"),
-      ctx.meta("part", "p_container").code("MED BOX"),
+      ctx.info("part", "p_brand").code("Brand#23"),
+      ctx.info("part", "p_container").code("MED BOX"),
       bits);
   SV_CUDA(cudaGetLastError());
   Q17Args a;
   a.parts = rankBitmap(ctx, bits, parts);
-  a.partkey = ctx.col<int32_t>("lineitem", "l_partkey");
-  a.quantity = ctx.col<int16_t>("lineitem", "l_quantity");
   a.rows = ctx.rows("lineitem");
   a.quantitySum = ctx.zeroed<unsigned>(a.parts.count);
   a.lineCount = ctx.zeroed<unsigned>(a.parts.count);
   a.lineTotal = ctx.zeroed<unsigned long long>(1);
   // Lines per part are about rows / parts; leave room for skew.
   a.capacity = a.parts.count * (a.rows / parts + 1) * 2 + 1024;
-  a.lines = ctx.scratch<uint32_t>(a.capacity);
+  a.lines = ctx.scratch<PartLine>(a.capacity);
   forBatches(
       ctx,
       0,
@@ -125,6 +131,9 @@ Result q17(QueryContext& ctx) {
       [&](int64_t first, int64_t last) {
         a.firstRow = first;
         a.rows = last;
+        a.partkey = ctx.rows<int32_t>("lineitem", "l_partkey", first, last);
+        a.quantity = ctx.rows<int16_t>("lineitem", "l_quantity", first, last);
+        a.price = ctx.rows<int32_t>("lineitem", "l_extendedprice", first, last);
         q17Kernel<<<persistentBlocks(q17Kernel, kThreads), kThreads, 0, ctx.stream()>>>(a);
       },
       1,
@@ -135,7 +144,7 @@ Result q17(QueryContext& ctx) {
     throw std::runtime_error("q17: line buffer overflow");
   }
   auto* total = ctx.zeroed<unsigned long long>(1);
-  q17SumKernel<<<1024, 256, 0, ctx.stream()>>>(a, ctx.col<int32_t>("lineitem", "l_extendedprice"), lineCount, total);
+  q17SumKernel<<<1024, 256, 0, ctx.stream()>>>(a, lineCount, total);
   SV_CUDA(cudaGetLastError());
   Result result(kSchema);
   result.doubles[0].push_back(ctx.download(total, 1)[0] / 100.0 / 7.0);

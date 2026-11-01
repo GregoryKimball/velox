@@ -17,6 +17,7 @@
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "velox/experimental/supervelox/queries/Kernels.cuh"
 
@@ -49,17 +50,20 @@ __global__ void widenKernel(const From* in, To* out, int64_t rows) {
 }
 
 template <typename To>
-void widen(const Column& column, const void* in, To* out, cudaStream_t stream) {
+void widen(const Column& column, const void* in, To* out, cudaStream_t stream, int64_t rows = -1) {
   const int blocks = 4096;
+  if (rows < 0) {
+    rows = column.rows;
+  }
   switch (column.dtype) {
     case DType::kInt8:
-      widenKernel<<<blocks, 256, 0, stream>>>(static_cast<const int8_t*>(in), out, column.rows);
+      widenKernel<<<blocks, 256, 0, stream>>>(static_cast<const int8_t*>(in), out, rows);
       break;
     case DType::kInt16:
-      widenKernel<<<blocks, 256, 0, stream>>>(static_cast<const int16_t*>(in), out, column.rows);
+      widenKernel<<<blocks, 256, 0, stream>>>(static_cast<const int16_t*>(in), out, rows);
       break;
     case DType::kInt32:
-      widenKernel<<<blocks, 256, 0, stream>>>(static_cast<const int32_t*>(in), out, column.rows);
+      widenKernel<<<blocks, 256, 0, stream>>>(static_cast<const int32_t*>(in), out, rows);
       break;
     default:
       throw std::runtime_error("cannot widen " + column.name);
@@ -141,10 +145,118 @@ void QueryContext::mark(const char* phase) {
 }
 
 QueryContext::~QueryContext() {
+  endBatch();
   for (void* buffer : scratch_) {
     cudaFreeAsync(buffer, stream_);
   }
   cudaStreamSynchronize(stream_);
+  if (staging_ != nullptr) {
+    cudaFreeHost(staging_);
+  }
+}
+
+void* QueryContext::batchBytes(size_t bytes) {
+  void* buffer = nullptr;
+  SV_CUDA(cudaMallocAsync(&buffer, std::max<size_t>(bytes, 16), stream_));
+  batch_.push_back(buffer);
+  return buffer;
+}
+
+void QueryContext::endBatch() {
+  for (void* buffer : batch_) {
+    cudaFreeAsync(buffer, stream_);
+  }
+  batch_.clear();
+}
+
+void* QueryContext::staging(size_t bytes) {
+  if (bytes > stagingBytes_) {
+    if (staging_ != nullptr) {
+      SV_CUDA(cudaStreamSynchronize(stream_));
+      cudaFreeHost(staging_);
+    }
+    stagingBytes_ = std::max(bytes, stagingBytes_ * 2);
+    SV_CUDA(cudaHostAlloc(&staging_, stagingBytes_, cudaHostAllocDefault));
+  }
+  return staging_;
+}
+
+void QueryContext::upload(void* to, const void* from, size_t bytes, bool pinned) {
+  if (!pinned) {
+    void* stage = staging(bytes);
+    std::memcpy(stage, from, bytes);
+    from = stage;
+  }
+  SV_CUDA(cudaMemcpyAsync(to, from, bytes, cudaMemcpyHostToDevice, stream_));
+  // The staging buffer is reused by the next upload.
+  SV_CUDA(cudaStreamSynchronize(stream_));
+}
+
+const void* QueryContext::range(
+    const std::string& table,
+    const std::string& name,
+    int64_t first,
+    int64_t last,
+    size_t width) {
+  if (batchRows() == 0) {
+    return column(table, name, width);
+  }
+  const Column& meta = store_.metadata(table, name);
+  const size_t stored = dtypeSize(meta.dtype);
+  if (stored > width) {
+    throw std::runtime_error(table + "." + name + " is wider than requested");
+  }
+  const int64_t count = std::max<int64_t>(last - first, 0);
+  char* out = static_cast<char*>(batchBytes(count * width));
+  char* in = stored == width ? out : static_cast<char*>(batchBytes(count * stored));
+  if (meta.data != nullptr) {
+    upload(in, static_cast<const char*>(meta.data) + first * stored, count * stored, true);
+  } else {
+    void* stage = staging(count * stored);
+    store_.read(table, name, first, count, stage);
+    upload(in, stage, count * stored, true);
+  }
+  if (stored != width) {
+    switch (width) {
+      case 2:
+        widen(meta, in, reinterpret_cast<int16_t*>(out), stream_, count);
+        break;
+      case 4:
+        widen(meta, in, reinterpret_cast<int32_t*>(out), stream_, count);
+        break;
+      default:
+        widen(meta, in, reinterpret_cast<int64_t*>(out), stream_, count);
+    }
+  }
+  return out - first * static_cast<int64_t>(width);
+}
+
+QueryContext::StringRows
+QueryContext::strings(const std::string& table, const std::string& name, int64_t first, int64_t last) {
+  if (batchRows() == 0) {
+    return {offsets(table, name), chars(table, name)};
+  }
+  const int64_t count = std::max<int64_t>(last - first, 0);
+  auto* offsetRows = static_cast<int64_t*>(batchBytes((count + 1) * sizeof(int64_t)));
+  const Column& meta = store_.metadata(table, name);
+  if (meta.data != nullptr) {
+    const int64_t begin = meta.offsets[first];
+    const int64_t end = meta.offsets[first + count];
+    upload(offsetRows, meta.offsets + first, (count + 1) * sizeof(int64_t), true);
+    char* chars = static_cast<char*>(batchBytes(end - begin));
+    upload(chars, static_cast<const char*>(meta.data) + begin, end - begin, true);
+    return {offsetRows - first, chars - begin};
+  }
+  auto* hostOffsets = static_cast<int64_t*>(staging((count + 1) * sizeof(int64_t)));
+  store_.read(table, name, first, count, hostOffsets);
+  const int64_t begin = hostOffsets[0];
+  const int64_t end = hostOffsets[count];
+  upload(offsetRows, hostOffsets, (count + 1) * sizeof(int64_t), true);
+  char* chars = static_cast<char*>(batchBytes(end - begin));
+  void* stage = staging(end - begin);
+  store_.readChars(table, name, begin, end, stage);
+  upload(chars, stage, end - begin, true);
+  return {offsetRows - first, chars - begin};
 }
 
 const void* QueryContext::column(const std::string& table, const std::string& name, size_t width) {
@@ -187,28 +299,44 @@ const char* QueryContext::chars(const std::string& table, const std::string& nam
 }
 
 const int2* QueryContext::zones(const std::string& table, const std::string& name) {
-  const Column& column = store_.column(table, name);
+  const Column& column = batchRows() > 0 ? store_.metadata(table, name) : store_.column(table, name);
   const int64_t count = (column.rows + kZoneRows - 1) / kZoneRows;
   return static_cast<const int2*>(cache_.derived(
       table + "." + name + "#zones",
       count * sizeof(int2),
       [&](void* out) {
-        auto* zones = static_cast<int2*>(out);
-        const void* in = column.data;
-        switch (column.dtype) {
-          case DType::kInt8:
-            zoneKernel<<<count, 256, 0, stream_>>>(static_cast<const int8_t*>(in), column.rows, zones);
-            break;
-          case DType::kInt16:
-            zoneKernel<<<count, 256, 0, stream_>>>(static_cast<const int16_t*>(in), column.rows, zones);
-            break;
-          case DType::kInt32:
-            zoneKernel<<<count, 256, 0, stream_>>>(static_cast<const int32_t*>(in), column.rows, zones);
-            break;
-          default:
-            throw std::runtime_error("no zones for int64 " + name);
+        // Batch by batch, the column streams through a chunk buffer as a file
+        // writer computing its statistics would.
+        const int64_t chunkRows = batchRows() > 0 ? int64_t{1} << 26 : column.rows;
+        const size_t width = dtypeSize(column.dtype);
+        void* chunk = batchRows() > 0 ? scratchBytes(chunkRows * width) : nullptr;
+        for (int64_t first = 0; first < column.rows; first += chunkRows) {
+          const int64_t rows = std::min(chunkRows, column.rows - first);
+          const void* in = column.data;
+          if (chunk != nullptr) {
+            void* stage = staging(rows * width);
+            store_.read(table, name, first, rows, stage);
+            upload(chunk, stage, rows * width, true);
+            in = chunk;
+          }
+          auto* zones = static_cast<int2*>(out) + first / kZoneRows;
+          const int64_t chunkZones = (rows + kZoneRows - 1) / kZoneRows;
+          switch (column.dtype) {
+            case DType::kInt8:
+              zoneKernel<<<chunkZones, 256, 0, stream_>>>(static_cast<const int8_t*>(in), rows, zones);
+              break;
+            case DType::kInt16:
+              zoneKernel<<<chunkZones, 256, 0, stream_>>>(static_cast<const int16_t*>(in), rows, zones);
+              break;
+            case DType::kInt32:
+              zoneKernel<<<chunkZones, 256, 0, stream_>>>(static_cast<const int32_t*>(in), rows, zones);
+              break;
+            default:
+              throw std::runtime_error("no zones for int64 " + name);
+          }
+          SV_CUDA(cudaGetLastError());
+          SV_CUDA(cudaStreamSynchronize(stream_));
         }
-        SV_CUDA(cudaGetLastError());
       },
       stream_));
 }

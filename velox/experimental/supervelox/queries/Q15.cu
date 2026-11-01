@@ -64,10 +64,6 @@ const std::vector<ResultField> kSchema = {
 
 Result q15(QueryContext& ctx) {
   Q15Args a;
-  a.shipdate = ctx.col<int16_t>("lineitem", "l_shipdate");
-  a.suppkey = ctx.col<int32_t>("lineitem", "l_suppkey");
-  a.price = ctx.col<int32_t>("lineitem", "l_extendedprice");
-  a.discount = ctx.col<int8_t>("lineitem", "l_discount");
   a.zones = ctx.zones("lineitem", "l_shipdate");
   a.rows = ctx.rows("lineitem");
   a.dateLow = days(1996, 1, 1);
@@ -82,6 +78,10 @@ Result q15(QueryContext& ctx) {
       [&](int64_t first, int64_t last) {
         a.firstZone = first;
         a.lastZone = last;
+        a.shipdate = ctx.rows<int16_t>("lineitem", "l_shipdate", first * kZone, std::min(a.rows, last * kZone));
+        a.suppkey = ctx.rows<int32_t>("lineitem", "l_suppkey", first * kZone, std::min(a.rows, last * kZone));
+        a.price = ctx.rows<int32_t>("lineitem", "l_extendedprice", first * kZone, std::min(a.rows, last * kZone));
+        a.discount = ctx.rows<int8_t>("lineitem", "l_discount", first * kZone, std::min(a.rows, last * kZone));
         q15Kernel<<<persistentBlocks(q15Kernel, kThreads), kThreads, 0, ctx.stream()>>>(a);
       },
       kZone);

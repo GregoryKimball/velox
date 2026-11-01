@@ -104,10 +104,6 @@ Result q20(QueryContext& ctx) {
   Q20Args a;
   a.partCount = ctx.rows("part");
   a.parts = rankBitmap(ctx, likeBitmap(ctx, "part", "p_name", Match::kPrefix, "forest"), a.partCount);
-  a.shipdate = ctx.col<int16_t>("lineitem", "l_shipdate");
-  a.partkey = ctx.col<int32_t>("lineitem", "l_partkey");
-  a.suppkey = ctx.col<int32_t>("lineitem", "l_suppkey");
-  a.quantity = ctx.col<int16_t>("lineitem", "l_quantity");
   a.partsuppSuppkey = ctx.col<int32_t>("partsupp", "ps_suppkey");
   a.availqty = ctx.col<int16_t>("partsupp", "ps_availqty");
   a.supplierNation = ctx.col<int8_t>("supplier", "s_nationkey");
@@ -129,6 +125,10 @@ Result q20(QueryContext& ctx) {
       [&](int64_t first, int64_t last) {
         a.firstZone = first;
         a.lastZone = last;
+        a.shipdate = ctx.rows<int16_t>("lineitem", "l_shipdate", first * kZone, std::min(a.rows, last * kZone));
+        a.partkey = ctx.rows<int32_t>("lineitem", "l_partkey", first * kZone, std::min(a.rows, last * kZone));
+        a.suppkey = ctx.rows<int32_t>("lineitem", "l_suppkey", first * kZone, std::min(a.rows, last * kZone));
+        a.quantity = ctx.rows<int16_t>("lineitem", "l_quantity", first * kZone, std::min(a.rows, last * kZone));
         q20LineKernel<<<persistentBlocks(q20LineKernel, kThreads), kThreads, 0, ctx.stream()>>>(a);
       },
       kZone);

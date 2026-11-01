@@ -29,12 +29,25 @@ namespace facebook::velox::supervelox {
 /// the lines of order row o are [starts[o], starts[o + 1]).
 const uint32_t* orderLineStarts(QueryContext& ctx);
 
+/// The lines of order rows [first, last): those of order row o are
+/// [base + starts[o], base + starts[o + 1]), with 'starts' valid at
+/// [first, last]. In one batch the whole orderLineStarts with base 0 and
+/// [firstLine, lastLine) all of lineitem; batch by batch, offsets from
+/// 'base' = 'firstLine' built for these orders only.
+struct LineRange {
+  const uint32_t* starts;
+  int64_t base;
+  int64_t firstLine;
+  int64_t lastLine;
+};
+LineRange lineRange(QueryContext& ctx, int64_t first, int64_t last);
+
 /// {min, max} over all lines of lineitem.'column' minus the o_orderdate of the
 /// line's order. Lets lineitem date predicates bound the range of orders.
 std::pair<int32_t, int32_t> lineDateLag(QueryContext& ctx, const std::string& column);
 
 /// Rows [begin, end) of 'table' whose values of the ascending 'column' are in
-/// [low, high). Reads the pinned host copy.
+/// [low, high), found by reading single values.
 std::pair<int64_t, int64_t>
 sortedRange(QueryContext& ctx, const std::string& table, const std::string& column, int64_t low, int64_t high);
 
@@ -58,6 +71,18 @@ const uint32_t* likeBitmap(
     Match match,
     const std::string& pattern,
     const std::string& second = "");
+
+/// Like likeBitmap for rows [first, last) of 'strings', setting bit r - first
+/// of 'bits' for a match at row r.
+void likeRows(
+    QueryContext& ctx,
+    QueryContext::StringRows strings,
+    int64_t first,
+    int64_t last,
+    Match match,
+    const std::string& pattern,
+    const std::string& second,
+    uint32_t* bits);
 
 /// Dense numbering of the set bits of a bitmap over 'rows' rows: the rank of
 /// row r is ranks[r / 32] + popcount of the lower bits of its word.

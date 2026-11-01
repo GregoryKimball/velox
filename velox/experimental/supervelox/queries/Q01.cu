@@ -13,6 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <algorithm>
+
 #include "velox/experimental/supervelox/queries/Kernels.cuh"
 
 namespace facebook::velox::supervelox {
@@ -188,13 +190,6 @@ const std::vector<ResultField> kSchema = {
 
 Result q1(QueryContext& ctx) {
   Q1Args a;
-  a.returnflag = ctx.col<int8_t>("lineitem", "l_returnflag");
-  a.linestatus = ctx.col<int8_t>("lineitem", "l_linestatus");
-  a.quantity = ctx.col<int16_t>("lineitem", "l_quantity");
-  a.price = ctx.col<int32_t>("lineitem", "l_extendedprice");
-  a.discount = ctx.col<int8_t>("lineitem", "l_discount");
-  a.tax = ctx.col<int8_t>("lineitem", "l_tax");
-  a.shipdate = ctx.col<int16_t>("lineitem", "l_shipdate");
   a.zones = ctx.zones("lineitem", "l_shipdate");
   a.rows = ctx.rows("lineitem");
   a.dateLimit = ctx.param("shipdate_max", days(1998, 9, 2));
@@ -207,14 +202,21 @@ Result q1(QueryContext& ctx) {
       [&](int64_t first, int64_t last) {
         a.firstZone = first;
         a.lastZone = last;
+        a.returnflag = ctx.rows<int8_t>("lineitem", "l_returnflag", first * kZone, std::min(a.rows, last * kZone));
+        a.linestatus = ctx.rows<int8_t>("lineitem", "l_linestatus", first * kZone, std::min(a.rows, last * kZone));
+        a.quantity = ctx.rows<int16_t>("lineitem", "l_quantity", first * kZone, std::min(a.rows, last * kZone));
+        a.price = ctx.rows<int32_t>("lineitem", "l_extendedprice", first * kZone, std::min(a.rows, last * kZone));
+        a.discount = ctx.rows<int8_t>("lineitem", "l_discount", first * kZone, std::min(a.rows, last * kZone));
+        a.tax = ctx.rows<int8_t>("lineitem", "l_tax", first * kZone, std::min(a.rows, last * kZone));
+        a.shipdate = ctx.rows<int16_t>("lineitem", "l_shipdate", first * kZone, std::min(a.rows, last * kZone));
         q1Kernel<<<persistentBlocks(q1Kernel, kThreads), kThreads, 0, ctx.stream()>>>(a, totals);
       },
       kZone);
   SV_CUDA(cudaGetLastError());
   auto host = ctx.download(totals, kGroups);
 
-  const auto& flags = ctx.meta("lineitem", "l_returnflag").dictionary;
-  const auto& statuses = ctx.meta("lineitem", "l_linestatus").dictionary;
+  const auto& flags = ctx.info("lineitem", "l_returnflag").dictionary;
+  const auto& statuses = ctx.info("lineitem", "l_linestatus").dictionary;
   Result result(kSchema);
   for (int g = 0; g < kGroups; ++g) {
     const Totals& t = host[g];

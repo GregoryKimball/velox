@@ -25,6 +25,7 @@ constexpr int kMaxLines = 8;
 
 struct Q21Args {
   const uint32_t* starts;
+  int64_t lineBase;
   const int8_t* status;
   const int32_t* suppkey;
   const int16_t* commitdate;
@@ -42,8 +43,8 @@ __global__ void q21Kernel(Q21Args a) {
     if (a.status[o] != a.statusCode) {
       continue;
     }
-    const uint32_t begin = a.starts[o];
-    const int n = a.starts[o + 1] - begin;
+    const int64_t begin = a.lineBase + a.starts[o];
+    const int n = a.lineBase + a.starts[o + 1] - begin;
     if (n > kMaxLines) {
       // TPC-H orders have at most 7 lines.
       __trap();
@@ -90,13 +91,8 @@ const std::vector<ResultField> kSchema = {
 
 Result q21(QueryContext& ctx) {
   Q21Args a;
-  a.starts = orderLineStarts(ctx);
-  a.status = ctx.col<int8_t>("orders", "o_orderstatus");
-  a.suppkey = ctx.col<int32_t>("lineitem", "l_suppkey");
-  a.commitdate = ctx.col<int16_t>("lineitem", "l_commitdate");
-  a.receiptdate = ctx.col<int16_t>("lineitem", "l_receiptdate");
   a.supplierNation = ctx.col<int8_t>("supplier", "s_nationkey");
-  a.statusCode = ctx.meta("orders", "o_orderstatus").code("F");
+  a.statusCode = ctx.info("orders", "o_orderstatus").code("F");
   a.nation = nationKey(ctx, "SAUDI ARABIA");
   const int64_t suppliers = ctx.rows("supplier");
   a.counts = ctx.zeroed<unsigned long long>(suppliers);
@@ -105,6 +101,13 @@ Result q21(QueryContext& ctx) {
       0,
       ctx.rows("orders"),
       [&](int64_t first, int64_t last) {
+        const LineRange lines = lineRange(ctx, first, last);
+        a.starts = lines.starts;
+        a.lineBase = lines.base;
+        a.status = ctx.rows<int8_t>("orders", "o_orderstatus", first, last);
+        a.suppkey = ctx.rows<int32_t>("lineitem", "l_suppkey", lines.firstLine, lines.lastLine);
+        a.commitdate = ctx.rows<int16_t>("lineitem", "l_commitdate", lines.firstLine, lines.lastLine);
+        a.receiptdate = ctx.rows<int16_t>("lineitem", "l_receiptdate", lines.firstLine, lines.lastLine);
         a.firstOrder = first;
         a.orders = last;
         q21Kernel<<<4096, 256, 0, ctx.stream()>>>(a);

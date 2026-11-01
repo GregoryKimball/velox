@@ -23,6 +23,7 @@ constexpr int kModes = 8;
 
 struct Q12Args {
   const uint32_t* starts;
+  int64_t lineBase;
   const int8_t* priority;
   const int8_t* shipmode;
   const int16_t* shipdate;
@@ -46,7 +47,7 @@ __global__ void q12Kernel(Q12Args a) {
   for (int64_t o = a.begin + blockIdx.x * (int64_t)blockDim.x + threadIdx.x; o < a.end;
        o += (int64_t)gridDim.x * blockDim.x) {
     const int isHigh = a.high.contains(a.priority[o]) ? 0 : 1;
-    for (uint32_t line = a.starts[o]; line < a.starts[o + 1]; ++line) {
+    for (int64_t line = a.lineBase + a.starts[o]; line < a.lineBase + a.starts[o + 1]; ++line) {
       const int mode = a.shipmode[line];
       if (!a.modes.contains(mode)) {
         continue;
@@ -78,12 +79,6 @@ Result q12(QueryContext& ctx) {
   const auto range = sortedRange(ctx, "orders", "o_orderdate", a.dateLow - lag.second, a.dateHigh - lag.first);
   a.begin = range.first;
   a.end = range.second;
-  a.starts = orderLineStarts(ctx);
-  a.priority = ctx.col<int8_t>("orders", "o_orderpriority");
-  a.shipmode = ctx.col<int8_t>("lineitem", "l_shipmode");
-  a.shipdate = ctx.col<int16_t>("lineitem", "l_shipdate");
-  a.commitdate = ctx.col<int16_t>("lineitem", "l_commitdate");
-  a.receiptdate = ctx.col<int16_t>("lineitem", "l_receiptdate");
   a.modes = codesParam(ctx, "shipmodes", dictionaryCodes(ctx, "lineitem", "l_shipmode", {"MAIL", "SHIP"}));
   a.high = codesParam(ctx, "high_priorities", dictionaryCodes(ctx, "orders", "o_orderpriority", {"1-URGENT", "2-HIGH"}));
   a.counts = ctx.zeroed<unsigned long long>(kModes * 2);
@@ -93,6 +88,14 @@ Result q12(QueryContext& ctx) {
       all.first,
       all.second,
       [&](int64_t first, int64_t last) {
+        const LineRange lines = lineRange(ctx, first, last);
+        a.starts = lines.starts;
+        a.lineBase = lines.base;
+        a.priority = ctx.rows<int8_t>("orders", "o_orderpriority", first, last);
+        a.shipmode = ctx.rows<int8_t>("lineitem", "l_shipmode", lines.firstLine, lines.lastLine);
+        a.shipdate = ctx.rows<int16_t>("lineitem", "l_shipdate", lines.firstLine, lines.lastLine);
+        a.commitdate = ctx.rows<int16_t>("lineitem", "l_commitdate", lines.firstLine, lines.lastLine);
+        a.receiptdate = ctx.rows<int16_t>("lineitem", "l_receiptdate", lines.firstLine, lines.lastLine);
         a.begin = first;
         a.end = last;
         q12Kernel<<<2048, 256, 0, ctx.stream()>>>(a);
@@ -100,7 +103,7 @@ Result q12(QueryContext& ctx) {
       4);
   SV_CUDA(cudaGetLastError());
   auto counts = ctx.download(a.counts, kModes * 2);
-  const auto& names = ctx.meta("lineitem", "l_shipmode").dictionary;
+  const auto& names = ctx.info("lineitem", "l_shipmode").dictionary;
   if (names.size() > kModes) {
     throw std::runtime_error("too many ship modes");
   }

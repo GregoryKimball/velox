@@ -76,6 +76,21 @@ class ColumnStore {
 
   int64_t rows(const std::string& table);
 
+  /// Copies rows [first, first + count) of a fixed-width column as stored, or
+  /// for a string column its offsets [first, first + count], to host 'out'.
+  /// Reads the column's file unless the column is loaded.
+  void read(const std::string& table, const std::string& name, int64_t first, int64_t count, void* out);
+
+  /// Copies characters [begin, end) of a string column to host 'out'.
+  void readChars(const std::string& table, const std::string& name, int64_t begin, int64_t end, void* out);
+
+  /// The value at 'row' of a fixed-width column as stored (unscaled, codes),
+  /// read from the file unless the column is loaded.
+  int64_t value(const std::string& table, const std::string& name, int64_t row);
+
+  /// The value at 'row' of a string column, or the decoded dictionary value.
+  std::string string(const std::string& table, const std::string& name, int64_t row);
+
   /// "table.column" for every column of the named tables.
   std::vector<std::string> columns(const std::vector<std::string>& tables);
 

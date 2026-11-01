@@ -24,6 +24,7 @@ constexpr int kBins = 4;
 
 struct Q8Args {
   const uint32_t* starts;
+  int64_t lineBase;
   const int32_t* custkey;
   const int16_t* orderdate;
   const int8_t* customerNation;
@@ -54,7 +55,7 @@ __global__ void q8Kernel(Q8Args a) {
       continue;
     }
     const int year = a.orderdate[o] >= a.secondYear ? 1 : 0;
-    for (uint32_t line = a.starts[o]; line < a.starts[o + 1]; ++line) {
+    for (int64_t line = a.lineBase + a.starts[o]; line < a.lineBase + a.starts[o + 1]; ++line) {
       if (a.partType[a.partkey[line] - 1] != a.typeCode) {
         continue;
       }
@@ -82,16 +83,9 @@ Result q8(QueryContext& ctx) {
   a.begin = range.first;
   a.end = range.second;
   a.secondYear = days(1996, 1, 1);
-  a.starts = orderLineStarts(ctx);
-  a.custkey = ctx.col<int32_t>("orders", "o_custkey");
-  a.orderdate = ctx.col<int16_t>("orders", "o_orderdate");
   a.customerNation = ctx.col<int8_t>("customer", "c_nationkey");
-  a.partkey = ctx.col<int32_t>("lineitem", "l_partkey");
   a.partType = ctx.col<int16_t>("part", "p_type");
-  a.suppkey = ctx.col<int32_t>("lineitem", "l_suppkey");
   a.supplierNation = ctx.col<int8_t>("supplier", "s_nationkey");
-  a.price = ctx.col<int32_t>("lineitem", "l_extendedprice");
-  a.discount = ctx.col<int8_t>("lineitem", "l_discount");
   a.nations = nationsInRegion(ctx, "AMERICA");
   a.typeCode = ctx.meta("part", "p_type").code("ECONOMY ANODIZED STEEL");
   a.nation = nationKey(ctx, "BRAZIL");
@@ -102,6 +96,15 @@ Result q8(QueryContext& ctx) {
       all.first,
       all.second,
       [&](int64_t first, int64_t last) {
+        const LineRange lines = lineRange(ctx, first, last);
+        a.starts = lines.starts;
+        a.lineBase = lines.base;
+        a.custkey = ctx.rows<int32_t>("orders", "o_custkey", first, last);
+        a.orderdate = ctx.rows<int16_t>("orders", "o_orderdate", first, last);
+        a.partkey = ctx.rows<int32_t>("lineitem", "l_partkey", lines.firstLine, lines.lastLine);
+        a.suppkey = ctx.rows<int32_t>("lineitem", "l_suppkey", lines.firstLine, lines.lastLine);
+        a.price = ctx.rows<int32_t>("lineitem", "l_extendedprice", lines.firstLine, lines.lastLine);
+        a.discount = ctx.rows<int8_t>("lineitem", "l_discount", lines.firstLine, lines.lastLine);
         a.begin = first;
         a.end = last;
         q8Kernel<<<2048, 256, 0, ctx.stream()>>>(a);

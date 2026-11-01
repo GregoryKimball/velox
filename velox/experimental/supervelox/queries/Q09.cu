@@ -28,6 +28,7 @@ constexpr int kBins = kNations * kYears;
 
 struct Q9Args {
   const uint32_t* starts;
+  int64_t lineBase;
   const int16_t* orderdate;
   const int32_t* partkey;
   const int32_t* suppkey;
@@ -52,7 +53,7 @@ __global__ void q9Kernel(Q9Args a) {
   __syncthreads();
   for (int64_t o = a.firstOrder + blockIdx.x * (int64_t)blockDim.x + threadIdx.x; o < a.orders; o += (int64_t)gridDim.x * blockDim.x) {
     const int year = yearOf(a.orderdate[o]) - kFirstYear;
-    for (uint32_t line = a.starts[o]; line < a.starts[o + 1]; ++line) {
+    for (int64_t line = a.lineBase + a.starts[o]; line < a.lineBase + a.starts[o + 1]; ++line) {
       const int part = a.partkey[line];
       if (!testBit(a.parts, part - 1)) {
         continue;
@@ -89,13 +90,6 @@ const std::vector<ResultField> kSchema = {
 Result q9(QueryContext& ctx) {
   Q9Args a;
   a.parts = likeBitmap(ctx, "part", "p_name", Match::kContains, "green");
-  a.starts = orderLineStarts(ctx);
-  a.orderdate = ctx.col<int16_t>("orders", "o_orderdate");
-  a.partkey = ctx.col<int32_t>("lineitem", "l_partkey");
-  a.suppkey = ctx.col<int32_t>("lineitem", "l_suppkey");
-  a.quantity = ctx.col<int16_t>("lineitem", "l_quantity");
-  a.price = ctx.col<int32_t>("lineitem", "l_extendedprice");
-  a.discount = ctx.col<int8_t>("lineitem", "l_discount");
   a.partsuppSuppkey = ctx.col<int32_t>("partsupp", "ps_suppkey");
   a.supplycost = ctx.col<int32_t>("partsupp", "ps_supplycost");
   a.supplierNation = ctx.col<int8_t>("supplier", "s_nationkey");
@@ -106,6 +100,15 @@ Result q9(QueryContext& ctx) {
       0,
       ctx.rows("orders"),
       [&](int64_t first, int64_t last) {
+        const LineRange lines = lineRange(ctx, first, last);
+        a.starts = lines.starts;
+        a.lineBase = lines.base;
+        a.orderdate = ctx.rows<int16_t>("orders", "o_orderdate", first, last);
+        a.partkey = ctx.rows<int32_t>("lineitem", "l_partkey", lines.firstLine, lines.lastLine);
+        a.suppkey = ctx.rows<int32_t>("lineitem", "l_suppkey", lines.firstLine, lines.lastLine);
+        a.quantity = ctx.rows<int16_t>("lineitem", "l_quantity", lines.firstLine, lines.lastLine);
+        a.price = ctx.rows<int32_t>("lineitem", "l_extendedprice", lines.firstLine, lines.lastLine);
+        a.discount = ctx.rows<int8_t>("lineitem", "l_discount", lines.firstLine, lines.lastLine);
         a.firstOrder = first;
         a.orders = last;
         q9Kernel<<<4096, 256, 0, ctx.stream()>>>(a);

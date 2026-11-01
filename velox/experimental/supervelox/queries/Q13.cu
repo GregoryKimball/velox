@@ -138,9 +138,44 @@ const std::vector<ResultField> kSchema = {
     {"custdist", ResultType::kBigint},
 };
 
+void countOrders(QueryContext& ctx, int64_t orders, uint32_t* counts);
+Result histogramResult(QueryContext& ctx, const uint32_t* counts, int64_t customers);
+
 Result q13(QueryContext& ctx) {
   const int64_t orders = ctx.rows("orders");
   const int64_t customers = ctx.rows("customer");
+  auto* counts = ctx.zeroed<uint32_t>((customers + 3) / 4);
+  if (batchRows() > 0) {
+    forBatches(
+        ctx,
+        0,
+        orders,
+        [&](int64_t first, int64_t last) {
+          auto* excluded = ctx.batchScratch<uint32_t>((last - first + 31) / 32);
+          likeRows(
+              ctx,
+              ctx.strings("orders", "o_comment", first, last),
+              first,
+              last,
+              Match::kContains,
+              "special",
+              "requests",
+              excluded);
+          q13OrdersKernel<<<4096, 256, 0, ctx.stream()>>>(
+              ctx.rows<int32_t>("orders", "o_custkey", first, last), excluded - first / 32, first, last, counts);
+        },
+        64,
+        32);
+  } else {
+    countOrders(ctx, orders, counts);
+  }
+  SV_CUDA(cudaGetLastError());
+  return histogramResult(ctx, counts, customers);
+}
+
+/// Without batches: one pass over all comment bytes, each thread scanning a
+/// chunk, then one over the orders.
+void countOrders(QueryContext& ctx, int64_t orders, uint32_t* counts) {
   const Column& comment = ctx.meta("orders", "o_comment");
   const int64_t* offsets = ctx.offsets("orders", "o_comment");
   const int64_t blocks = (comment.bytes + kBlockBytes - 1) / kBlockBytes;
@@ -159,7 +194,6 @@ Result q13(QueryContext& ctx) {
         chars, comment.bytes, offsets, orders, blockRows, first, last, excluded);
   });
   SV_CUDA(cudaGetLastError());
-  auto* counts = ctx.zeroed<uint32_t>((customers + 3) / 4);
   const int32_t* custkey = ctx.col<int32_t>("orders", "o_custkey");
   forBatches(
       ctx,
@@ -169,7 +203,9 @@ Result q13(QueryContext& ctx) {
         q13OrdersKernel<<<4096, 256, 0, ctx.stream()>>>(custkey, excluded, first, last, counts);
       },
       4);
-  SV_CUDA(cudaGetLastError());
+}
+
+Result histogramResult(QueryContext& ctx, const uint32_t* counts, int64_t customers) {
   auto* histogram = ctx.zeroed<unsigned long long>(kMaxCount);
   q13HistogramKernel<<<1024, kMaxCount, 0, ctx.stream()>>>(counts, customers, histogram);
   SV_CUDA(cudaGetLastError());

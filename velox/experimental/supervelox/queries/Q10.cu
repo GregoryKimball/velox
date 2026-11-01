@@ -23,6 +23,7 @@ namespace {
 
 __global__ void q10Kernel(
     const uint32_t* starts,
+    int64_t lineBase,
     const int32_t* custkey,
     const int8_t* returnflag,
     const int32_t* price,
@@ -34,7 +35,7 @@ __global__ void q10Kernel(
   for (int64_t o = begin + blockIdx.x * (int64_t)blockDim.x + threadIdx.x; o < end;
        o += (int64_t)gridDim.x * blockDim.x) {
     long long sum = 0;
-    for (uint32_t line = starts[o]; line < starts[o + 1]; ++line) {
+    for (int64_t line = lineBase + starts[o]; line < lineBase + starts[o + 1]; ++line) {
       if (returnflag[line] == flag) {
         sum += (long long)price[line] * (100 - discount[line]);
       }
@@ -60,19 +61,24 @@ Result q10(QueryContext& ctx) {
   const auto [begin, end] = sortedRange(ctx, "orders", "o_orderdate", days(1993, 10, 1), days(1994, 1, 1));
   const int64_t customers = ctx.rows("customer");
   auto* revenue = ctx.zeroed<unsigned long long>(customers);
-  const uint32_t* starts = orderLineStarts(ctx);
-  const int32_t* custkey = ctx.col<int32_t>("orders", "o_custkey");
-  const int8_t* returnflag = ctx.col<int8_t>("lineitem", "l_returnflag");
-  const int32_t* price = ctx.col<int32_t>("lineitem", "l_extendedprice");
-  const int8_t* discount = ctx.col<int8_t>("lineitem", "l_discount");
-  const int32_t returned = ctx.meta("lineitem", "l_returnflag").code("R");
+  const int32_t returned = ctx.info("lineitem", "l_returnflag").code("R");
   forBatches(
       ctx,
       begin,
       end,
       [&](int64_t first, int64_t last) {
+        const LineRange lines = lineRange(ctx, first, last);
         q10Kernel<<<2048, 256, 0, ctx.stream()>>>(
-            starts, custkey, returnflag, price, discount, first, last, returned, revenue);
+            lines.starts,
+            lines.base,
+            ctx.rows<int32_t>("orders", "o_custkey", first, last),
+            ctx.rows<int8_t>("lineitem", "l_returnflag", lines.firstLine, lines.lastLine),
+            ctx.rows<int32_t>("lineitem", "l_extendedprice", lines.firstLine, lines.lastLine),
+            ctx.rows<int8_t>("lineitem", "l_discount", lines.firstLine, lines.lastLine),
+            first,
+            last,
+            returned,
+            revenue);
       },
       4);
   SV_CUDA(cudaGetLastError());

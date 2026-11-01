@@ -99,17 +99,11 @@ const std::vector<ResultField> kSchema = {{"revenue", ResultType::kDecimal, 38, 
 
 Result q19(QueryContext& ctx) {
   Q19Args a;
-  a.shipinstruct = ctx.col<int8_t>("lineitem", "l_shipinstruct");
-  a.shipmode = ctx.col<int8_t>("lineitem", "l_shipmode");
-  a.partkey = ctx.col<int32_t>("lineitem", "l_partkey");
-  a.quantity = ctx.col<int16_t>("lineitem", "l_quantity");
-  a.price = ctx.col<int32_t>("lineitem", "l_extendedprice");
-  a.discount = ctx.col<int8_t>("lineitem", "l_discount");
   a.brand = ctx.col<int8_t>("part", "p_brand");
   a.container = ctx.col<int8_t>("part", "p_container");
   a.size = ctx.col<int8_t>("part", "p_size");
   a.rows = ctx.rows("lineitem");
-  a.instruct = ctx.param("shipinstruct", ctx.meta("lineitem", "l_shipinstruct").code("DELIVER IN PERSON"));
+  a.instruct = ctx.param("shipinstruct", ctx.info("lineitem", "l_shipinstruct").code("DELIVER IN PERSON"));
   a.modes = codesParam(ctx, "shipmodes", dictionaryCodes(ctx, "lineitem", "l_shipmode", {"AIR", "AIR REG"}));
   const Column& brand = ctx.meta("part", "p_brand");
   const Branch defaults[3] = {
@@ -150,6 +144,12 @@ Result q19(QueryContext& ctx) {
       [&](int64_t first, int64_t last) {
         a.firstRow = first;
         a.rows = last;
+        a.shipinstruct = ctx.rows<int8_t>("lineitem", "l_shipinstruct", first, last);
+        a.shipmode = ctx.rows<int8_t>("lineitem", "l_shipmode", first, last);
+        a.partkey = ctx.rows<int32_t>("lineitem", "l_partkey", first, last);
+        a.quantity = ctx.rows<int16_t>("lineitem", "l_quantity", first, last);
+        a.price = ctx.rows<int32_t>("lineitem", "l_extendedprice", first, last);
+        a.discount = ctx.rows<int8_t>("lineitem", "l_discount", first, last);
         q19Kernel<<<persistentBlocks(q19Kernel, kThreads), kThreads, 0, ctx.stream()>>>(a);
       },
       1,

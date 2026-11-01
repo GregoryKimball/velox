@@ -103,6 +103,11 @@ class QueryContext {
     return store_.column(table, name);
   }
 
+  /// The description and dictionary of table.name, without loading its values.
+  const Column& info(const std::string& table, const std::string& name) {
+    return store_.metadata(table, name);
+  }
+
   int64_t rows(const std::string& table) {
     return store_.rows(table);
   }
@@ -116,6 +121,44 @@ class QueryContext {
 
   const int64_t* offsets(const std::string& table, const std::string& name);
   const char* chars(const std::string& table, const std::string& name);
+
+  /// Device-readable rows [first, last) of a fixed-width column as T, at
+  /// p + first through p + last - 1 of the returned p. In one batch the whole
+  /// cached column; run batch by batch, only these rows, copied into memory
+  /// that endBatch frees.
+  template <typename T>
+  const T* rows(const std::string& table, const std::string& name, int64_t first, int64_t last) {
+    return static_cast<const T*>(range(table, name, first, last, sizeof(T)));
+  }
+
+  /// Rows [first, last) of a string column: offsets valid at [first, last]
+  /// and characters at the absolute positions those offsets give.
+  struct StringRows {
+    const int64_t* offsets;
+    const char* chars;
+  };
+  StringRows strings(const std::string& table, const std::string& name, int64_t first, int64_t last);
+
+  /// Device memory that endBatch frees.
+  void* batchBytes(size_t bytes);
+
+  template <typename T>
+  T* batchScratch(size_t count) {
+    return static_cast<T*>(batchBytes(count * sizeof(T)));
+  }
+
+  /// Frees the memory of the batch that just finished.
+  void endBatch();
+
+  /// A value of table.name as stored, read from the store without loading
+  /// the column.
+  int64_t value(const std::string& table, const std::string& name, int64_t row) {
+    return store_.value(table, name, row);
+  }
+
+  std::string string(const std::string& table, const std::string& name, int64_t row) {
+    return store_.string(table, name, row);
+  }
 
   /// Per-zone {min, max} of an integer column, kZoneRows rows per zone.
   const int2* zones(const std::string& table, const std::string& name);
@@ -165,12 +208,20 @@ class QueryContext {
 
  private:
   const void* column(const std::string& table, const std::string& name, size_t width);
+  const void* range(const std::string& table, const std::string& name, int64_t first, int64_t last, size_t width);
+  /// Copies 'bytes' of host 'from' to device 'to', through pinned staging
+  /// unless 'from' is pinned.
+  void upload(void* to, const void* from, size_t bytes, bool pinned);
+  void* staging(size_t bytes);
 
   ColumnStore& store_;
   DeviceCache& cache_;
   cudaStream_t stream_;
   const QueryParams& params_;
   std::vector<void*> scratch_;
+  std::vector<void*> batch_;
+  void* staging_{nullptr};
+  size_t stagingBytes_{0};
   const bool trace_;
   double lastMark_;
 };

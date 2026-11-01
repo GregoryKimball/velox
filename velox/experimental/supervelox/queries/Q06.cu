@@ -13,6 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <algorithm>
+
 #include "velox/experimental/supervelox/queries/Kernels.cuh"
 
 namespace facebook::velox::supervelox {
@@ -104,10 +106,6 @@ const std::vector<ResultField> kSchema = {{"revenue", ResultType::kDecimal, 38, 
 
 Result q6(QueryContext& ctx) {
   Q6Args a;
-  a.shipdate = ctx.col<int16_t>("lineitem", "l_shipdate");
-  a.discount = ctx.col<int8_t>("lineitem", "l_discount");
-  a.quantity = ctx.col<int16_t>("lineitem", "l_quantity");
-  a.price = ctx.col<int32_t>("lineitem", "l_extendedprice");
   a.zones = ctx.zones("lineitem", "l_shipdate");
   a.rows = ctx.rows("lineitem");
   a.dateLow = ctx.param("shipdate_min", days(1994, 1, 1));
@@ -124,6 +122,10 @@ Result q6(QueryContext& ctx) {
       [&](int64_t first, int64_t last) {
         a.firstZone = first;
         a.lastZone = last;
+        a.shipdate = ctx.rows<int16_t>("lineitem", "l_shipdate", first * kZone, std::min(a.rows, last * kZone));
+        a.discount = ctx.rows<int8_t>("lineitem", "l_discount", first * kZone, std::min(a.rows, last * kZone));
+        a.quantity = ctx.rows<int16_t>("lineitem", "l_quantity", first * kZone, std::min(a.rows, last * kZone));
+        a.price = ctx.rows<int32_t>("lineitem", "l_extendedprice", first * kZone, std::min(a.rows, last * kZone));
         q6Kernel<<<persistentBlocks(q6Kernel, kThreads), kThreads, 0, ctx.stream()>>>(a, sum);
       },
       kZone);

@@ -23,6 +23,7 @@ namespace {
 
 __global__ void q18Kernel(
     const uint32_t* starts,
+    int64_t lineBase,
     const int16_t* quantity,
     int64_t begin,
     int64_t end,
@@ -32,7 +33,7 @@ __global__ void q18Kernel(
     unsigned long long capacity) {
   for (int64_t o = begin + blockIdx.x * (int64_t)blockDim.x + threadIdx.x; o < end; o += (int64_t)gridDim.x * blockDim.x) {
     int sum = 0;
-    for (uint32_t line = starts[o]; line < starts[o + 1]; ++line) {
+    for (int64_t line = lineBase + starts[o]; line < lineBase + starts[o + 1]; ++line) {
       sum += quantity[line];
     }
     if (sum > limit) {
@@ -55,49 +56,60 @@ const std::vector<ResultField> kSchema = {
 
 Result q18(QueryContext& ctx) {
   const int64_t orders = ctx.rows("orders");
-  const uint32_t* starts = orderLineStarts(ctx);
-  const int16_t* quantity = ctx.col<int16_t>("lineitem", "l_quantity");
   std::vector<Candidate> candidates;
-  for (unsigned long long capacity = 1 << 16;; capacity *= 16) {
-    auto* out = ctx.scratch<Candidate>(capacity);
-    auto* count = ctx.zeroed<unsigned long long>(1);
-    forBatches(
-        ctx,
-        0,
-        orders,
-        [&](int64_t first, int64_t last) {
-          q18Kernel<<<4096, 256, 0, ctx.stream()>>>(starts, quantity, first, last, 30000, out, count, capacity);
-        },
-        4);
-    SV_CUDA(cudaGetLastError());
-    const unsigned long long found = ctx.download(count, 1)[0];
-    if (found <= capacity) {
-      candidates = ctx.download(out, found);
-      break;
-    }
+  auto* count = ctx.scratch<unsigned long long>(1);
+  forBatches(
+      ctx,
+      0,
+      orders,
+      [&](int64_t first, int64_t last) {
+        const LineRange lines = lineRange(ctx, first, last);
+        const int16_t* quantity = ctx.rows<int16_t>("lineitem", "l_quantity", lines.firstLine, lines.lastLine);
+        // Few orders qualify; if more than the guess, rerun with room for all.
+        for (unsigned long long capacity = std::min<int64_t>(1 << 16, last - first);; capacity = last - first) {
+          auto* out = ctx.batchScratch<Candidate>(std::max<unsigned long long>(capacity, 1));
+          SV_CUDA(cudaMemsetAsync(count, 0, sizeof(*count), ctx.stream()));
+          q18Kernel<<<4096, 256, 0, ctx.stream()>>>(
+              lines.starts, lines.base, quantity, first, last, 30000, out, count, capacity);
+          SV_CUDA(cudaGetLastError());
+          const unsigned long long found = ctx.download(count, 1)[0];
+          if (found <= capacity) {
+            const auto batch = ctx.download(out, found);
+            candidates.insert(candidates.end(), batch.begin(), batch.end());
+            break;
+          }
+        }
+      },
+      4);
+  auto totalprice = [&](int64_t row) { return ctx.value("orders", "o_totalprice", row); };
+  auto orderdate = [&](int64_t row) { return ctx.value("orders", "o_orderdate", row); };
+  struct Ranked {
+    int64_t price;
+    int64_t date;
+    Candidate candidate;
+  };
+  std::vector<Ranked> ranked;
+  ranked.reserve(candidates.size());
+  for (const auto& c : candidates) {
+    ranked.push_back({totalprice(c.index), orderdate(c.index), c});
   }
-  const Column& totalprice = ctx.meta("orders", "o_totalprice");
-  const Column& orderdate = ctx.meta("orders", "o_orderdate");
-  std::sort(candidates.begin(), candidates.end(), [&](const Candidate& x, const Candidate& y) {
-    const int64_t px = totalprice.value(x.index);
-    const int64_t py = totalprice.value(y.index);
-    if (px != py) {
-      return px > py;
-    }
-    return orderdate.value(x.index) < orderdate.value(y.index);
+  std::sort(ranked.begin(), ranked.end(), [](const Ranked& x, const Ranked& y) {
+    return x.price != y.price ? x.price > y.price : x.date < y.date;
   });
-  candidates.resize(std::min<size_t>(candidates.size(), 100));
-  const Column& custkey = ctx.meta("orders", "o_custkey");
-  const Column& orderkey = ctx.meta("orders", "o_orderkey");
+  ranked.resize(std::min<size_t>(ranked.size(), 100));
+  candidates.clear();
+  for (const auto& r : ranked) {
+    candidates.push_back(r.candidate);
+  }
   const Column& name = ctx.meta("customer", "c_name");
   Result result(kSchema);
   for (const auto& c : candidates) {
-    const int64_t customer = custkey.value(c.index);
+    const int64_t customer = ctx.value("orders", "o_custkey", c.index);
     result.strings[0].push_back(name.string(customer - 1));
     result.ints[1].push_back(customer);
-    result.ints[2].push_back(orderkey.value(c.index));
-    result.ints[3].push_back(orderdate.value(c.index));
-    result.decimals[4].push_back(totalprice.value(c.index));
+    result.ints[2].push_back(ctx.value("orders", "o_orderkey", c.index));
+    result.ints[3].push_back(orderdate(c.index));
+    result.decimals[4].push_back(totalprice(c.index));
     result.decimals[5].push_back(c.value);
   }
   return result;

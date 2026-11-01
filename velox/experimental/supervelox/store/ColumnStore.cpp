@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <thread>
@@ -118,6 +119,23 @@ size_t fileSize(const std::string& path) {
     throw std::runtime_error("cannot stat " + path);
   }
   return info.st_size;
+}
+
+void preadAll(const std::string& path, size_t offset, size_t bytes, void* out) {
+  int fd = open(path.c_str(), O_RDONLY);
+  if (fd < 0) {
+    throw std::runtime_error("cannot open " + path);
+  }
+  size_t done = 0;
+  while (done < bytes) {
+    const ssize_t n = pread(fd, static_cast<char*>(out) + done, bytes - done, offset + done);
+    if (n <= 0) {
+      close(fd);
+      throw std::runtime_error("short read of " + path);
+    }
+    done += n;
+  }
+  close(fd);
 }
 
 /// Reads 'path' into pinned memory using several threads for large files.
@@ -299,6 +317,75 @@ std::vector<std::string> ColumnStore::columns(const std::vector<std::string>& ta
     }
   }
   return names;
+}
+
+void ColumnStore::read(const std::string& tableName, const std::string& name, int64_t first, int64_t count, void* out) {
+  const Column& column = metadata(tableName, name);
+  const std::string base = directory_ + "/" + tableName + "/" + name;
+  if (column.kind == Kind::kString) {
+    const size_t bytes = (count + 1) * sizeof(int64_t);
+    if (column.offsets != nullptr) {
+      std::memcpy(out, column.offsets + first, bytes);
+    } else {
+      preadAll(base + ".offsets", first * sizeof(int64_t), bytes, out);
+    }
+    return;
+  }
+  const size_t width = dtypeSize(column.dtype);
+  if (column.data != nullptr) {
+    std::memcpy(out, static_cast<const char*>(column.data) + first * width, count * width);
+  } else {
+    preadAll(base + ".bin", first * width, count * width, out);
+  }
+}
+
+void ColumnStore::readChars(
+    const std::string& tableName,
+    const std::string& name,
+    int64_t begin,
+    int64_t end,
+    void* out) {
+  const Column& column = metadata(tableName, name);
+  if (column.data != nullptr) {
+    std::memcpy(out, static_cast<const char*>(column.data) + begin, end - begin);
+  } else {
+    preadAll(directory_ + "/" + tableName + "/" + name + ".chars", begin, end - begin, out);
+  }
+}
+
+int64_t ColumnStore::value(const std::string& tableName, const std::string& name, int64_t row) {
+  const Column& column = metadata(tableName, name);
+  if (column.data != nullptr) {
+    return column.value(row);
+  }
+  int64_t raw = 0;
+  read(tableName, name, row, 1, &raw);
+  switch (column.dtype) {
+    case DType::kInt8:
+      return static_cast<int8_t>(raw);
+    case DType::kInt16:
+      return static_cast<int16_t>(raw);
+    case DType::kInt32:
+      return static_cast<int32_t>(raw);
+    case DType::kInt64:
+      return raw;
+  }
+  return 0;
+}
+
+std::string ColumnStore::string(const std::string& tableName, const std::string& name, int64_t row) {
+  const Column& column = metadata(tableName, name);
+  if (column.kind == Kind::kDictionary) {
+    return column.dictionary.at(value(tableName, name, row));
+  }
+  if (column.data != nullptr) {
+    return column.string(row);
+  }
+  int64_t offsets[2];
+  read(tableName, name, row, 1, offsets);
+  std::string out(offsets[1] - offsets[0], '\0');
+  readChars(tableName, name, offsets[0], offsets[1], out.data());
+  return out;
 }
 
 int64_t ColumnStore::rows(const std::string& tableName) {

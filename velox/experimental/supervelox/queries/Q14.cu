@@ -13,6 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <algorithm>
+
 #include "velox/experimental/supervelox/queries/Derived.h"
 #include "velox/experimental/supervelox/queries/Kernels.cuh"
 
@@ -71,10 +73,6 @@ const std::vector<ResultField> kSchema = {{"promo_revenue", ResultType::kDouble}
 
 Result q14(QueryContext& ctx) {
   Q14Args a;
-  a.shipdate = ctx.col<int16_t>("lineitem", "l_shipdate");
-  a.partkey = ctx.col<int32_t>("lineitem", "l_partkey");
-  a.price = ctx.col<int32_t>("lineitem", "l_extendedprice");
-  a.discount = ctx.col<int8_t>("lineitem", "l_discount");
   a.partType = ctx.col<int16_t>("part", "p_type");
   a.zones = ctx.zones("lineitem", "l_shipdate");
   a.rows = ctx.rows("lineitem");
@@ -90,6 +88,10 @@ Result q14(QueryContext& ctx) {
       [&](int64_t first, int64_t last) {
         a.firstZone = first;
         a.lastZone = last;
+        a.shipdate = ctx.rows<int16_t>("lineitem", "l_shipdate", first * kZone, std::min(a.rows, last * kZone));
+        a.partkey = ctx.rows<int32_t>("lineitem", "l_partkey", first * kZone, std::min(a.rows, last * kZone));
+        a.price = ctx.rows<int32_t>("lineitem", "l_extendedprice", first * kZone, std::min(a.rows, last * kZone));
+        a.discount = ctx.rows<int8_t>("lineitem", "l_discount", first * kZone, std::min(a.rows, last * kZone));
         q14Kernel<<<persistentBlocks(q14Kernel, kThreads), kThreads, 0, ctx.stream()>>>(a);
       },
       kZone);

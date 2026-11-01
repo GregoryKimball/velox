@@ -18,6 +18,8 @@
 #include <algorithm>
 #include <climits>
 #include <cstring>
+#include <map>
+#include <mutex>
 
 #include <cub/cub.cuh>
 
@@ -26,27 +28,96 @@
 namespace facebook::velox::supervelox {
 namespace {
 
+template <typename Key>
 struct OrderStart {
-  const int32_t* keys;
+  const Key* keys;
+  int64_t base;
 
   __device__ bool operator()(uint32_t row) const {
-    return row == 0 || keys[row] != keys[row - 1];
+    return row == 0 || keys[base + row] != keys[base + row - 1];
   }
 };
 
-template <typename T>
-int64_t lowerBound(const T* values, int64_t rows, int64_t value) {
-  int64_t low = 0;
-  int64_t high = rows;
-  while (low < high) {
-    const int64_t mid = (low + high) / 2;
-    if (values[mid] < value) {
-      low = mid + 1;
-    } else {
-      high = mid;
+/// l_orderkey of lines [first, first + count), widened to int64.
+void readKeys(QueryContext& ctx, int64_t first, int64_t count, int64_t* out) {
+  const Column& meta = ctx.store().metadata("lineitem", "l_orderkey");
+  std::vector<char> raw(count * dtypeSize(meta.dtype));
+  ctx.store().read("lineitem", "l_orderkey", first, count, raw.data());
+  for (int64_t i = 0; i < count; ++i) {
+    switch (meta.dtype) {
+      case DType::kInt8:
+        out[i] = reinterpret_cast<const int8_t*>(raw.data())[i];
+        break;
+      case DType::kInt16:
+        out[i] = reinterpret_cast<const int16_t*>(raw.data())[i];
+        break;
+      case DType::kInt32:
+        out[i] = reinterpret_cast<const int32_t*>(raw.data())[i];
+        break;
+      case DType::kInt64:
+        out[i] = reinterpret_cast<const int64_t*>(raw.data())[i];
+        break;
     }
   }
-  return low;
+}
+
+/// First line of every kStride-th order row, from one pass over l_orderkey.
+constexpr int64_t kStride = 4096;
+
+const std::vector<int64_t>& lineIndex(QueryContext& ctx) {
+  static std::mutex mutex;
+  static std::map<const ColumnStore*, std::vector<int64_t>> indexes;
+  std::lock_guard<std::mutex> lock(mutex);
+  auto& index = indexes[&ctx.store()];
+  if (!index.empty()) {
+    return index;
+  }
+  const int64_t lines = ctx.rows("lineitem");
+  constexpr int64_t kChunk = int64_t{1} << 24;
+  std::vector<int64_t> keys(kChunk);
+  int64_t order = 0;
+  int64_t previous = 0;
+  for (int64_t first = 0; first < lines; first += kChunk) {
+    const int64_t count = std::min(kChunk, lines - first);
+    readKeys(ctx, first, count, keys.data());
+    for (int64_t i = 0; i < count; ++i) {
+      if (first + i == 0 || keys[i] != previous) {
+        if (order % kStride == 0) {
+          index.push_back(first + i);
+        }
+        ++order;
+      }
+      previous = keys[i];
+    }
+  }
+  index.push_back(lines);
+  return index;
+}
+
+/// The first line of order row 'order', or the line count for the row past
+/// the last.
+int64_t lineStart(QueryContext& ctx, int64_t order) {
+  const auto& index = lineIndex(ctx);
+  const int64_t orders = ctx.rows("orders");
+  if (order >= orders) {
+    return ctx.rows("lineitem");
+  }
+  int64_t line = index[order / kStride];
+  int64_t skip = order % kStride;
+  const int64_t lines = ctx.rows("lineitem");
+  constexpr int64_t kChunk = 1 << 16;
+  std::vector<int64_t> keys(kChunk + 1);
+  while (skip > 0) {
+    const int64_t count = std::min(kChunk + 1, lines - line);
+    readKeys(ctx, line, count, keys.data());
+    for (int64_t i = 1; i < count; ++i) {
+      if (keys[i] != keys[i - 1] && --skip == 0) {
+        return line + i;
+      }
+    }
+    line += count - 1;
+  }
+  return line;
 }
 
 constexpr int kMaxPattern = 32;
@@ -165,15 +236,18 @@ __global__ void compactKernel(
 
 __global__ void lagKernel(
     const uint32_t* starts,
+    int64_t base,
     const int16_t* orderDates,
     const int16_t* lineDates,
+    int64_t firstOrder,
     int64_t orders,
     int* lag) {
   int low = INT_MAX;
   int high = INT_MIN;
-  for (int64_t o = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; o < orders; o += (int64_t)gridDim.x * blockDim.x) {
+  for (int64_t o = firstOrder + blockIdx.x * (int64_t)blockDim.x + threadIdx.x; o < orders;
+       o += (int64_t)gridDim.x * blockDim.x) {
     const int date = orderDates[o];
-    for (uint32_t line = starts[o]; line < starts[o + 1]; ++line) {
+    for (int64_t line = base + starts[o]; line < base + starts[o + 1]; ++line) {
       const int d = lineDates[line] - date;
       low = min(low, d);
       high = max(high, d);
@@ -240,13 +314,23 @@ std::pair<int32_t, int32_t> lineDateLag(QueryContext& ctx, const std::string& co
       [&](void* buffer) {
         const int initial[2] = {INT_MAX, INT_MIN};
         SV_CUDA(cudaMemcpyAsync(buffer, initial, sizeof(initial), cudaMemcpyHostToDevice, ctx.stream()));
-        lagKernel<<<2048, 256, 0, ctx.stream()>>>(
-            orderLineStarts(ctx),
-            ctx.col<int16_t>("orders", "o_orderdate"),
-            ctx.col<int16_t>("lineitem", column),
+        forBatches(
+            ctx,
+            0,
             ctx.rows("orders"),
-            static_cast<int*>(buffer));
-        SV_CUDA(cudaGetLastError());
+            [&](int64_t first, int64_t last) {
+              const LineRange lines = lineRange(ctx, first, last);
+              lagKernel<<<2048, 256, 0, ctx.stream()>>>(
+                  lines.starts,
+                  lines.base,
+                  ctx.rows<int16_t>("orders", "o_orderdate", first, last),
+                  ctx.rows<int16_t>("lineitem", column, lines.firstLine, lines.lastLine),
+                  first,
+                  last,
+                  static_cast<int*>(buffer));
+              SV_CUDA(cudaGetLastError());
+            },
+            4);
       },
       ctx.stream()));
   auto host = ctx.download(lag, 2);
@@ -265,11 +349,10 @@ const uint32_t* orderLineStarts(QueryContext& ctx) {
         auto* selected = ctx.scratch<int64_t>(1);
         size_t tempBytes = 0;
         cub::CountingInputIterator<uint32_t> rows(0);
-        SV_CUDA(cub::DeviceSelect::If(
-            nullptr, tempBytes, rows, starts, selected, lines, OrderStart{keys}, ctx.stream()));
+        const OrderStart<int32_t> isStart{keys, 0};
+        SV_CUDA(cub::DeviceSelect::If(nullptr, tempBytes, rows, starts, selected, lines, isStart, ctx.stream()));
         void* temp = ctx.scratchBytes(tempBytes);
-        SV_CUDA(cub::DeviceSelect::If(
-            temp, tempBytes, rows, starts, selected, lines, OrderStart{keys}, ctx.stream()));
+        SV_CUDA(cub::DeviceSelect::If(temp, tempBytes, rows, starts, selected, lines, isStart, ctx.stream()));
         const int64_t found = ctx.download(selected, 1)[0];
         if (found != orders) {
           throw std::runtime_error(
@@ -282,32 +365,57 @@ const uint32_t* orderLineStarts(QueryContext& ctx) {
       ctx.stream()));
 }
 
-std::pair<int64_t, int64_t>
-sortedRange(QueryContext& ctx, const std::string& table, const std::string& name, int64_t low, int64_t high) {
-  const Column& column = ctx.meta(table, name);
-  auto bounds = [&](auto* values) {
-    return std::make_pair(lowerBound(values, column.rows, low), lowerBound(values, column.rows, high));
-  };
-  switch (column.dtype) {
-    case DType::kInt8:
-      return bounds(static_cast<const int8_t*>(column.data));
-    case DType::kInt16:
-      return bounds(static_cast<const int16_t*>(column.data));
-    case DType::kInt32:
-      return bounds(static_cast<const int32_t*>(column.data));
-    case DType::kInt64:
-      return bounds(static_cast<const int64_t*>(column.data));
+LineRange lineRange(QueryContext& ctx, int64_t first, int64_t last) {
+  if (batchRows() == 0) {
+    return {orderLineStarts(ctx), 0, 0, ctx.rows("lineitem")};
   }
-  return {0, 0};
+  const int64_t firstLine = lineStart(ctx, first);
+  const int64_t lastLine = lineStart(ctx, last);
+  const int64_t orders = last - first;
+  auto* starts = ctx.batchScratch<uint32_t>(orders + 1);
+  if (orders > 0) {
+    const int64_t* keys = ctx.rows<int64_t>("lineitem", "l_orderkey", firstLine, lastLine);
+    auto* selected = ctx.batchScratch<int64_t>(1);
+    size_t tempBytes = 0;
+    cub::CountingInputIterator<uint32_t> rows(0);
+    const OrderStart<int64_t> isStart{keys, firstLine};
+    const int64_t lines = lastLine - firstLine;
+    SV_CUDA(cub::DeviceSelect::If(nullptr, tempBytes, rows, starts, selected, lines, isStart, ctx.stream()));
+    void* temp = ctx.batchBytes(tempBytes);
+    SV_CUDA(cub::DeviceSelect::If(temp, tempBytes, rows, starts, selected, lines, isStart, ctx.stream()));
+    const int64_t found = ctx.download(selected, 1)[0];
+    if (found != orders) {
+      throw std::runtime_error(
+          "lines " + std::to_string(firstLine) + ".." + std::to_string(lastLine) + " hold " + std::to_string(found) +
+          " orders, not " + std::to_string(orders));
+    }
+  }
+  const uint32_t end = static_cast<uint32_t>(lastLine - firstLine);
+  SV_CUDA(cudaMemcpyAsync(starts + orders, &end, sizeof(end), cudaMemcpyHostToDevice, ctx.stream()));
+  SV_CUDA(cudaStreamSynchronize(ctx.stream()));
+  return {starts - first, firstLine, firstLine, lastLine};
 }
 
-const uint32_t* likeBitmap(
-    QueryContext& ctx,
-    const std::string& table,
-    const std::string& column,
-    Match match,
-    const std::string& pattern,
-    const std::string& second) {
+std::pair<int64_t, int64_t>
+sortedRange(QueryContext& ctx, const std::string& table, const std::string& name, int64_t low, int64_t high) {
+  const int64_t rows = ctx.rows(table);
+  auto lowerBound = [&](int64_t value) {
+    int64_t begin = 0;
+    int64_t end = rows;
+    while (begin < end) {
+      const int64_t mid = (begin + end) / 2;
+      if (ctx.value(table, name, mid) < value) {
+        begin = mid + 1;
+      } else {
+        end = mid;
+      }
+    }
+    return begin;
+  };
+  return {lowerBound(low), lowerBound(high)};
+}
+
+Pattern makePattern(Match match, const std::string& pattern, const std::string& second) {
   Pattern p{};
   if (pattern.size() > kMaxPattern || second.size() > kMaxPattern) {
     throw std::runtime_error("pattern too long");
@@ -317,12 +425,36 @@ const uint32_t* likeBitmap(
   memcpy(p.second, second.data(), second.size());
   p.secondLength = second.size();
   p.match = match;
+  return p;
+}
+
+const uint32_t* likeBitmap(
+    QueryContext& ctx,
+    const std::string& table,
+    const std::string& column,
+    Match match,
+    const std::string& pattern,
+    const std::string& second) {
   const int64_t rows = ctx.rows(table);
   auto* bits = ctx.scratch<uint32_t>((rows + 31) / 32);
   likeKernel<<<4096, 256, 0, ctx.stream()>>>(
-      ctx.offsets(table, column), ctx.chars(table, column), rows, p, bits);
+      ctx.offsets(table, column), ctx.chars(table, column), rows, makePattern(match, pattern, second), bits);
   SV_CUDA(cudaGetLastError());
   return bits;
+}
+
+void likeRows(
+    QueryContext& ctx,
+    QueryContext::StringRows strings,
+    int64_t first,
+    int64_t last,
+    Match match,
+    const std::string& pattern,
+    const std::string& second,
+    uint32_t* bits) {
+  likeKernel<<<4096, 256, 0, ctx.stream()>>>(
+      strings.offsets + first, strings.chars, last - first, makePattern(match, pattern, second), bits);
+  SV_CUDA(cudaGetLastError());
 }
 
 struct PopCount {
@@ -355,7 +487,7 @@ CodeSet dictionaryCodes(
     const std::string& column,
     Match match,
     const std::string& pattern) {
-  const auto& dictionary = ctx.meta(table, column).dictionary;
+  const auto& dictionary = ctx.info(table, column).dictionary;
   CodeSet codes;
   for (size_t i = 0; i < dictionary.size(); ++i) {
     if (hostMatches(dictionary[i], match, pattern)) {
@@ -370,7 +502,7 @@ CodeSet dictionaryCodes(
     const std::string& table,
     const std::string& column,
     const std::vector<std::string>& values) {
-  const Column& meta = ctx.meta(table, column);
+  const Column& meta = ctx.info(table, column);
   CodeSet codes;
   for (const auto& value : values) {
     const int32_t code = meta.code(value);

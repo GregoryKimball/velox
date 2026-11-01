@@ -24,6 +24,7 @@ constexpr int kBins = 4;
 
 struct Q7Args {
   const uint32_t* starts;
+  int64_t lineBase;
   const int32_t* custkey;
   const int8_t* customerNation;
   const int32_t* suppkey;
@@ -54,7 +55,7 @@ __global__ void q7Kernel(Q7Args a) {
       continue;
     }
     const int wanted = customer == a.first ? a.second : a.first;
-    for (uint32_t line = a.starts[o]; line < a.starts[o + 1]; ++line) {
+    for (int64_t line = a.lineBase + a.starts[o]; line < a.lineBase + a.starts[o + 1]; ++line) {
       const int date = a.shipdate[line];
       if (date < a.dateLow || date > a.dateHigh || a.supplierNation[a.suppkey[line] - 1] != wanted) {
         continue;
@@ -85,14 +86,8 @@ Result q7(QueryContext& ctx) {
   const auto range = sortedRange(ctx, "orders", "o_orderdate", a.dateLow - lag.second, a.dateHigh - lag.first + 1);
   a.begin = range.first;
   a.end = range.second;
-  a.starts = orderLineStarts(ctx);
-  a.custkey = ctx.col<int32_t>("orders", "o_custkey");
   a.customerNation = ctx.col<int8_t>("customer", "c_nationkey");
-  a.suppkey = ctx.col<int32_t>("lineitem", "l_suppkey");
   a.supplierNation = ctx.col<int8_t>("supplier", "s_nationkey");
-  a.shipdate = ctx.col<int16_t>("lineitem", "l_shipdate");
-  a.price = ctx.col<int32_t>("lineitem", "l_extendedprice");
-  a.discount = ctx.col<int8_t>("lineitem", "l_discount");
   const std::string names[2] = {"FRANCE", "GERMANY"};
   a.first = nationKey(ctx, names[0]);
   a.second = nationKey(ctx, names[1]);
@@ -103,6 +98,14 @@ Result q7(QueryContext& ctx) {
       all.first,
       all.second,
       [&](int64_t first, int64_t last) {
+        const LineRange lines = lineRange(ctx, first, last);
+        a.starts = lines.starts;
+        a.lineBase = lines.base;
+        a.custkey = ctx.rows<int32_t>("orders", "o_custkey", first, last);
+        a.suppkey = ctx.rows<int32_t>("lineitem", "l_suppkey", lines.firstLine, lines.lastLine);
+        a.shipdate = ctx.rows<int16_t>("lineitem", "l_shipdate", lines.firstLine, lines.lastLine);
+        a.price = ctx.rows<int32_t>("lineitem", "l_extendedprice", lines.firstLine, lines.lastLine);
+        a.discount = ctx.rows<int8_t>("lineitem", "l_discount", lines.firstLine, lines.lastLine);
         a.begin = first;
         a.end = last;
         q7Kernel<<<2048, 256, 0, ctx.stream()>>>(a);

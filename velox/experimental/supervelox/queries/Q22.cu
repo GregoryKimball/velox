@@ -109,7 +109,6 @@ const std::vector<ResultField> kSchema = {
 
 Result q22(QueryContext& ctx) {
   Q22Args a;
-  a.custkey = ctx.col<int32_t>("orders", "o_custkey");
   a.phoneOffsets = ctx.offsets("customer", "c_phone");
   a.phoneChars = ctx.chars("customer", "c_phone");
   a.acctbal = ctx.col<int32_t>("customer", "c_acctbal");
@@ -128,6 +127,7 @@ Result q22(QueryContext& ctx) {
       [&](int64_t first, int64_t last) {
         a.firstOrder = first;
         a.orders = last;
+        a.custkey = ctx.rows<int32_t>("orders", "o_custkey", first, last);
         q22OrdersKernel<<<4096, 256, 0, ctx.stream()>>>(a);
       },
       4);
