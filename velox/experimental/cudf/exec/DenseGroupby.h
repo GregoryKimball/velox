@@ -32,12 +32,21 @@
 
 namespace facebook::velox::cudf_velox {
 
-/// A single step aggregation grouped by one integer key whose values all lie
-/// in [low, high]. Every driver of the pipeline adds its input into one set of
-/// accumulators indexed by key - low, and the last driver to finish emits the
-/// groups, so the input needs no partitioning by key. Only CudfGroupby runs
-/// it; a CPU aggregation over the same node would see each driver's share of
-/// every group.
+/// A grouping key of a dense aggregation: an integer whose values all lie in
+/// [low, high], or with a dictionary, an integer code into it that the
+/// aggregation emits as the dictionary's string.
+struct DenseKey {
+  int64_t low;
+  int64_t high;
+  std::vector<std::string> dictionary;
+};
+
+/// A single step aggregation grouped by integer keys whose values all lie in
+/// known ranges. Every driver of the pipeline adds its input into one set of
+/// accumulators indexed by the keys' offsets in their ranges, and the last
+/// driver to finish emits the groups, so the input needs no partitioning by
+/// key. Only CudfGroupby runs it; a CPU aggregation over the same node would
+/// see each driver's share of every group.
 class DenseAggregationNode : public core::AggregationNode {
  public:
   DenseAggregationNode(
@@ -46,33 +55,20 @@ class DenseAggregationNode : public core::AggregationNode {
       const std::vector<std::string>& aggregateNames,
       const std::vector<Aggregate>& aggregates,
       core::PlanNodePtr source,
-      int64_t low,
-      int64_t high)
-      : AggregationNode(
-            id,
-            Step::kSingle,
-            groupingKeys,
-            {},
-            aggregateNames,
-            aggregates,
-            /*ignoreNullKeys=*/false,
-            /*noGroupsSpanBatches=*/false,
-            std::nullopt,
-            std::move(source)),
-        low_(low),
-        high_(high) {}
+      std::vector<DenseKey> keys);
 
-  int64_t low() const {
-    return low_;
+  const std::vector<DenseKey>& keys() const {
+    return keys_;
   }
 
-  int64_t high() const {
-    return high_;
+  /// The aggregation's output with dictionary keys as VARCHAR.
+  const RowTypePtr& outputType() const override {
+    return outputType_;
   }
 
  private:
-  const int64_t low_;
-  const int64_t high_;
+  const std::vector<DenseKey> keys_;
+  const RowTypePtr outputType_;
 };
 
 /// Whether an aggregate can be accumulated densely: sum, avg, count, min or
@@ -100,19 +96,24 @@ class DenseGroupby {
       const core::AggregationNode& node,
       const RowTypePtr& inputType);
 
+  struct Key {
+    DenseKey range;
+    /// Input column.
+    int32_t channel;
+    /// Output type: the input's, or VARCHAR with a dictionary.
+    TypePtr type;
+  };
+
   DenseGroupby(
-      int64_t low,
-      int64_t high,
-      TypePtr keyType,
+      std::vector<Key> keys,
       std::vector<Aggregate> aggregates,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr);
 
-  /// Adds the rows of 'input' to the accumulators. 'keyChannel' and the
-  /// aggregates' channels index the columns of 'input'.
+  /// Adds the rows of 'input' to the accumulators. The keys' and aggregates'
+  /// channels index the columns of 'input'.
   void add(
       const std::vector<cudf::column_view>& input,
-      int32_t keyChannel,
       cuda::stream_ref stream);
 
   /// The key and aggregate columns of the groups with rows.
@@ -140,9 +141,10 @@ class DenseGroupby {
     bool floating;
   };
 
-  const int64_t low_;
-  const int64_t slots_;
-  const TypePtr keyType_;
+  const std::vector<Key> keys_;
+  /// Slot = sum over keys of (key - low) * stride.
+  std::vector<int64_t> strides_;
+  int64_t slots_;
   rmm::device_buffer rows_;
   rmm::device_buffer outOfRange_;
   std::vector<State> states_;

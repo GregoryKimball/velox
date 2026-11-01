@@ -267,7 +267,6 @@ class CudfGroupby : public CudfOperatorBase {
   // last one to finish emits the groups.
   const DenseAggregationNode* denseNode_{nullptr};
   std::shared_ptr<DenseGroupby> dense_;
-  column_index_t denseKeyChannel_{0};
   bool denseEmits_{false};
   CudfVectorPtr preGroupedTail_;
   std::deque<CudfVectorPtr> preGroupedOutputs_;

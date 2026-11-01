@@ -273,6 +273,9 @@ class CacheDataSource : public connector::DataSource {
         static_cast<const char*>(connector_.data(column, stream.get())) + begin * width,
         nullptr,
         0);
+    if (column.kind == Kind::kDictionary && type->isInteger()) {
+      return cudf::cast(stored, cudf::data_type{cudf::type_id::INT32}, stream, mr);
+    }
     if (column.kind == Kind::kDictionary) {
       VELOX_CHECK(type->isVarchar(), "{}.{} is a dictionary, not {}", table_, column.name, type->toString());
       auto gathered = cudf::gather(

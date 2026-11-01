@@ -1696,19 +1696,19 @@ void CudfGroupby::initialize() {
   ignoreNullKeys_ = aggregationNode_->ignoreNullKeys();
   if (denseNode_ != nullptr) {
     const auto inputRow = asRowType(inputType_);
-    VELOX_CHECK_EQ(denseNode_->groupingKeys().size(), 1);
-    denseKeyChannel_ =
-        inputRow->getChildIdx(denseNode_->groupingKeys()[0]->name());
+    std::vector<DenseGroupby::Key> keys;
+    for (size_t k = 0; k < denseNode_->groupingKeys().size(); ++k) {
+      keys.push_back(DenseGroupby::Key{
+          denseNode_->keys()[k],
+          static_cast<int32_t>(inputRow->getChildIdx(
+              denseNode_->groupingKeys()[k]->name())),
+          denseNode_->outputType()->childAt(k)});
+    }
     auto aggregates = DenseGroupby::aggregates(*denseNode_, inputRow);
-    const auto low = denseNode_->low();
-    const auto high = denseNode_->high();
-    auto keyType = inputRow->childAt(denseKeyChannel_);
     dense_ = DenseGroupby::shared(
         operatorCtx_->task().get(), planNodeId(), [&]() {
           return std::make_shared<DenseGroupby>(
-              low,
-              high,
-              keyType,
+              std::move(keys),
               std::move(aggregates),
               cudfGlobalStreamPool().get_stream(),
               get_output_mr());
@@ -1955,7 +1955,6 @@ void CudfGroupby::doAddInput(RowVectorPtr input) {
     const auto view = cudfInput->getTableView();
     dense_->add(
         std::vector<cudf::column_view>(view.begin(), view.end()),
-        denseKeyChannel_,
         cudfInput->stream());
     // The shared accumulators outlive this batch and are read by another
     // driver's stream.

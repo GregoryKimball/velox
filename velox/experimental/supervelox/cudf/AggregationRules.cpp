@@ -18,6 +18,9 @@
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
+#include <set>
+
+#include "velox/connectors/hive/TableHandle.h"
 #include "velox/core/Expressions.h"
 #include "velox/experimental/cudf/exec/DenseGroupby.h"
 
@@ -221,10 +224,81 @@ std::optional<KeySource> traceValues(const core::PlanNodePtr& node, const std::s
   return std::nullopt;
 }
 
+bool references(const core::TypedExprPtr& expr, const std::set<std::string>& columns) {
+  if (const auto* field = dynamic_cast<const core::FieldAccessTypedExpr*>(expr.get())) {
+    if (field->isInputColumn() && columns.count(field->name())) {
+      return true;
+    }
+  }
+  for (const auto& input : expr->inputs()) {
+    if (references(input, columns)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// 'node' with dictionary 'columns' of its output read as their integer codes
+/// from the scan up, or null unless only filters not reading them and
+/// projections passing them through lie between.
+core::PlanNodePtr withCodes(const core::PlanNodePtr& node, const std::set<std::string>& columns) {
+  if (const auto* scan = dynamic_cast<const core::TableScanNode*>(node.get())) {
+    std::set<std::string> stored;
+    for (const auto& column : columns) {
+      stored.insert(scan->assignments().at(column)->name());
+    }
+    if (const auto* hive = dynamic_cast<const connector::hive::HiveTableHandle*>(scan->tableHandle().get())) {
+      for (const auto& [subfield, filter] : hive->subfieldFilters()) {
+        if (stored.count(subfield.baseName())) {
+          return nullptr;
+        }
+      }
+      if (hive->remainingFilter() != nullptr && references(hive->remainingFilter(), stored)) {
+        return nullptr;
+      }
+    }
+    auto types = scan->outputType()->children();
+    for (const auto& column : columns) {
+      types[scan->outputType()->getChildIdx(column)] = INTEGER();
+    }
+    return std::make_shared<core::TableScanNode>(
+        scan->id(), ROW(std::vector<std::string>(scan->outputType()->names()), std::move(types)),
+        scan->tableHandle(), scan->assignments());
+  }
+  if (const auto* filter = dynamic_cast<const core::FilterNode*>(node.get())) {
+    if (references(filter->filter(), columns)) {
+      return nullptr;
+    }
+    auto source = withCodes(node->sources()[0], columns);
+    return source ? std::make_shared<core::FilterNode>(filter->id(), filter->filter(), source) : nullptr;
+  }
+  if (const auto* project = dynamic_cast<const core::ProjectNode*>(node.get())) {
+    std::set<std::string> below;
+    auto projections = project->projections();
+    for (size_t i = 0; i < projections.size(); ++i) {
+      if (columns.count(project->names()[i])) {
+        below.insert(std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(projections[i])->name());
+      }
+    }
+    for (size_t i = 0; i < projections.size(); ++i) {
+      if (columns.count(project->names()[i])) {
+        const auto& name = std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(projections[i])->name();
+        projections[i] = std::make_shared<core::FieldAccessTypedExpr>(INTEGER(), name);
+      } else if (references(projections[i], below)) {
+        return nullptr;
+      }
+    }
+    auto source = withCodes(node->sources()[0], below);
+    return source ? std::make_shared<core::ProjectNode>(project->id(), project->names(), projections, source)
+                  : nullptr;
+  }
+  return nullptr;
+}
+
 /// 'step' as a dense aggregation, or null.
 core::PlanNodePtr dense(const OneStep& step, CacheConnector& connector, AggregationRewrite& out) {
   constexpr int64_t kMaxSlots = int64_t{1} << 28;
-  if (step.raw->groupingKeys().size() != 1 || step.aggregates.empty()) {
+  if (step.aggregates.empty()) {
     return nullptr;
   }
   for (const auto& aggregate : step.aggregates) {
@@ -232,37 +306,63 @@ core::PlanNodePtr dense(const OneStep& step, CacheConnector& connector, Aggregat
       return nullptr;
     }
   }
-  const auto& key = step.raw->groupingKeys()[0];
-  if (!(key->type()->isBigint() || key->type()->isInteger() || key->type()->isDate())) {
+  std::vector<cudf_velox::DenseKey> ranges;
+  std::set<std::string> coded;
+  std::vector<std::string> described;
+  int64_t slots = 1;
+  int64_t rows = 0;
+  for (const auto& key : step.raw->groupingKeys()) {
+    const auto source = traceValues(step.raw->sources()[0], key->name());
+    if (!source.has_value()) {
+      return nullptr;
+    }
+    const Column& column = connector.store().metadata(source->table, source->column);
+    const auto& type = key->type();
+    if ((type->isBigint() || type->isInteger() || type->isDate()) &&
+        (column.kind == Kind::kInt || column.kind == Kind::kDate)) {
+      ranges.push_back({column.min, column.max, {}});
+    } else if (type->isVarchar() && column.kind == Kind::kDictionary && !column.dictionary.empty()) {
+      ranges.push_back({0, static_cast<int64_t>(column.dictionary.size()) - 1, column.dictionary});
+      coded.insert(key->name());
+    } else {
+      return nullptr;
+    }
+    slots *= ranges.back().high - ranges.back().low + 1;
+    if (slots > kMaxSlots) {
+      return nullptr;
+    }
+    rows = std::max(rows, connector.store().rows(source->table));
+    described.push_back(fmt::format(
+        "{} ({}.{}{})",
+        key->name(),
+        source->table,
+        source->column,
+        coded.count(key->name()) ? fmt::format(", {} dictionary codes", column.dictionary.size())
+                                 : fmt::format(" in {}..{}", column.min, column.max)));
+  }
+  if (slots > rows) {
     return nullptr;
   }
-  const auto source = traceValues(step.raw->sources()[0], key->name());
-  if (!source.has_value()) {
-    return nullptr;
-  }
-  const Column& column = connector.store().metadata(source->table, source->column);
-  const int64_t slots = column.max - column.min + 1;
-  if ((column.kind != Kind::kInt && column.kind != Kind::kDate) || slots > kMaxSlots ||
-      slots > connector.store().rows(source->table)) {
-    return nullptr;
+  auto source = step.raw->sources()[0];
+  auto keys = step.raw->groupingKeys();
+  if (!coded.empty()) {
+    source = withCodes(source, coded);
+    if (source == nullptr) {
+      return nullptr;
+    }
+    for (auto& key : keys) {
+      if (coded.count(key->name())) {
+        key = std::make_shared<core::FieldAccessTypedExpr>(INTEGER(), key->name());
+      }
+    }
   }
   out.log.push_back(fmt::format(
-      "aggregation {} grouped by {}, which takes the values {}..{} of {}.{}, adds into {} slots indexed by key",
+      "aggregation {} grouped by {} adds into {} slots indexed by key",
       step.aggregation->id(),
-      key->name(),
-      column.min,
-      column.max,
-      source->table,
-      source->column,
+      fmt::join(described, ", "),
       slots));
   return std::make_shared<cudf_velox::DenseAggregationNode>(
-      step.aggregation->id(),
-      step.raw->groupingKeys(),
-      step.raw->aggregateNames(),
-      step.aggregates,
-      step.raw->sources()[0],
-      column.min,
-      column.max);
+      step.aggregation->id(), keys, step.raw->aggregateNames(), step.aggregates, source, std::move(ranges));
 }
 
 core::PlanNodePtr rewrite(

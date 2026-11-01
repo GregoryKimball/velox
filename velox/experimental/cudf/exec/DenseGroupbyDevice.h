@@ -25,12 +25,49 @@
 #include <rmm/resource_ref.hpp>
 
 #include <cstdint>
+#include <vector>
 
 namespace facebook::velox::cudf_velox::dense {
 
 enum class Kind { kCountRows, kCount, kSum, kAvg, kMin, kMax };
 
 void fill(int64_t* out, int64_t count, int64_t value, cuda::stream_ref stream);
+
+/// The slot of each row, sum over keys of (key - lows[k]) * strides[k], into
+/// 'out', or 'slots' for a row with a key outside [lows[k], lows[k] +
+/// sizes[k]).
+void combine(
+    const std::vector<cudf::column_view>& keys,
+    const std::vector<int64_t>& lows,
+    const std::vector<int64_t>& sizes,
+    const std::vector<int64_t>& strides,
+    int64_t slots,
+    int32_t* out,
+    cuda::stream_ref stream);
+
+/// One aggregate for addShared: 'value' is unused for kCountRows.
+struct Target {
+  cudf::column_view value;
+  Kind kind;
+  bool floating;
+  void* accumulators;
+  unsigned long long* counts;
+};
+
+/// The largest slot count addShared takes for 'targets' aggregates.
+int64_t sharedSlots(size_t targets);
+
+/// Like addRows and add for every target in one pass, accumulating per block
+/// in shared memory first. For few slots, where atomics on global memory
+/// would contend.
+void addShared(
+    const cudf::column_view& key,
+    int64_t low,
+    int64_t slots,
+    const std::vector<Target>& targets,
+    unsigned long long* rows,
+    int* outOfRange,
+    cuda::stream_ref stream);
 
 /// Counts the rows of each key - low in 'rows', and sets 'outOfRange' for a
 /// key outside [low, low + slots).
@@ -63,10 +100,12 @@ rmm::device_uvector<cudf::size_type> occupied(
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr);
 
-/// low + slot for each of 'slots', into 'out'.
+/// low + slot / stride % size for each of 'slots', into 'out'.
 void keys(
     const rmm::device_uvector<cudf::size_type>& slots,
     int64_t low,
+    int64_t stride,
+    int64_t size,
     cudf::mutable_column_view out,
     cuda::stream_ref stream);
 

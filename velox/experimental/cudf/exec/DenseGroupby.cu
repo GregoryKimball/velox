@@ -123,6 +123,186 @@ __device__ void maxDouble(double* slot, double value) {
   }
 }
 
+/// Adds the int128 (low, high) to the int128 at 'slot'.
+__device__ void addInt128Parts(unsigned long long* slot, unsigned long long low, unsigned long long high) {
+  const unsigned long long old = atomicAdd(slot, low);
+  high += old + low < old ? 1ULL : 0ULL;
+  if (high != 0) {
+    atomicAdd(slot + 1, high);
+  }
+}
+
+/// Adds row 'row' of 'value', an integer or 128-bit decimal, to the int128 at
+/// 'slot'.
+__device__ void addInteger(unsigned long long* slot, const Values& value, cudf::size_type row) {
+  if (value.type == cudf::type_id::DECIMAL128) {
+    const __int128_t wide = reinterpret_cast<const __int128_t*>(value.data)[row];
+    addInt128Parts(slot, static_cast<unsigned long long>(wide), static_cast<unsigned long long>(wide >> 64));
+  } else {
+    addInt128(slot, value.integer(row));
+  }
+}
+
+constexpr int kMaxKeys = 8;
+
+struct Keys {
+  Values key[kMaxKeys];
+  int64_t low[kMaxKeys];
+  int64_t size[kMaxKeys];
+  int64_t stride[kMaxKeys];
+  int count;
+};
+
+__global__ void combineKernel(Keys keys, cudf::size_type rows, int64_t slots, int32_t* out) {
+  for (cudf::size_type row = blockIdx.x * blockDim.x + threadIdx.x; row < rows;
+       row += gridDim.x * blockDim.x) {
+    int64_t slot = 0;
+    bool inRange = true;
+    for (int k = 0; k < keys.count; ++k) {
+      const int64_t offset = keys.key[k].integer(row) - keys.low[k];
+      inRange &= offset >= 0 && offset < keys.size[k];
+      slot += offset * keys.stride[k];
+    }
+    out[row] = static_cast<int32_t>(inRange ? slot : slots);
+  }
+}
+
+constexpr int kMaxTargets = 16;
+constexpr int64_t kSharedBytes = 48 * 1024;
+constexpr int kSharedBlocks = 1024;
+
+struct SharedTarget {
+  Values value;
+  Kind kind;
+  bool floating;
+  void* accumulators;
+  unsigned long long* counts;
+};
+
+struct Targets {
+  SharedTarget target[kMaxTargets];
+  int count;
+};
+
+/// Shared memory: rows per slot, then per target counts per slot and two
+/// words of value per slot.
+__global__ void addSharedKernel(
+    Values key,
+    int64_t low,
+    int64_t slots,
+    cudf::size_type rows,
+    Targets targets,
+    unsigned long long* globalRows,
+    int* outOfRange) {
+  extern __shared__ unsigned long long shared[];
+  unsigned long long* blockRows = shared;
+  auto counts = [&](int t) { return shared + slots * (1 + 3 * t); };
+  auto values = [&](int t) { return shared + slots * (2 + 3 * t); };
+  for (int64_t i = threadIdx.x; i < slots; i += blockDim.x) {
+    blockRows[i] = 0;
+    for (int t = 0; t < targets.count; ++t) {
+      const auto& target = targets.target[t];
+      counts(t)[i] = 0;
+      int64_t start = 0;
+      if (target.kind == Kind::kMin || target.kind == Kind::kMax) {
+        if (target.floating) {
+          // Bits of +infinity and -infinity.
+          start = target.kind == Kind::kMin ? 0x7ff0000000000000LL : static_cast<int64_t>(0xfff0000000000000ULL);
+        } else {
+          start = target.kind == Kind::kMin ? INT64_MAX : INT64_MIN;
+        }
+      }
+      values(t)[2 * i] = static_cast<unsigned long long>(start);
+      values(t)[2 * i + 1] = 0;
+    }
+  }
+  __syncthreads();
+  for (cudf::size_type row = blockIdx.x * blockDim.x + threadIdx.x; row < rows;
+       row += gridDim.x * blockDim.x) {
+    const int64_t slot = key.integer(row) - low;
+    if (slot < 0 || slot >= slots) {
+      *outOfRange = 1;
+      continue;
+    }
+    atomicAdd(&blockRows[slot], 1ULL);
+    for (int t = 0; t < targets.count; ++t) {
+      const auto& target = targets.target[t];
+      if (target.kind == Kind::kCountRows || !target.value.valid(row)) {
+        continue;
+      }
+      atomicAdd(&counts(t)[slot], 1ULL);
+      unsigned long long* value = values(t) + 2 * slot;
+      switch (target.kind) {
+        case Kind::kSum:
+        case Kind::kAvg:
+          if (target.floating) {
+            atomicAdd(reinterpret_cast<double*>(value), target.value.floating(row));
+          } else {
+            addInteger(value, target.value, row);
+          }
+          break;
+        case Kind::kMin:
+          if (target.floating) {
+            minDouble(reinterpret_cast<double*>(value), target.value.floating(row));
+          } else {
+            atomicMin(reinterpret_cast<long long*>(value), static_cast<long long>(target.value.integer(row)));
+          }
+          break;
+        case Kind::kMax:
+          if (target.floating) {
+            maxDouble(reinterpret_cast<double*>(value), target.value.floating(row));
+          } else {
+            atomicMax(reinterpret_cast<long long*>(value), static_cast<long long>(target.value.integer(row)));
+          }
+          break;
+        default:
+          break;
+      }
+    }
+  }
+  __syncthreads();
+  for (int64_t i = threadIdx.x; i < slots; i += blockDim.x) {
+    if (blockRows[i] == 0) {
+      continue;
+    }
+    atomicAdd(&globalRows[i], blockRows[i]);
+    for (int t = 0; t < targets.count; ++t) {
+      const auto& target = targets.target[t];
+      if (target.kind == Kind::kCountRows || counts(t)[i] == 0) {
+        continue;
+      }
+      atomicAdd(&target.counts[i], counts(t)[i]);
+      const unsigned long long* value = values(t) + 2 * i;
+      switch (target.kind) {
+        case Kind::kSum:
+        case Kind::kAvg:
+          if (target.floating) {
+            atomicAdd(static_cast<double*>(target.accumulators) + i, __longlong_as_double(static_cast<long long>(value[0])));
+          } else {
+            addInt128Parts(static_cast<unsigned long long*>(target.accumulators) + 2 * i, value[0], value[1]);
+          }
+          break;
+        case Kind::kMin:
+          if (target.floating) {
+            minDouble(static_cast<double*>(target.accumulators) + i, __longlong_as_double(static_cast<long long>(value[0])));
+          } else {
+            atomicMin(static_cast<long long*>(target.accumulators) + i, static_cast<long long>(value[0]));
+          }
+          break;
+        case Kind::kMax:
+          if (target.floating) {
+            maxDouble(static_cast<double*>(target.accumulators) + i, __longlong_as_double(static_cast<long long>(value[0])));
+          } else {
+            atomicMax(static_cast<long long*>(target.accumulators) + i, static_cast<long long>(value[0]));
+          }
+          break;
+        default:
+          break;
+      }
+    }
+  }
+}
+
 __global__ void fillKernel(int64_t* out, int64_t count, int64_t value) {
   for (int64_t i = blockIdx.x * int64_t{blockDim.x} + threadIdx.x; i < count;
        i += int64_t{gridDim.x} * blockDim.x) {
@@ -171,9 +351,10 @@ __global__ void addKernel(
         if (floating) {
           atomicAdd(static_cast<double*>(accumulators) + slot, value.floating(row));
         } else {
-          addInt128(
+          addInteger(
               static_cast<unsigned long long*>(accumulators) + 2 * slot,
-              value.integer(row));
+              value,
+              row);
         }
         break;
       case Kind::kMin:
@@ -204,11 +385,13 @@ __global__ void keysKernel(
     const cudf::size_type* slots,
     cudf::size_type groups,
     int64_t low,
+    int64_t stride,
+    int64_t size,
     cudf::type_id type,
     void* out) {
   for (cudf::size_type i = blockIdx.x * blockDim.x + threadIdx.x; i < groups;
        i += gridDim.x * blockDim.x) {
-    const int64_t key = low + slots[i];
+    const int64_t key = low + slots[i] / stride % size;
     switch (type) {
       case cudf::type_id::INT8:
         static_cast<int8_t*>(out)[i] = static_cast<int8_t>(key);
@@ -329,6 +512,61 @@ void fill(int64_t* out, int64_t count, int64_t value, cuda::stream_ref stream) {
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
+void combine(
+    const std::vector<cudf::column_view>& keys,
+    const std::vector<int64_t>& lows,
+    const std::vector<int64_t>& sizes,
+    const std::vector<int64_t>& strides,
+    int64_t slots,
+    int32_t* out,
+    cuda::stream_ref stream) {
+  CUDF_EXPECTS(keys.size() <= kMaxKeys, "Too many dense aggregation keys");
+  Keys args{};
+  args.count = static_cast<int>(keys.size());
+  for (size_t k = 0; k < keys.size(); ++k) {
+    args.key[k] = values(keys[k]);
+    args.low[k] = lows[k];
+    args.size[k] = sizes[k];
+    args.stride[k] = strides[k];
+  }
+  const auto rows = keys[0].size();
+  combineKernel<<<blocks(rows), kBlock, 0, stream.get()>>>(args, rows, slots, out);
+  CUDF_CUDA_TRY(cudaGetLastError());
+}
+
+int64_t sharedSlots(size_t targets) {
+  if (targets > kMaxTargets) {
+    return 0;
+  }
+  return kSharedBytes / static_cast<int64_t>(sizeof(unsigned long long) * (1 + 3 * targets));
+}
+
+void addShared(
+    const cudf::column_view& key,
+    int64_t low,
+    int64_t slots,
+    const std::vector<Target>& targets,
+    unsigned long long* rows,
+    int* outOfRange,
+    cuda::stream_ref stream) {
+  CUDF_EXPECTS(slots <= sharedSlots(targets.size()), "Too many slots for shared accumulators");
+  Targets args{};
+  args.count = static_cast<int>(targets.size());
+  for (size_t t = 0; t < targets.size(); ++t) {
+    const auto& target = targets[t];
+    args.target[t] = SharedTarget{
+        target.kind == Kind::kCountRows ? Values{} : values(target.value),
+        target.kind,
+        target.floating,
+        target.accumulators,
+        target.counts};
+  }
+  const size_t bytes = slots * sizeof(unsigned long long) * (1 + 3 * targets.size());
+  addSharedKernel<<<std::min(blocks(key.size()), kSharedBlocks), kBlock, bytes, stream.get()>>>(
+      values(key), low, slots, key.size(), args, rows, outOfRange);
+  CUDF_CUDA_TRY(cudaGetLastError());
+}
+
 void addRows(
     const cudf::column_view& key,
     int64_t low,
@@ -383,6 +621,8 @@ rmm::device_uvector<cudf::size_type> occupied(
 void keys(
     const rmm::device_uvector<cudf::size_type>& slots,
     int64_t low,
+    int64_t stride,
+    int64_t size,
     cudf::mutable_column_view out,
     cuda::stream_ref stream) {
   const auto groups = static_cast<cudf::size_type>(slots.size());
@@ -390,7 +630,7 @@ void keys(
     return;
   }
   keysKernel<<<blocks(groups), kBlock, 0, stream.get()>>>(
-      slots.data(), groups, low, out.type().id(), out.head());
+      slots.data(), groups, low, stride, size, out.type().id(), out.head());
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
