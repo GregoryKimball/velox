@@ -123,16 +123,17 @@ class QueryContext {
   const char* chars(const std::string& table, const std::string& name);
 
   /// Device-readable rows [first, last) of a fixed-width column as T, at
-  /// p + first through p + last - 1 of the returned p. In one batch the whole
-  /// cached column; run batch by batch, only these rows, copied into memory
-  /// that endBatch frees.
+  /// p + first through p + last - 1 of the returned p: the cached column, or
+  /// run batch by batch from a narrower stored type, these rows widened into
+  /// memory that endBatch frees.
   template <typename T>
   const T* rows(const std::string& table, const std::string& name, int64_t first, int64_t last) {
     return static_cast<const T*>(range(table, name, first, last, sizeof(T)));
   }
 
-  /// Rows [first, last) of a string column: offsets valid at [first, last]
-  /// and characters at the absolute positions those offsets give.
+  /// Rows [first, last) of a cached string column: offsets valid at
+  /// [first, last] and characters at the absolute positions those offsets
+  /// give.
   struct StringRows {
     const int64_t* offsets;
     const char* chars;
@@ -209,10 +210,6 @@ class QueryContext {
  private:
   const void* column(const std::string& table, const std::string& name, size_t width);
   const void* range(const std::string& table, const std::string& name, int64_t first, int64_t last, size_t width);
-  /// Copies 'bytes' of host 'from' to device 'to', through pinned staging
-  /// unless 'from' is pinned.
-  void upload(void* to, const void* from, size_t bytes, bool pinned);
-  void* staging(size_t bytes);
 
   ColumnStore& store_;
   DeviceCache& cache_;
@@ -220,8 +217,6 @@ class QueryContext {
   const QueryParams& params_;
   std::vector<void*> scratch_;
   std::vector<void*> batch_;
-  void* staging_{nullptr};
-  size_t stagingBytes_{0};
   const bool trace_;
   double lastMark_;
 };

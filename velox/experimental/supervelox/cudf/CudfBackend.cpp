@@ -354,6 +354,10 @@ OrderLines orderLines(QueryContext& ctx, int64_t begin, int64_t end) {
       cudf::binary_operator::SUB,
       cudf::data_type{cudf::type_id::INT32},
       ctx.stream());
+  lines.groups = std::make_unique<cudf::groupby::groupby>(
+      cudf::table_view({fixedView(ctx, "lineitem", "l_orderkey", lines.lines)}),
+      cudf::null_policy::INCLUDE,
+      cudf::sorted::YES);
   return lines;
 }
 
@@ -376,26 +380,42 @@ perLine(QueryContext& ctx, const OrderLines& lines, const std::vector<cudf::colu
   return cudf::repeat(cudf::table_view(columns), lines.counts->view(), ctx.stream());
 }
 
+namespace {
+
+/// 'aggregation' of 'values' over each order's lines. A sorted groupby over
+/// l_orderkey finds the orders' boundaries once per OrderLines; segmented
+/// reductions spend a thread block on each order's few lines.
+std::unique_ptr<cudf::column> perOrder(
+    QueryContext& ctx,
+    const cudf::column_view& values,
+    const OrderLines& lines,
+    std::unique_ptr<cudf::groupby_aggregation> aggregation) {
+  std::vector<cudf::groupby::aggregation_request> requests(1);
+  requests[0].values = values;
+  requests[0].aggregations.push_back(std::move(aggregation));
+  auto [keys, results] = lines.groups->aggregate(requests, ctx.stream());
+  if (keys->num_rows() != lines.end - lines.begin) {
+    throw std::runtime_error("orders without lines");
+  }
+  return std::move(results[0].results[0]);
+}
+
+} // namespace
+
 std::unique_ptr<cudf::column> sumPerOrder(QueryContext& ctx, const cudf::column_view& values, const OrderLines& lines) {
-  return cudf::segmented_reduce(
-      values,
-      cudf::device_span<cudf::size_type const>(lines.offsets->view().data<cudf::size_type>(), lines.offsets->size()),
-      *cudf::make_sum_aggregation<cudf::segmented_reduce_aggregation>(),
-      cudf::data_type{cudf::type_id::INT64},
-      cudf::null_policy::EXCLUDE,
-      ctx.stream());
+  auto sums = perOrder(ctx, values, lines, cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+  return sums->type().id() == cudf::type_id::INT64 ? std::move(sums)
+                                                     : cudf::cast(sums->view(), cudf::data_type{cudf::type_id::INT64}, ctx.stream());
 }
 
 std::unique_ptr<cudf::column>
 extremePerOrder(QueryContext& ctx, const cudf::column_view& values, const OrderLines& lines, bool maximum) {
-  return cudf::segmented_reduce(
+  return perOrder(
+      ctx,
       values,
-      cudf::device_span<cudf::size_type const>(lines.offsets->view().data<cudf::size_type>(), lines.offsets->size()),
-      maximum ? *cudf::make_max_aggregation<cudf::segmented_reduce_aggregation>()
-              : *cudf::make_min_aggregation<cudf::segmented_reduce_aggregation>(),
-      values.type(),
-      cudf::null_policy::EXCLUDE,
-      ctx.stream());
+      lines,
+      maximum ? cudf::make_max_aggregation<cudf::groupby_aggregation>()
+              : cudf::make_min_aggregation<cudf::groupby_aggregation>());
 }
 
 std::unique_ptr<cudf::column>

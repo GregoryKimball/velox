@@ -17,6 +17,7 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/groupby.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <cudf/udf.hpp>
@@ -121,6 +122,9 @@ struct OrderLines {
   RowRange lines;
   std::unique_ptr<cudf::column> counts;
   std::unique_ptr<cudf::column> offsets;
+  /// The lines grouped by l_orderkey, which is equal over an order's lines,
+  /// for aggregating per order.
+  std::unique_ptr<cudf::groupby::groupby> groups;
 };
 
 OrderLines orderLines(QueryContext& ctx, int64_t begin, int64_t end);
