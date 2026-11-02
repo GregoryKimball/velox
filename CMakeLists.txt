@@ -195,6 +195,7 @@ option(VELOX_SIMDJSON_SKIPUTF8VALIDATION "Skip simdjson utf8 validation in JSON 
 option(VELOX_ENABLE_FAISS "Build faiss vector search support" OFF)
 option(VELOX_ENABLE_TORCHWAVE "Build TorchWave experimental subsystem." OFF)
 option(VELOX_ENABLE_CXL "Build CXL experimental memory subsystem (Linux only)." OFF)
+option(VELOX_ENABLE_SUPERVELOX "Build the supervelox fused GPU operators." OFF)
 
 # Explicitly force compilers to generate colored output. Compilers usually do
 # this by default if they detect the output is a terminal, but this assumption
@@ -571,7 +572,7 @@ if(ENABLE_ALL_WARNINGS)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra ${KNOWN_WARNINGS}")
 endif()
 
-if(VELOX_ENABLE_WAVE OR VELOX_ENABLE_CUDF)
+if(VELOX_ENABLE_WAVE OR VELOX_ENABLE_CUDF OR VELOX_ENABLE_SUPERVELOX)
   enable_language(CUDA)
   # Use same C++ standard throughout
   set(CMAKE_CUDA_STANDARD ${CMAKE_CXX_STANDARD})

@@ -224,11 +224,117 @@ TypedExprPtr adjustLastNArguments(
   return nullptr;
 }
 
+// 'type' as a decimal: itself if a decimal, the decimal of scale 0 holding
+// every value of an integer type, or null.
+TypePtr asDecimal(const TypePtr& type) {
+  if (type->isDecimal()) {
+    return type;
+  }
+  switch (type->kind()) {
+    case TypeKind::TINYINT:
+      return DECIMAL(3, 0);
+    case TypeKind::SMALLINT:
+      return DECIMAL(5, 0);
+    case TypeKind::INTEGER:
+      return DECIMAL(10, 0);
+    case TypeKind::BIGINT:
+      return DECIMAL(19, 0);
+    default:
+      return nullptr;
+  }
+}
+
+// 'input' as a value of 'type', a decimal with at least its scale: a constant
+// rescaled, anything else cast.
+TypedExprPtr toDecimal(const TypedExprPtr& input, const TypePtr& type) {
+  const auto* constant = dynamic_cast<const ConstantTypedExpr*>(input.get());
+  if (!constant || constant->hasValueVector() || constant->value().isNull()) {
+    return makeTypedCast(type, input);
+  }
+  const auto& value = constant->value();
+  int128_t unscaled;
+  int32_t scale = 0;
+  if (input->type()->isDecimal()) {
+    scale = getDecimalPrecisionScale(*input->type()).second;
+    unscaled = input->type()->isShortDecimal() ? value.value<int64_t>()
+                                               : value.value<int128_t>();
+  } else {
+    switch (input->type()->kind()) {
+      case TypeKind::TINYINT:
+        unscaled = value.value<int8_t>();
+        break;
+      case TypeKind::SMALLINT:
+        unscaled = value.value<int16_t>();
+        break;
+      case TypeKind::INTEGER:
+        unscaled = value.value<int32_t>();
+        break;
+      default:
+        unscaled = value.value<int64_t>();
+        break;
+    }
+  }
+  for (auto s = scale; s < getDecimalPrecisionScale(*type).second; ++s) {
+    unscaled *= 10;
+  }
+  if (type->isShortDecimal()) {
+    return std::make_shared<ConstantTypedExpr>(
+        type, Variant(static_cast<int64_t>(unscaled)));
+  }
+  return std::make_shared<ConstantTypedExpr>(type, Variant(unscaled));
+}
+
+// The call with its decimal and integer arguments brought to their common
+// decimal type, as SQL compares and combines decimals of different precision
+// and scale. Null unless some argument is a decimal and the call resolves
+// that way.
+TypedExprPtr unifyDecimals(
+    const std::shared_ptr<const CallExpr>& expr,
+    std::vector<TypedExprPtr> inputs) {
+  int32_t integerDigits = 0;
+  int32_t scale = 0;
+  bool anyDecimal = false;
+  for (const auto& input : inputs) {
+    if (auto type = asDecimal(input->type())) {
+      const auto [p, s] = getDecimalPrecisionScale(*type);
+      integerDigits = std::max<int32_t>(integerDigits, p - s);
+      scale = std::max<int32_t>(scale, s);
+      anyDecimal |= input->type()->isDecimal();
+    }
+  }
+  if (!anyDecimal) {
+    return nullptr;
+  }
+  const auto common =
+      DECIMAL(std::min<int32_t>(LongDecimalType::kMaxPrecision, integerDigits + scale), scale);
+  for (auto& input : inputs) {
+    if (asDecimal(input->type()) && !input->type()->equivalent(*common)) {
+      input = toDecimal(input, common);
+    }
+  }
+  auto type = resolveTypeImpl(inputs, expr, true /*nullOnFailure*/);
+  if (type == nullptr) {
+    return nullptr;
+  }
+  return std::make_shared<CallTypedExpr>(type, inputs, std::string{expr->name()});
+}
+
 TypedExprPtr createWithImplicitCast(
     const std::shared_ptr<const CallExpr>& expr,
     const std::vector<TypedExprPtr>& inputs) {
+  // Conditionals fail rather than return null when their branches differ in
+  // type, so their decimal branches are brought together first.
+  const bool conditional = expr->name() == "switch" || expr->name() == "if";
+  if (conditional) {
+    if (auto unified = unifyDecimals(expr, inputs)) {
+      return unified;
+    }
+  }
   if (auto adjusted = adjustLastNArguments(inputs, expr, inputs.size())) {
     return adjusted;
+  }
+  if (auto unified = conditional ? nullptr : unifyDecimals(expr, inputs)) {
+    return unified;
   }
   auto type = resolveTypeImpl(inputs, expr, /*nullOnFailure=*/false);
   return std::make_shared<CallTypedExpr>(type, inputs, expr->name());

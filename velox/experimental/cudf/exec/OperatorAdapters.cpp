@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/connectors/GpuConnector.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
 #include "velox/experimental/cudf/connectors/hive/iceberg/CudfIcebergConnector.h"
 #include "velox/experimental/cudf/exec/CudfAggregation.h"
@@ -173,12 +174,15 @@ class TableScanAdapter : public OperatorAdapter {
         std::dynamic_pointer_cast<facebook::velox::cudf_velox::connector::hive::
                                       iceberg::CudfIcebergConnector>(connector);
 
-    bool canRunOnGPU =
-        cudfHiveConnector != nullptr or cudfIcebergConnector != nullptr;
+    auto gpuConnector = std::dynamic_pointer_cast<
+        facebook::velox::cudf_velox::connector::GpuConnector>(connector);
+
+    bool canRunOnGPU = cudfHiveConnector != nullptr or
+        cudfIcebergConnector != nullptr or gpuConnector != nullptr;
 
     if (!canRunOnGPU) {
       LOG_FALLBACK(
-          "TableScan connector is not CudfHiveConnector or CudfIcebergConnector, PlanNode id: {}",
+          "TableScan connector is not CudfHiveConnector, CudfIcebergConnector or a GpuConnector, PlanNode id: {}",
           planNode->id());
     }
 
@@ -341,6 +345,12 @@ class AggregationAdapter : public OperatorAdapter {
       return false;
     }
 
+    // A CPU aggregation over a dense node would see each driver's share of
+    // every group.
+    if (dynamic_cast<const DenseAggregationNode*>(aggregationPlanNode.get())) {
+      return true;
+    }
+
     bool canEvaluate = canBeEvaluatedByCudf(
         *aggregationPlanNode, ctx->task->queryCtx().get(), op->pool());
     if (!canEvaluate) {
@@ -367,8 +377,12 @@ class AggregationAdapter : public OperatorAdapter {
     auto aggregationPlanNode =
         std::dynamic_pointer_cast<const core::AggregationNode>(planNode);
 
-    bool isGlobal = aggregationPlanNode->groupingKeys().empty();
-    bool isDistinct = !isGlobal && aggregationPlanNode->aggregates().empty();
+    // A dense node without keys is a global aggregation that CudfGroupby runs.
+    const bool dense =
+        dynamic_cast<const DenseAggregationNode*>(aggregationPlanNode.get()) !=
+        nullptr;
+    bool isGlobal = !dense && aggregationPlanNode->groupingKeys().empty();
+    bool isDistinct = !dense && !isGlobal && aggregationPlanNode->aggregates().empty();
 
     std::vector<std::unique_ptr<exec::Operator>> result;
     if (CudfConfig::getInstance().concatOptimizationEnabled) {

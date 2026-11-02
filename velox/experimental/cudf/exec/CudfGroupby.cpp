@@ -1451,6 +1451,9 @@ CudfGroupby::CudfGroupby(
           !hasFinalAggs(aggregationNode->aggregates())),
       isSingleStep_(
           aggregationNode->step() == core::AggregationNode::Step::kSingle),
+      preGrouped_(isSingleStep_ && aggregationNode->isPreGrouped()),
+      denseNode_(
+          dynamic_cast<const DenseAggregationNode*>(aggregationNode.get())),
       maxPartialAggregationMemoryUsage_(
           driverCtx->queryConfig().maxPartialAggregationMemoryUsage()) {}
 
@@ -1691,12 +1694,39 @@ void CudfGroupby::initialize() {
 
   inputType_ = aggregationNode_->sources()[0]->outputType();
   ignoreNullKeys_ = aggregationNode_->ignoreNullKeys();
+  if (denseNode_ != nullptr) {
+    const auto inputRow = asRowType(inputType_);
+    std::vector<DenseGroupby::Key> keys;
+    for (size_t k = 0; k < denseNode_->groupingKeys().size(); ++k) {
+      keys.push_back(DenseGroupby::Key{
+          denseNode_->keys()[k],
+          static_cast<int32_t>(inputRow->getChildIdx(
+              denseNode_->groupingKeys()[k]->name())),
+          denseNode_->outputType()->childAt(k)});
+    }
+    std::vector<DenseGroupby::Aggregate> aggregates;
+    if (const auto* fused =
+            dynamic_cast<const FusedAggregationNode*>(denseNode_)) {
+      fused_ = std::make_unique<FusedReduction>(*fused, inputRow);
+      aggregates = fused_->aggregates();
+    } else {
+      aggregates = DenseGroupby::aggregates(*denseNode_, inputRow);
+    }
+    dense_ = DenseGroupby::shared(
+        operatorCtx_->task().get(), planNodeId(), [&]() {
+          return std::make_shared<DenseGroupby>(
+              std::move(keys),
+              std::move(aggregates),
+              cudfGlobalStreamPool().get_stream(),
+              get_output_mr());
+        });
+    aggregationNode_.reset();
+    return;
+  }
   setupGroupingKeyChannelProjections(
       *aggregationNode_, groupingKeyInputChannels_, groupingKeyOutputChannels_);
 
-  // Velox CPU does optimizations related to pre-grouped keys. This can be
-  // done in cudf by passing sort information to cudf::groupby() constructor.
-  // We're postponing this for now.
+  // Pre-grouped keys are handled for a single step only, see preGrouped_.
 
   numAggregates_ = aggregationNode_->aggregates().size();
   const auto inputRowSchema = asRowType(inputType_);
@@ -1923,6 +1953,31 @@ void CudfGroupby::doAddInput(RowVectorPtr input) {
   auto cudfInput = std::dynamic_pointer_cast<cudf_velox::CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
 
+  if (preGrouped_) {
+    computePreGroupedGroupby(std::move(cudfInput));
+    return;
+  }
+
+  if (fused_) {
+    const auto view = cudfInput->getTableView();
+    fused_->add(
+        std::vector<cudf::column_view>(view.begin(), view.end()),
+        *dense_,
+        cudfInput->stream());
+    return;
+  }
+
+  if (dense_) {
+    const auto view = cudfInput->getTableView();
+    dense_->add(
+        std::vector<cudf::column_view>(view.begin(), view.end()),
+        cudfInput->stream());
+    // The shared accumulators outlive this batch and are read by another
+    // driver's stream.
+    cudfInput->stream().sync();
+    return;
+  }
+
   if (streamingGroupbyEnabled_) {
     computeFinalGroupbyStreaming(std::move(cudfInput));
     return;
@@ -1951,16 +2006,16 @@ CudfVectorPtr CudfGroupby::doGroupByAggregation(
     std::vector<std::unique_ptr<GroupbyAggregator>>& aggregators,
     TypePtr const& outputType,
     cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr) {
+    rmm::device_async_resource_ref mr,
+    cudf::sorted keysSorted) {
   auto groupbyKeyView =
       tableView.select(groupByKeys.begin(), groupByKeys.end());
 
-  // TODO: All other args to groupby are related to sort groupby. We don't
-  // support optimizations related to it yet.
   cudf::groupby::groupby groupByOwner(
       groupbyKeyView,
       ignoreNullKeys_ ? cudf::null_policy::EXCLUDE
-                      : cudf::null_policy::INCLUDE);
+                      : cudf::null_policy::INCLUDE,
+      keysSorted);
 
   auto releaseInputs = [&]() {
     for (auto& aggregator : aggregators) {
@@ -2004,6 +2059,69 @@ CudfVectorPtr CudfGroupby::doGroupByAggregation(
 
   return std::make_shared<cudf_velox::CudfVector>(
       pool(), outputType, numRows, std::move(resultTable), stream);
+}
+
+void CudfGroupby::computePreGroupedGroupby(CudfVectorPtr input) {
+  auto stream = input->stream();
+  if (preGroupedTail_) {
+    std::vector<CudfVectorPtr> pieces{
+        std::move(preGroupedTail_), std::move(input)};
+    auto table = getConcatenatedTable(
+        std::move(pieces), inputType_, stream, get_output_mr());
+    const auto rows = table->num_rows();
+    input = std::make_shared<CudfVector>(
+        pool(), inputType_, rows, std::move(table), stream);
+  }
+  const auto view = input->getTableView();
+  const auto keys = view.select(
+      groupingKeyInputChannels_.begin(), groupingKeyInputChannels_.end());
+  // The offsets of the groups, on the host. Null keys are kept so that the
+  // offsets index the input rows. The last group may continue in the next
+  // batch.
+  cudf::groupby::groupby grouping(
+      keys, cudf::null_policy::INCLUDE, cudf::sorted::YES);
+  const auto offsets =
+      grouping.get_groups(cudf::table_view{}, stream, get_temp_mr()).offsets;
+  const auto tailStart =
+      offsets.size() >= 2 ? offsets[offsets.size() - 2] : 0;
+  auto split = cudf::split(view, {tailStart}, stream);
+  if (tailStart > 0) {
+    auto head = split[0].select(
+        aggregationInputChannels_.begin(), aggregationInputChannels_.end());
+    if (auto output = doGroupByAggregation(
+            head,
+            groupingKeyOutputChannels_,
+            aggregators_,
+            outputType_,
+            stream,
+            get_output_mr(),
+            cudf::sorted::YES)) {
+      preGroupedOutputs_.push_back(std::move(output));
+    }
+  }
+  auto tail = std::make_unique<cudf::table>(split[1], stream, get_output_mr());
+  const auto tailRows = tail->num_rows();
+  preGroupedTail_ = std::make_shared<CudfVector>(
+      pool(), inputType_, tailRows, std::move(tail), stream);
+}
+
+void CudfGroupby::flushPreGroupedGroupby() {
+  if (!preGroupedTail_) {
+    return;
+  }
+  auto tail = std::move(preGroupedTail_);
+  auto view = tail->getTableView().select(
+      aggregationInputChannels_.begin(), aggregationInputChannels_.end());
+  if (auto output = doGroupByAggregation(
+          view,
+          groupingKeyOutputChannels_,
+          aggregators_,
+          outputType_,
+          tail->stream(),
+          get_output_mr(),
+          cudf::sorted::YES)) {
+    preGroupedOutputs_.push_back(std::move(output));
+  }
 }
 
 CudfVectorPtr CudfGroupby::finalizeGroupedStates(
@@ -2052,6 +2170,38 @@ CudfVectorPtr CudfGroupby::releaseAndResetBufferedResult() {
 }
 
 RowVectorPtr CudfGroupby::doGetOutput() {
+  if (dense_) {
+    if (!denseEmits_ || finished_) {
+      return nullptr;
+    }
+    finished_ = true;
+    auto stream = cudfGlobalStreamPool().get_stream();
+    auto columns = dense_->release(stream, get_output_mr());
+    DenseGroupby::forget(operatorCtx_->task().get(), planNodeId());
+    dense_.reset();
+    const auto rows = columns.front()->size();
+    if (rows == 0) {
+      return nullptr;
+    }
+    return std::make_shared<CudfVector>(
+        pool(),
+        outputType_,
+        rows,
+        std::make_unique<cudf::table>(std::move(columns)),
+        stream);
+  }
+  if (preGrouped_) {
+    if (noMoreInput_) {
+      flushPreGroupedGroupby();
+    }
+    if (!preGroupedOutputs_.empty()) {
+      auto output = std::move(preGroupedOutputs_.front());
+      preGroupedOutputs_.pop_front();
+      return output;
+    }
+    finished_ = noMoreInput_;
+    return nullptr;
+  }
   // Handle partial streaming groupby.
   if (isPartialOutput_ && incrementalAggregationEnabled_) {
     if (bufferedResult_ &&
@@ -2130,6 +2280,18 @@ RowVectorPtr CudfGroupby::doGetOutput() {
 
 void CudfGroupby::doNoMoreInput() {
   Operator::noMoreInput();
+  if (dense_) {
+    ContinueFuture future;
+    std::vector<ContinuePromise> promises;
+    std::vector<std::shared_ptr<exec::Driver>> peers;
+    denseEmits_ = operatorCtx_->task()->allPeersFinished(
+        planNodeId(), operatorCtx_->driver(), &future, promises, peers);
+    for (auto& promise : promises) {
+      promise.setValue();
+    }
+    finished_ = !denseEmits_;
+    return;
+  }
   if (isPartialOutput_ && inputs_.empty()) {
     finished_ = true;
   }
@@ -2148,6 +2310,10 @@ void CudfGroupby::doClose() {
   streamingGroupbyAggregators_.clear();
   inputs_.clear();
   bufferedResult_.reset();
+  preGroupedTail_.reset();
+  preGroupedOutputs_.clear();
+  dense_.reset();
+  fused_.reset();
   aggregators_.clear();
   intermediateAggregators_.clear();
   partialAggregators_.clear();
