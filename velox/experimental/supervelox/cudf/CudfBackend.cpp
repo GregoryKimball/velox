@@ -31,6 +31,7 @@
 #include <cudf/stream_compaction.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
+#include <rmm/device_buffer.hpp>
 #include <rmm/mr/cuda_async_view_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
@@ -46,6 +47,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
+
+#include <fmt/format.h>
 
 #include "velox/experimental/supervelox/common/Cuda.h"
 
@@ -119,6 +122,21 @@ const std::vector<int2>& hostZones(QueryContext& ctx, const std::string& table, 
 }
 
 bool jitEnabled = true;
+
+/// Declarations of `arrays` in generated code, read from `user`, a device
+/// copy of `pointers`, to which their addresses are appended.
+std::string
+declareArrays(QueryContext& ctx, const std::vector<ArrayInput>& arrays, std::vector<const void*>& pointers);
+
+/// A device copy of `pointers`, for transform_lto's or reduce_lto's user data.
+rmm::device_buffer devicePointers(QueryContext& ctx, const std::vector<const void*>& pointers) {
+  rmm::device_buffer buffer(std::max<size_t>(1, pointers.size()) * sizeof(void*), ctx.stream());
+  if (!pointers.empty()) {
+    SV_CUDA(cudaMemcpyAsync(
+        buffer.data(), pointers.data(), pointers.size() * sizeof(void*), cudaMemcpyHostToDevice, ctx.stream()));
+  }
+  return buffer;
+}
 
 /// The C subset of the queries' device expressions as a cuDF AST, which
 /// compute_column evaluates with its precompiled interpreter. Integers are
@@ -701,14 +719,19 @@ using namespace cuda::std;
 
 extern "C" {
 )";
-  source += "__device__ errc sums_filter(size_type, bool* keep, " + sums.inputs + ") {\n" + sums.prelude +
-      "  *keep = " + sums.filter + ";\n  return errc::SUCCESS;\n}\n";
+  // Arrays come last among the inputs, through the user data.
+  std::vector<const void*> pointers;
+  const std::string inputs = sums.arrays.empty() ? sums.inputs : sums.inputs + ", void* user";
+  const std::string arrays = sums.arrays.empty() ? "" : declareArrays(ctx, sums.arrays, pointers);
+  source += "__device__ errc sums_filter(size_type row, bool* keep, " + inputs + ") {\n" +
+      (sums.filter == "true" ? "" : arrays + sums.prelude) + "  *keep = " + sums.filter +
+      ";\n  return errc::SUCCESS;\n}\n";
   source += "__device__ errc sums_init(" + list("int64_t*", "s") + ") {\n";
   for (int32_t i = 0; i < fields; ++i) {
     source += "  *s" + std::to_string(i) + " = 0;\n";
   }
   source += "  return errc::SUCCESS;\n}\n";
-  source += "__device__ errc sums_update(size_type, " + list("int64_t*", "s") + ", " + sums.inputs + ") {\n" +
+  source += "__device__ errc sums_update(size_type row, " + list("int64_t*", "s") + ", " + inputs + ") {\n" + arrays +
       sums.prelude + "  const int group = " + sums.group + ";\n";
   for (size_t k = 0; k < sums.values.size(); ++k) {
     source += "  const int64_t v" + std::to_string(k) + " = " + sums.values[k] + ";\n";
@@ -737,14 +760,21 @@ extern "C" {
     return totals;
   }
   if (!useJit()) {
+    if (!sums.arrays.empty()) {
+      throw std::invalid_argument("sumGroups reads arrays only with JIT");
+    }
     return stockSumGroups(ctx, sums, columns);
   }
   const auto& fragment = compileFragment(source);
-  const std::vector<cudf::reduce_input> inputs(columns.begin(), columns.end());
+  rmm::device_buffer user = devicePointers(ctx, pointers);
+  std::vector<cudf::reduce_input> reduceInputs(columns.begin(), columns.end());
+  if (!sums.arrays.empty()) {
+    reduceInputs.push_back(cudf::user_data{user.data()});
+  }
   const cudf::lto_fragment fragments[] = {{cudf::lto_binary_type::LTO_IR, fragment.view()}};
   const cudf::reduce_udf udf{fragments, "sums_init", "sums_update", "sums_merge", "sums_finalize", "sums_filter"};
   const std::vector<cudf::data_type> types(fields, cudf::data_type{cudf::type_id::INT64});
-  auto results = cudf::reduce_lto(udf, cudf::null_aware::NO, inputs, types, types, ctx.stream());
+  auto results = cudf::reduce_lto(udf, cudf::null_aware::NO, reduceInputs, types, types, ctx.stream());
   for (int32_t i = 0; i < fields; ++i) {
     SV_CUDA(cudaMemcpyAsync(
         &totals[i], results[i]->view().head(), sizeof(int64_t), cudaMemcpyDeviceToHost, ctx.stream()));
@@ -776,6 +806,8 @@ const char* deviceType(cudf::type_id type) {
       return "int32_t";
     case cudf::type_id::INT64:
       return "int64_t";
+    case cudf::type_id::UINT32:
+      return "uint32_t";
     case cudf::type_id::FLOAT64:
       return "double";
     default:
@@ -830,28 +862,236 @@ OrderLines orderLines(QueryContext& ctx, int64_t begin, int64_t end) {
   if (end <= begin) {
     return lines;
   }
-  const uint32_t* starts = orderLineStarts(ctx);
-  const auto bounds = ctx.download(starts + begin, 1);
-  const auto last = ctx.download(starts + end, 1);
-  lines.lines = {bounds[0], last[0]};
+  const OrderBatch batch = orderBatch(ctx, begin, end);
+  lines.lines = batch.lines;
+  const auto size = static_cast<cudf::size_type>(end - begin);
   lines.counts = cudf::binary_operation(
-      deviceView(cudf::type_id::INT32, starts + begin + 1, end - begin),
-      deviceView(cudf::type_id::INT32, starts + begin, end - begin),
+      cudf::slice(batch.starts, {1, size + 1})[0],
+      cudf::slice(batch.starts, {0, size})[0],
       cudf::binary_operator::SUB,
       cudf::data_type{cudf::type_id::INT32},
       ctx.stream());
-  const cudf::numeric_scalar<int32_t> base(static_cast<int32_t>(lines.lines.begin), true, ctx.stream());
+  const cudf::numeric_scalar<int64_t> base(lines.lines.begin - batch.base, true, ctx.stream());
   lines.offsets = cudf::binary_operation(
-      deviceView(cudf::type_id::INT32, starts + begin, end - begin + 1),
-      base,
-      cudf::binary_operator::SUB,
-      cudf::data_type{cudf::type_id::INT32},
-      ctx.stream());
+      batch.starts, base, cudf::binary_operator::SUB, cudf::data_type{cudf::type_id::INT32}, ctx.stream());
   lines.groups = std::make_unique<cudf::groupby::groupby>(
       cudf::table_view({fixedView(ctx, "lineitem", "l_orderkey", lines.lines)}),
       cudf::null_policy::INCLUDE,
       cudf::sorted::YES);
   return lines;
+}
+
+namespace {
+
+std::string
+declareArrays(QueryContext& ctx, const std::vector<ArrayInput>& arrays, std::vector<const void*>& pointers) {
+  std::string source = "  const void* const* pointers = static_cast<const void* const*>(user);\n";
+  for (const auto& array : arrays) {
+    cudf::type_id type = array.view.type().id();
+    if (array.table.empty()) {
+      pointers.push_back(array.view.head());
+    } else {
+      const Column& column = ctx.meta(array.table, array.column);
+      pointers.push_back(
+          static_cast<const char*>(storedColumn(ctx, array.table, array.column, column.dtype)) +
+          array.first * dtypeSize(column.dtype));
+      type = typeId(column.dtype);
+    }
+    source += fmt::format(
+        "  const {0}* {1} = static_cast<const {0}*>(pointers[{2}]);\n", deviceType(type), array.name, pointers.size() - 1);
+  }
+  return source;
+}
+
+} // namespace
+
+std::unique_ptr<cudf::table> transformRows(
+    QueryContext& ctx,
+    int64_t rows,
+    const std::string& inputs,
+    const std::vector<cudf::column_view>& columns,
+    const std::vector<ArrayInput>& arrays,
+    const std::vector<std::pair<cudf::type_id, std::string>>& outputs,
+    const std::string& body) {
+  std::vector<const void*> pointers;
+  std::string source = R"(
+#include <cuda/std/cstdint>
+
+using namespace cuda::std;
+
+extern "C" __device__ int transform(void* user, int32_t row)";
+  for (const auto& [type, name] : outputs) {
+    source += std::string(", ") + deviceType(type) + "* " + name;
+  }
+  source += (inputs.empty() ? "" : ", " + inputs) + ") {\n";
+  source += declareArrays(ctx, arrays, pointers);
+  source += body + "\n  return 0;\n}\n";
+  rmm::device_buffer user = devicePointers(ctx, pointers);
+  const std::vector<cudf::transform_input> in(columns.begin(), columns.end());
+  std::vector<cudf::transform_output> out;
+  for (const auto& output : outputs) {
+    out.push_back({cudf::data_type{output.first}, cudf::output_nullability::ALL_VALID});
+  }
+  return cudf::transform_lto(
+      compileFragment(source).view(),
+      cudf::lto_binary_type::LTO_IR,
+      cudf::null_aware::NO,
+      user.data(),
+      in,
+      out,
+      {},
+      static_cast<cudf::size_type>(rows),
+      ctx.stream());
+}
+
+std::unique_ptr<cudf::table> perOrderColumns(
+    QueryContext& ctx,
+    int64_t begin,
+    int64_t end,
+    const std::string& orderInputs,
+    const std::vector<cudf::column_view>& orderColumns,
+    const std::vector<ArrayInput>& arrays,
+    const std::vector<std::pair<cudf::type_id, std::string>>& outputs,
+    const std::string& init,
+    const std::string& line,
+    const std::string& finish) {
+  const OrderBatch batch = orderBatch(ctx, begin, end);
+  return transformRows(
+      ctx,
+      end - begin,
+      orderInputs,
+      orderColumns,
+      withLines(batch, arrays),
+      outputs,
+      init + "\n  for (int64_t l = starts[row]; l < starts[row + 1]; ++l) {\n" + line + "\n  }\n" + finish);
+}
+
+namespace {
+
+/// linesOfParts over one batch, with the parts as bitmask words.
+std::unique_ptr<cudf::table> linesOfPartsIn(
+    QueryContext& ctx,
+    const cudf::column_view& wanted,
+    RowRange range,
+    const std::vector<ArrayInput>& arrays,
+    const std::string& condition,
+    const std::vector<std::string>& columns) {
+  // Words cover 32 lines from a multiple of 32, so that whole words inside
+  // the range read the part keys 16 bytes at a time.
+  // Lineitem arrays are read from `base`, so that batches of the same size
+  // generate the same source.
+  const int64_t base = range.begin / 32 * 32;
+  const int64_t words = (range.end - base + 31) / 32;
+  std::vector<ArrayInput> bitArrays = arrays;
+  bitArrays.push_back({"lineitem", "l_partkey", "partkey"});
+  for (auto& array : bitArrays) {
+    if (array.table == "lineitem") {
+      array.first = base;
+    }
+  }
+  bitArrays.push_back({.name = "wanted", .view = wanted});
+  const bool vector = typeId(ctx.meta("lineitem", "l_partkey").dtype) == cudf::type_id::INT32;
+  auto bits = transformRows(
+      ctx,
+      words,
+      "",
+      {},
+      bitArrays,
+      {{cudf::type_id::UINT32, "word"}, {cudf::type_id::INT32, "count"}},
+      fmt::format(
+          "  uint32_t bits = 0;\n"
+          "  const int64_t first = {0} + int64_t{{row}} * 32;\n"
+          "  auto test = [&](int64_t key, int k) {{\n"
+          "    const int64_t part = key - 1;\n"
+          "    const int64_t l = first + k;\n"
+          "    if (((wanted[part >> 5] >> (part & 31)) & 1u) && ({3})) bits |= 1u << k;\n"
+          "  }};\n"
+          "  if ({4} && first >= {1} && first + 32 <= {2}) {{\n"
+          "    const int4* keys = reinterpret_cast<const int4*>(partkey + first);\n"
+          "#pragma unroll\n"
+          "    for (int v = 0; v < 8; ++v) {{\n"
+          "      const int4 four = keys[v];\n"
+          "      test(four.x, 4 * v); test(four.y, 4 * v + 1); test(four.z, 4 * v + 2); test(four.w, 4 * v + 3);\n"
+          "    }}\n"
+          "  }} else {{\n"
+          "    for (int k = 0; k < 32; ++k) {{\n"
+          "      if (first + k >= {1} && first + k < {2}) test(partkey[first + k], k);\n"
+          "    }}\n"
+          "  }}\n"
+          "  *word = bits;\n"
+          "  *count = __popc(bits);",
+          0,
+          range.begin - base,
+          range.end - base,
+          condition.empty() ? "true" : condition,
+          vector ? "true" : "false"));
+  auto ends = cudf::scan(
+      bits->get_column(1).view(),
+      *cudf::make_sum_aggregation<cudf::scan_aggregation>(),
+      cudf::scan_type::INCLUSIVE,
+      cudf::null_policy::EXCLUDE,
+      ctx.stream());
+  const int64_t total =
+      words == 0 ? 0 : ctx.download(static_cast<const int32_t*>(ends->view().head()) + words - 1, 1)[0];
+  std::vector<ArrayInput> rowArrays = {
+      {.name = "words", .view = bits->get_column(0).view()}, {.name = "ends", .view = ends->view()}};
+  std::vector<std::pair<cudf::type_id, std::string>> outputs;
+  std::string copies;
+  for (size_t i = 0; i < columns.size(); ++i) {
+    rowArrays.push_back({"lineitem", columns[i], "in" + std::to_string(i), {}, base});
+    outputs.emplace_back(typeId(ctx.meta("lineitem", columns[i]).dtype), "out" + std::to_string(i));
+    copies += fmt::format("  *out{0} = in{0}[line];\n", i);
+  }
+  if (total == 0) {
+    std::vector<std::unique_ptr<cudf::column>> empty;
+    for (const auto& [type, name] : outputs) {
+      empty.push_back(cudf::make_empty_column(cudf::data_type{type}));
+    }
+    return std::make_unique<cudf::table>(std::move(empty));
+  }
+  // The kept row of rank `row` is in the first word whose inclusive count
+  // exceeds it.
+  return transformRows(
+      ctx,
+      total,
+      "",
+      {},
+      rowArrays,
+      outputs,
+      fmt::format(
+          "  int64_t low = 0, high = {1} - 1;\n"
+          "  while (low < high) {{\n"
+          "    const int64_t middle = (low + high) / 2;\n"
+          "    if (ends[middle] > row) high = middle; else low = middle + 1;\n"
+          "  }}\n"
+          "  uint32_t bits = words[low];\n"
+          "  for (int skip = row - (ends[low] - __popc(bits)); skip > 0; --skip) bits &= bits - 1;\n"
+          "  const int64_t line = {0} + low * 32 + __ffs(bits) - 1;\n",
+          0,
+          words) +
+          copies);
+}
+
+} // namespace
+
+std::unique_ptr<cudf::table> linesOfParts(
+    QueryContext& ctx,
+    const cudf::column_view& parts,
+    RowRange range,
+    const std::vector<ArrayInput>& arrays,
+    const std::string& condition,
+    const std::vector<std::string>& columns) {
+  auto [partMask, partNulls] = cudf::bools_to_mask(parts, ctx.stream());
+  const cudf::column_view wanted =
+      deviceView(cudf::type_id::UINT32, partMask->data(), (parts.size() + 31) / 32);
+  std::vector<std::unique_ptr<cudf::table>> pieces;
+  for (const RowRange batch : rowBatches(range, range.size(), 1, 32)) {
+    pieces.push_back(linesOfPartsIn(ctx, wanted, batch, arrays, condition, columns));
+  }
+  if (pieces.size() == 1) {
+    return std::move(pieces[0]);
+  }
+  return concatenateTables(ctx, pieces);
 }
 
 std::vector<std::pair<int64_t, int64_t>>
@@ -860,12 +1100,96 @@ orderChunks(QueryContext& ctx, int64_t begin, int64_t end, int64_t maxLines) {
   if (end <= begin) {
     return chunks;
   }
+  if (batched()) {
+    // Batches count four lines an order, as the hand-written kernels do, and
+    // end at multiples of their size, where lineStart needs no search.
+    const int64_t step = std::max<int64_t>(1, batchRows() / 4);
+    for (int64_t first = begin; first < end;) {
+      const int64_t last = std::min(end, (first / step + 1) * step);
+      chunks.emplace_back(first, last);
+      first = last;
+    }
+    return chunks;
+  }
   // Orders hold at most seven lines, so a run of maxLines / 8 orders fits.
-  const int64_t orders = std::max<int64_t>(1, maxLines / 8);
-  for (int64_t first = begin; first < end; first += orders) {
-    chunks.emplace_back(first, std::min(end, first + orders));
+  for (const RowRange run : rowBatches({begin, end}, std::max<int64_t>(1, maxLines / 8))) {
+    chunks.emplace_back(run.begin, run.end);
   }
   return chunks;
+}
+
+bool batched() {
+  return batchRows() > 0;
+}
+
+std::vector<RowRange> rowBatches(RowRange range, int64_t whole, int64_t rowsPerItem, int64_t align) {
+  std::vector<RowRange> pieces;
+  if (range.size() <= 0) {
+    return pieces;
+  }
+  int64_t step = std::max<int64_t>(1, whole);
+  if (batched()) {
+    const int64_t items = std::max<int64_t>(1, batchRows() / rowsPerItem);
+    step = (items + align - 1) / align * align;
+  }
+  for (int64_t first = range.begin; first < range.end; first += step) {
+    pieces.push_back({first, std::min(range.end, first + step)});
+  }
+  return pieces;
+}
+
+OrderBatch orderBatch(QueryContext& ctx, int64_t first, int64_t last) {
+  OrderBatch batch;
+  batch.first = first;
+  batch.last = last;
+  const auto stream = ctx.stream();
+  if (!batched()) {
+    const uint32_t* starts = orderLineStarts(ctx);
+    batch.starts = deviceView(cudf::type_id::UINT32, starts + first, last - first + 1);
+    batch.lines = {ctx.download(starts + first, 1)[0], ctx.download(starts + last, 1)[0]};
+    return batch;
+  }
+  // An order starts where l_orderkey changes from the line before.
+  batch.lines = {lineStart(ctx, first), lineStart(ctx, last)};
+  batch.base = batch.lines.begin;
+  const int64_t lines = batch.lines.size();
+  const cudf::numeric_scalar<int32_t> zero(0, true, stream);
+  const cudf::numeric_scalar<int32_t> end(static_cast<int32_t>(lines), true, stream);
+  std::vector<std::unique_ptr<cudf::column>> parts;
+  parts.push_back(cudf::make_column_from_scalar(zero, last > first ? 1 : 0, stream));
+  if (lines > 1) {
+    const cudf::column_view keys = fixedView(ctx, "lineitem", "l_orderkey", batch.lines);
+    const auto next = cudf::slice(keys, {1, static_cast<cudf::size_type>(lines)})[0];
+    const auto previous = cudf::slice(keys, {0, static_cast<cudf::size_type>(lines - 1)})[0];
+    auto starts = cudf::binary_operation(
+        next, previous, cudf::binary_operator::NOT_EQUAL, cudf::data_type{cudf::type_id::BOOL8}, stream);
+    auto rows = sequence(ctx, lines - 1, 1);
+    auto selected = selectRows(ctx, cudf::table_view({rows->view()}), starts->view());
+    parts.push_back(std::move(selected->release()[0]));
+  }
+  parts.push_back(cudf::make_column_from_scalar(end, 1, stream));
+  std::vector<cudf::column_view> views;
+  for (const auto& part : parts) {
+    views.push_back(part->view());
+  }
+  batch.owned = cudf::concatenate(views, stream);
+  if (batch.owned->size() != last - first + 1) {
+    throw std::runtime_error(
+        "lines " + std::to_string(batch.lines.begin) + ".." + std::to_string(batch.lines.end) + " hold " +
+        std::to_string(batch.owned->size() - 1) + " orders, not " + std::to_string(last - first));
+  }
+  batch.starts = batch.owned->view();
+  return batch;
+}
+
+std::vector<ArrayInput> withLines(const OrderBatch& batch, std::vector<ArrayInput> arrays) {
+  for (auto& array : arrays) {
+    if (array.table == "lineitem") {
+      array.first = batch.base;
+    }
+  }
+  arrays.push_back({.name = "starts", .view = batch.starts});
+  return arrays;
 }
 
 std::unique_ptr<cudf::table>
@@ -954,6 +1278,51 @@ std::unique_ptr<cudf::table> concatenateTables(QueryContext& ctx, const std::vec
 
 std::unique_ptr<cudf::column>
 likeColumn(QueryContext& ctx, const std::string& table, const std::string& column, const std::string& pattern, RowRange rows) {
+  // %a%b%...% with LTO: a transform that finds each literal after the last.
+  const bool literals = pattern.size() >= 2 && pattern.front() == '%' && pattern.back() == '%' &&
+      pattern.find_first_of("_\\") == std::string::npos;
+  if (useJit() && literals) {
+    std::string source = R"(
+#include <cudf/strings/string_view.cuh>
+#include <cuda/std/cstdint>
+
+/// Where `word` starts in [from, size) of `text`, or -1.
+__device__ inline int find(const char* text, int from, int size, const char* word, int length) {
+  for (int i = from; i + length <= size; ++i) {
+    if (text[i] == word[0]) {
+      int j = 1;
+      while (j < length && text[i + j] == word[j]) {
+        ++j;
+      }
+      if (j == length) {
+        return i;
+      }
+    }
+  }
+  return -1;
+}
+
+extern "C" __device__ int transform(bool* matches, cudf::string_view value) {
+  const char* text = value.data();
+  const int size = value.size_bytes();
+  int at = 0;
+)";
+    std::stringstream words(pattern);
+    std::string word;
+    while (std::getline(words, word, '%')) {
+      if (!word.empty()) {
+        source += fmt::format(
+            "  at = find(text, at, size, \"{0}\", {1});\n  if (at < 0) {{\n    *matches = false;\n    return 0;\n  }}\n"
+            "  at += {1};\n",
+            word,
+            word.size());
+      }
+    }
+    source += "  *matches = true;\n  return 0;\n}\n";
+    const cudf::transform_input in[] = {stringView(ctx, table, column, rows)};
+    const cudf::transform_output out[] = {{cudf::data_type{cudf::type_id::BOOL8}, cudf::output_nullability::ALL_VALID}};
+    return std::move(transformColumns(ctx, source, in, out)->release()[0]);
+  }
   return cudf::strings::like(
       cudf::strings_column_view(stringView(ctx, table, column, rows)), pattern, "", ctx.stream());
 }
@@ -1043,6 +1412,57 @@ Grouped groupBy(
   auto [groupKeys, results] = grouping.aggregate(requests, ctx.stream());
   Grouped grouped;
   grouped.keys = std::move(groupKeys);
+  for (auto& result : results) {
+    grouped.values.push_back(std::move(result.results[0]));
+  }
+  return grouped;
+}
+
+StreamingGroups::StreamingGroups(const std::vector<Aggregate>& aggregates, int64_t maxKeys) : maxKeys_(maxKeys) {
+  std::vector<cudf::groupby::streaming_aggregation_request> requests;
+  for (size_t i = 0; i < aggregates.size(); ++i) {
+    std::unique_ptr<cudf::groupby_aggregation> aggregation;
+    switch (aggregates[i]) {
+      case Aggregate::kSum:
+        aggregation = cudf::make_sum_aggregation<cudf::groupby_aggregation>();
+        break;
+      case Aggregate::kMin:
+        aggregation = cudf::make_min_aggregation<cudf::groupby_aggregation>();
+        break;
+      case Aggregate::kMax:
+        aggregation = cudf::make_max_aggregation<cudf::groupby_aggregation>();
+        break;
+      case Aggregate::kCount:
+        aggregation = cudf::make_count_aggregation<cudf::groupby_aggregation>();
+        break;
+      case Aggregate::kDistinct:
+        throw std::invalid_argument("streaming groups do not count distinct values");
+    }
+    requests.push_back({static_cast<cudf::size_type>(i + 1), std::move(aggregation)});
+  }
+  const std::vector<cudf::size_type> keys = {0};
+  groups_ = std::make_unique<cudf::groupby::streaming_groupby>(
+      keys, requests, static_cast<cudf::size_type>(std::max<int64_t>(1, maxKeys)));
+}
+
+StreamingGroups::~StreamingGroups() = default;
+
+void StreamingGroups::add(QueryContext& ctx, const cudf::table_view& batch) {
+  // A batch may not have more rows than the state has keys.
+  for (int64_t first = 0; first < batch.num_rows(); first += maxKeys_) {
+    const auto last = static_cast<cudf::size_type>(std::min<int64_t>(batch.num_rows(), first + maxKeys_));
+    groups_->aggregate(cudf::slice(batch, {static_cast<cudf::size_type>(first), last})[0], ctx.stream());
+    added_ = true;
+  }
+}
+
+Grouped StreamingGroups::finish(QueryContext& ctx) {
+  Grouped grouped;
+  if (!added_) {
+    return grouped;
+  }
+  auto [keys, results] = groups_->finalize(ctx.stream());
+  grouped.keys = std::move(keys);
   for (auto& result : results) {
     grouped.values.push_back(std::move(result.results[0]));
   }

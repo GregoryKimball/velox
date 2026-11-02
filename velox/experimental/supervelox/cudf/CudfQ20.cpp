@@ -19,6 +19,8 @@
 #include <cudf/copying.hpp>
 #include <cudf/stream_compaction.hpp>
 
+#include <fmt/format.h>
+
 #include "velox/experimental/supervelox/cudf/CudfBackend.h"
 
 namespace facebook::velox::supervelox::cudf_backend {
@@ -43,32 +45,41 @@ Result q20(QueryContext& ctx) {
   const int64_t parts = ctx.rows("part");
   auto forest = likeColumn(ctx, "part", "p_name", "forest%", {0, parts});
   const RowRange zones = splitZones(ctx, "lineitem", "l_shipdate", low, high - 1).some;
-  std::vector<std::unique_ptr<cudf::table>> pieces;
-  for (int64_t begin = zones.begin; begin < zones.end; begin += kChunkRows) {
-    const RowRange chunk{begin, std::min(zones.end, begin + kChunkRows)};
-    const cudf::column_view partkey = fixedView(ctx, "lineitem", "l_partkey", chunk);
-    auto partRows = keyRows(ctx, partkey);
-    auto isForest = cudf::gather(
-        cudf::table_view({forest->view()}), partRows->view(), cudf::out_of_bounds_policy::DONT_CHECK, ctx.stream());
-    partRows.reset();
-    auto keep = computeColumn(
-        ctx,
-        "int16_t ship, bool forest",
-        "forest && ship >= " + std::to_string(low) + " && ship < " + std::to_string(high),
-        cudf::type_id::BOOL8,
-        {fixedView(ctx, "lineitem", "l_shipdate", chunk), isForest->get_column(0).view()});
-    pieces.push_back(selectRows(
-        ctx,
-        cudf::table_view(
-            {partkey, fixedView(ctx, "lineitem", "l_suppkey", chunk), fixedView(ctx, "lineitem", "l_quantity", chunk)}),
-        keep->view()));
-  }
   Result result(kSchema);
-  if (pieces.empty()) {
-    return result;
+  std::unique_ptr<cudf::table> lines;
+  if (useJit()) {
+    lines = linesOfParts(
+        ctx,
+        forest->view(),
+        zones,
+        {{"lineitem", "l_shipdate", "ship"}},
+        fmt::format("ship[l] >= {} && ship[l] < {}", low, high),
+        {"l_partkey", "l_suppkey", "l_quantity"});
+  } else {
+    std::vector<std::unique_ptr<cudf::table>> pieces;
+    forEachBatch(ctx, zones, kChunkRows, [&](RowRange chunk) {
+      const cudf::column_view partkey = fixedView(ctx, "lineitem", "l_partkey", chunk);
+      auto partRows = keyRows(ctx, partkey);
+      auto isForest = cudf::gather(
+          cudf::table_view({forest->view()}), partRows->view(), cudf::out_of_bounds_policy::DONT_CHECK, ctx.stream());
+      partRows.reset();
+      auto keep = computeColumn(
+          ctx,
+          "int16_t ship, bool forest",
+          "forest && ship >= " + std::to_string(low) + " && ship < " + std::to_string(high),
+          cudf::type_id::BOOL8,
+          {fixedView(ctx, "lineitem", "l_shipdate", chunk), isForest->get_column(0).view()});
+      pieces.push_back(selectRows(
+          ctx,
+          cudf::table_view(
+              {partkey, fixedView(ctx, "lineitem", "l_suppkey", chunk), fixedView(ctx, "lineitem", "l_quantity", chunk)}),
+          keep->view()));
+    });
+    if (pieces.empty()) {
+      return result;
+    }
+    lines = concatenateTables(ctx, pieces);
   }
-  auto lines = concatenateTables(ctx, pieces);
-  pieces.clear();
   if (lines->num_rows() == 0) {
     return result;
   }
@@ -89,17 +100,16 @@ Result q20(QueryContext& ctx) {
   auto chosen = selectRows(ctx, cudf::table_view({supplier}), excess->view());
   auto distinct = cudf::distinct(
       chosen->view(), {0}, cudf::duplicate_keep_option::KEEP_ANY, cudf::null_equality::EQUAL, cudf::nan_equality::ALL_EQUAL, ctx.stream());
-  const auto suppliers = downloadInts(ctx, distinct->get_column(0).view());
+  // Supplier names sort as their keys.
+  auto suppliers = downloadInts(ctx, distinct->get_column(0).view());
+  std::sort(suppliers.begin(), suppliers.end());
   const Column& name = ctx.meta("supplier", "s_name");
   const Column& address = ctx.meta("supplier", "s_address");
-  std::vector<std::pair<std::string, int64_t>> sorted;
+  result.strings[0].reserve(suppliers.size());
+  result.strings[1].reserve(suppliers.size());
   for (const int64_t key : suppliers) {
-    sorted.emplace_back(name.string(key - 1), key - 1);
-  }
-  std::sort(sorted.begin(), sorted.end());
-  for (auto& [supplierName, supplierRow] : sorted) {
-    result.strings[0].push_back(std::move(supplierName));
-    result.strings[1].push_back(address.string(supplierRow));
+    result.strings[0].push_back(name.string(key - 1));
+    result.strings[1].push_back(address.string(key - 1));
   }
   return result;
 }

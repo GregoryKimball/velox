@@ -42,35 +42,6 @@ Result q19(QueryContext& ctx) {
       codesParam(ctx, "shipmodes", dictionaryCodes(ctx, "lineitem", "l_shipmode", {"AIR", "AIR REG"}));
   const RowRange lines{0, ctx.rows("lineitem")};
 
-  auto keep = computeColumn(
-      ctx,
-      "int8_t instruct, int8_t mode",
-      "instruct == " + std::to_string(instruct) + " && " + codeTest("mode", modes),
-      cudf::type_id::BOOL8,
-      {fixedView(ctx, "lineitem", "l_shipinstruct", lines), fixedView(ctx, "lineitem", "l_shipmode", lines)});
-  auto kept = cudf::apply_retention_mask(
-      cudf::table_view(
-          {fixedView(ctx, "lineitem", "l_partkey", lines),
-           fixedView(ctx, "lineitem", "l_quantity", lines),
-           fixedView(ctx, "lineitem", "l_extendedprice", lines),
-           fixedView(ctx, "lineitem", "l_discount", lines)}),
-      keep->view(),
-      stream);
-  keep.reset();
-
-  const cudf::numeric_scalar<int32_t> one(1, true, stream);
-  auto partRows = cudf::binary_operation(
-      kept->get_column(0).view(), one, cudf::binary_operator::SUB, cudf::data_type{cudf::type_id::INT32}, stream);
-  const RowRange parts{0, ctx.rows("part")};
-  auto part = cudf::gather(
-      cudf::table_view(
-          {fixedView(ctx, "part", "p_brand", parts),
-           fixedView(ctx, "part", "p_container", parts),
-           fixedView(ctx, "part", "p_size", parts)}),
-      partRows->view(),
-      cudf::out_of_bounds_policy::DONT_CHECK,
-      stream);
-
   const Column& brand = ctx.meta("part", "p_brand");
   const char* defaultBrands[3] = {"Brand#12", "Brand#23", "Brand#34"};
   const std::vector<std::string> defaultContainers[3] = {
@@ -98,17 +69,80 @@ Result q19(QueryContext& ctx) {
   sums.inputs = "int16_t quantity, int32_t price, int8_t discount, int8_t brand, int8_t container, int8_t size";
   sums.filter = filter;
   sums.values = {"int64_t{price} * (100 - discount)"};
-  const auto totals = sumGroups(
-      ctx,
-      sums,
-      {kept->get_column(1).view(),
-       kept->get_column(2).view(),
-       kept->get_column(3).view(),
-       part->get_column(0).view(),
-       part->get_column(1).view(),
-       part->get_column(2).view()});
+  int64_t total = 0;
+  forEachBatch(ctx, lines, lines.size(), [&](RowRange batch) {
+    if (useJit()) {
+      // One reduction over the lines, reading the part's brand, container
+      // and size by key for those that pass the lineitem conjuncts.
+      const cudf::column_view partkey = fixedView(ctx, "lineitem", "l_partkey", batch);
+      GroupedSums fused;
+      fused.inputs = fmt::format(
+          "int8_t instruct, int8_t mode, {} partkey, int16_t quantity, int32_t price, int8_t discount",
+          deviceType(partkey.type().id()));
+      fused.arrays = {
+          {"part", "p_brand", "brands"}, {"part", "p_container", "containers"}, {"part", "p_size", "sizes"}};
+      fused.prelude = fmt::format(
+          "  const bool line = instruct == {} && {};\n"
+          "  int brand = -1, container = -1, size = -1;\n"
+          "  if (line) {{\n"
+          "    const int64_t p = int64_t{{partkey}} - 1;\n"
+          "    brand = brands[p];\n    container = containers[p];\n    size = sizes[p];\n"
+          "  }}\n",
+          instruct,
+          codeTest("mode", modes));
+      fused.filter = "line && (" + sums.filter + ")";
+      fused.values = sums.values;
+      total += sumGroups(
+          ctx,
+          fused,
+          {fixedView(ctx, "lineitem", "l_shipinstruct", batch),
+           fixedView(ctx, "lineitem", "l_shipmode", batch),
+           partkey,
+           fixedView(ctx, "lineitem", "l_quantity", batch),
+           fixedView(ctx, "lineitem", "l_extendedprice", batch),
+           fixedView(ctx, "lineitem", "l_discount", batch)})[0];
+      return;
+    }
+    auto keep = computeColumn(
+        ctx,
+        "int8_t instruct, int8_t mode",
+        "instruct == " + std::to_string(instruct) + " && " + codeTest("mode", modes),
+        cudf::type_id::BOOL8,
+        {fixedView(ctx, "lineitem", "l_shipinstruct", batch), fixedView(ctx, "lineitem", "l_shipmode", batch)});
+    auto kept = cudf::apply_retention_mask(
+        cudf::table_view(
+            {fixedView(ctx, "lineitem", "l_partkey", batch),
+             fixedView(ctx, "lineitem", "l_quantity", batch),
+             fixedView(ctx, "lineitem", "l_extendedprice", batch),
+             fixedView(ctx, "lineitem", "l_discount", batch)}),
+        keep->view(),
+        stream);
+    keep.reset();
+
+    const cudf::numeric_scalar<int32_t> one(1, true, stream);
+    auto partRows = cudf::binary_operation(
+        kept->get_column(0).view(), one, cudf::binary_operator::SUB, cudf::data_type{cudf::type_id::INT32}, stream);
+    const RowRange parts{0, ctx.rows("part")};
+    auto part = cudf::gather(
+        cudf::table_view(
+            {fixedView(ctx, "part", "p_brand", parts),
+             fixedView(ctx, "part", "p_container", parts),
+             fixedView(ctx, "part", "p_size", parts)}),
+        partRows->view(),
+        cudf::out_of_bounds_policy::DONT_CHECK,
+        stream);
+    total += sumGroups(
+        ctx,
+        sums,
+        {kept->get_column(1).view(),
+         kept->get_column(2).view(),
+         kept->get_column(3).view(),
+         part->get_column(0).view(),
+         part->get_column(1).view(),
+         part->get_column(2).view()})[0];
+  });
   Result result(kSchema);
-  result.decimals[0].push_back(totals[0]);
+  result.decimals[0].push_back(total);
   return result;
 }
 

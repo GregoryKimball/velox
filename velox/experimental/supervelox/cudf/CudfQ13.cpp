@@ -15,6 +15,9 @@
  */
 #include <algorithm>
 
+#include <cudf/binaryop.hpp>
+#include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/unary.hpp>
 
 #include "velox/experimental/supervelox/cudf/CudfBackend.h"
@@ -36,25 +39,69 @@ const std::vector<ResultField> kSchema = {
 /// of the counts.
 Result q13(QueryContext& ctx) {
   const int64_t orders = ctx.rows("orders");
-  std::vector<std::unique_ptr<cudf::table>> pieces;
-  for (int64_t begin = 0; begin < orders; begin += kChunkRows) {
-    const RowRange chunk{begin, std::min(orders, begin + kChunkRows)};
+  // The customers of the orders of `chunk` kept.
+  auto keptCustomers = [&](RowRange chunk) {
     auto special = likeColumn(ctx, "orders", "o_comment", "%special%requests%", chunk);
     auto plain = cudf::unary_operation(special->view(), cudf::unary_operator::NOT, ctx.stream());
     special.reset();
-    auto kept = selectRows(ctx, cudf::table_view({fixedView(ctx, "orders", "o_custkey", chunk)}), plain->view());
-    plain.reset();
-    auto counted = groupBy(ctx, kept->view(), {{kept->get_column(0).view(), Aggregate::kCount}});
-    std::vector<std::unique_ptr<cudf::column>> columns;
-    columns.push_back(std::move(counted.keys->release()[0]));
-    columns.push_back(std::move(counted.values[0]));
-    pieces.push_back(std::make_unique<cudf::table>(std::move(columns)));
+    return selectRows(ctx, cudf::table_view({fixedView(ctx, "orders", "o_custkey", chunk)}), plain->view());
+  };
+  auto counted = [&](RowRange chunk) {
+    auto kept = keptCustomers(chunk);
+    return groupBy(ctx, kept->view(), {{kept->get_column(0).view(), Aggregate::kCount}});
+  };
+  Grouped perCustomer;
+  if (batched()) {
+    // The counts so far in a column of one row per customer, at key - 1:
+    // each batch's counts added at its customers.
+    const cudf::numeric_scalar<int32_t> zero(0, true, ctx.stream());
+    const cudf::numeric_scalar<int32_t> one(1, true, ctx.stream());
+    auto dense = std::make_unique<cudf::table>(
+        cudf::table_view({cudf::make_column_from_scalar(zero, ctx.rows("customer"), ctx.stream())->view()}),
+        ctx.stream());
+    forEachBatch(
+        ctx,
+        {0, orders},
+        orders,
+        [&](RowRange chunk) {
+          auto part = counted(chunk);
+          auto rows = cudf::binary_operation(
+              part.keys->get_column(0).view(),
+              one,
+              cudf::binary_operator::SUB,
+              cudf::data_type{cudf::type_id::INT32},
+              ctx.stream());
+          auto before = cudf::gather(dense->view(), rows->view(), cudf::out_of_bounds_policy::DONT_CHECK, ctx.stream());
+          auto after = cudf::binary_operation(
+              before->get_column(0).view(),
+              part.values[0]->view(),
+              cudf::binary_operator::ADD,
+              cudf::data_type{cudf::type_id::INT32},
+              ctx.stream());
+          dense = cudf::scatter(cudf::table_view({after->view()}), rows->view(), dense->view(), ctx.stream());
+        },
+        4);
+    // Customers without orders count 0 here, as below.
+    auto counts = std::move(dense->release()[0]);
+    const cudf::numeric_scalar<int32_t> none(0, true, ctx.stream());
+    auto has = cudf::binary_operation(
+        counts->view(), none, cudf::binary_operator::NOT_EQUAL, cudf::data_type{cudf::type_id::BOOL8}, ctx.stream());
+    auto withOrders = selectRows(ctx, cudf::table_view({counts->view()}), has->view());
+    perCustomer.values.push_back(std::move(withOrders->release()[0]));
+  } else {
+    std::vector<std::unique_ptr<cudf::table>> pieces;
+    for (int64_t begin = 0; begin < orders; begin += kChunkRows) {
+      auto part = counted({begin, std::min(orders, begin + kChunkRows)});
+      std::vector<std::unique_ptr<cudf::column>> columns;
+      columns.push_back(std::move(part.keys->release()[0]));
+      columns.push_back(std::move(part.values[0]));
+      pieces.push_back(std::make_unique<cudf::table>(std::move(columns)));
+    }
+    auto partial = concatenateTables(ctx, pieces);
+    pieces.clear();
+    perCustomer = groupBy(
+        ctx, cudf::table_view({partial->get_column(0).view()}), {{partial->get_column(1).view(), Aggregate::kSum}});
   }
-  auto partial = concatenateTables(ctx, pieces);
-  pieces.clear();
-  auto perCustomer =
-      groupBy(ctx, cudf::table_view({partial->get_column(0).view()}), {{partial->get_column(1).view(), Aggregate::kSum}});
-  partial.reset();
   auto histogram = groupBy(
       ctx, cudf::table_view({perCustomer.values[0]->view()}), {{perCustomer.values[0]->view(), Aggregate::kCount}});
   const auto counts = downloadInts(ctx, histogram.keys->get_column(0).view());

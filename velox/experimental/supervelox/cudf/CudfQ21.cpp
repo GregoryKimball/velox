@@ -13,6 +13,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <cudf/binaryop.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <fmt/format.h>
+
 #include <algorithm>
 #include <map>
 
@@ -36,6 +40,68 @@ Result q21(QueryContext& ctx) {
   const int32_t status = ctx.meta("orders", "o_orderstatus").code("F");
   const int32_t saudi = nationKey(ctx, "SAUDI ARABIA");
   std::map<int64_t, int64_t> counts;
+  if (useJit()) {
+    // Per order in one pass over its lines: the supplier waiting on the
+    // order, if any, and its late lines; then their sum per supplier and the
+    // first 100, all on the GPU. Supplier names sort like their keys.
+    const cudf::numeric_scalar<int32_t> zero(0, true, ctx.stream());
+    std::vector<std::unique_ptr<cudf::table>> pieces;
+    for (const auto& [first, last] : orderChunks(ctx, 0, ctx.rows("orders"))) {
+      auto waiting = perOrderColumns(
+          ctx,
+          first,
+          last,
+          "int8_t status",
+          {fixedView(ctx, "orders", "o_orderstatus", {first, last})},
+          {{"lineitem", "l_suppkey", "supplier"},
+           {"lineitem", "l_commitdate", "commit"},
+           {"lineitem", "l_receiptdate", "receipt"},
+           {"supplier", "s_nationkey", "nation"}},
+          {{cudf::type_id::INT32, "waiter"}, {cudf::type_id::INT64, "lates"}},
+          "  int64_t low = INT64_MAX, high = 0, lateLow = INT64_MAX, lateHigh = 0;\n  int64_t count = 0;",
+          "    const int64_t s = supplier[l];\n"
+          "    low = s < low ? s : low;\n    high = s > high ? s : high;\n"
+          "    if (receipt[l] > commit[l]) {\n"
+          "      lateLow = s < lateLow ? s : lateLow;\n      lateHigh = s > lateHigh ? s : lateHigh;\n      ++count;\n"
+          "    }",
+          fmt::format(
+              "  const bool waits = status == {} && count > 0 && lateLow == lateHigh && low != high && "
+              "nation[lateLow - 1] == {};\n  *waiter = waits ? int32_t(lateLow) : 0;\n  *lates = waits ? count : 0;",
+              status,
+              saudi));
+      auto waits = cudf::binary_operation(
+          waiting->get_column(0).view(),
+          zero,
+          cudf::binary_operator::NOT_EQUAL,
+          cudf::data_type{cudf::type_id::BOOL8},
+          ctx.stream());
+      pieces.push_back(selectRows(ctx, waiting->view(), waits->view()));
+    }
+    Result result(kSchema);
+    auto ours = concatenateTables(ctx, pieces);
+    if (ours->num_rows() == 0) {
+      return result;
+    }
+    pieces.clear();
+    auto grouped =
+        groupBy(ctx, cudf::table_view({ours->get_column(0).view()}), {{ours->get_column(1).view(), Aggregate::kSum}});
+    const cudf::column_view supplier = grouped.keys->get_column(0).view();
+    const cudf::column_view count = grouped.values[0]->view();
+    auto top = firstRows(
+        ctx,
+        cudf::table_view({supplier, count}),
+        cudf::table_view({count, supplier}),
+        {cudf::order::DESCENDING, cudf::order::ASCENDING},
+        100);
+    const auto suppliers = downloadInts(ctx, top->get_column(0).view());
+    const auto sums = downloadInts(ctx, top->get_column(1).view());
+    const Column& name = ctx.meta("supplier", "s_name");
+    for (size_t i = 0; i < suppliers.size(); ++i) {
+      result.strings[0].push_back(name.string(suppliers[i] - 1));
+      result.ints[1].push_back(sums[i]);
+    }
+    return result;
+  }
   for (const auto& [first, last] : orderChunks(ctx, 0, ctx.rows("orders"))) {
     const OrderLines lines = orderLines(ctx, first, last);
     const cudf::column_view supplier = fixedView(ctx, "lineitem", "l_suppkey", lines.lines);

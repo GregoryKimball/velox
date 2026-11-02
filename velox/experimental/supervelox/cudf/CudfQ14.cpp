@@ -43,31 +43,35 @@ Result q14(QueryContext& ctx) {
     result.doubles[0].push_back(0.0 / 0.0);
     return result;
   }
-  const cudf::numeric_scalar<int32_t> one(1, true, stream);
-  auto partRows = cudf::binary_operation(
-      fixedView(ctx, "lineitem", "l_partkey", rows),
-      one,
-      cudf::binary_operator::SUB,
-      cudf::data_type{cudf::type_id::INT32},
-      stream);
-  auto partType = cudf::gather(
-      cudf::table_view({fixedView(ctx, "part", "p_type", {0, ctx.rows("part")})}),
-      partRows->view(),
-      cudf::out_of_bounds_policy::DONT_CHECK,
-      stream);
-
   GroupedSums sums;
   sums.inputs = "int16_t shipdate, int32_t price, int8_t discount, int16_t type";
   sums.prelude = "  const int64_t volume = int64_t{price} * (100 - discount);\n";
   sums.filter = "shipdate >= " + std::to_string(dateLow) + " && shipdate <= " + std::to_string(dateHigh);
   sums.values = {"volume", codeTest("type", promo) + " ? volume : 0"};
-  const auto totals = sumGroups(
-      ctx,
-      sums,
-      {fixedView(ctx, "lineitem", "l_shipdate", rows),
-       fixedView(ctx, "lineitem", "l_extendedprice", rows),
-       fixedView(ctx, "lineitem", "l_discount", rows),
-       partType->get_column(0).view()});
+  const cudf::numeric_scalar<int32_t> one(1, true, stream);
+  std::vector<int64_t> totals(2, 0);
+  forEachBatch(ctx, rows, rows.size(), [&](RowRange batch) {
+    auto partRows = cudf::binary_operation(
+        fixedView(ctx, "lineitem", "l_partkey", batch),
+        one,
+        cudf::binary_operator::SUB,
+        cudf::data_type{cudf::type_id::INT32},
+        stream);
+    auto partType = cudf::gather(
+        cudf::table_view({fixedView(ctx, "part", "p_type", {0, ctx.rows("part")})}),
+        partRows->view(),
+        cudf::out_of_bounds_policy::DONT_CHECK,
+        stream);
+    const auto part = sumGroups(
+        ctx,
+        sums,
+        {fixedView(ctx, "lineitem", "l_shipdate", batch),
+         fixedView(ctx, "lineitem", "l_extendedprice", batch),
+         fixedView(ctx, "lineitem", "l_discount", batch),
+         partType->get_column(0).view()});
+    totals[0] += part[0];
+    totals[1] += part[1];
+  });
   result.doubles[0].push_back(100.0 * static_cast<double>(totals[1]) / static_cast<double>(totals[0]));
   return result;
 }

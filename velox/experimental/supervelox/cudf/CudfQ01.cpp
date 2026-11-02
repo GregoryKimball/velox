@@ -28,6 +28,8 @@
 #include <limits>
 #include <map>
 
+#include <fmt/format.h>
+
 #include "velox/experimental/supervelox/cudf/CudfBackend.h"
 
 namespace facebook::velox::supervelox::cudf_backend {
@@ -286,6 +288,124 @@ void reduceGroups(
   }
 }
 
+/// Most threads of the strided pass, each summing every threads-th row.
+constexpr int64_t kStrideThreads = 1 << 18;
+
+/// Rows each thread of the strided pass loads before summing any.
+constexpr int32_t kStrideUnroll = 4;
+
+/// The sums of every group, per thread, of one transform whose threads
+/// stride over `rows` keeping the state in registers, starting from the
+/// threads' sums `carried` of earlier rows if any.
+std::unique_ptr<cudf::table> strideGroups(
+    QueryContext& ctx,
+    RowRange rows,
+    int64_t dateLimit,
+    int32_t statuses,
+    int32_t groups,
+    std::unique_ptr<cudf::table> carried) {
+  const int32_t fields = groups * kSums;
+  const int64_t threads = carried ? carried->num_rows() : std::min(kStrideThreads, rows.size());
+  const char* values[kSums] = {"q[k]", "p[k]", "discounted", "taxed", "d[k]", "1"};
+  std::string body;
+  std::string inputs;
+  std::vector<cudf::column_view> columns;
+  for (int32_t i = 0; i < fields; ++i) {
+    body += "  int64_t s" + std::to_string(i) + " = " + (carried ? "c" + std::to_string(i) : "0") + ";\n";
+    if (carried) {
+      inputs += (i ? ", int64_t c" : "int64_t c") + std::to_string(i);
+      columns.push_back(carried->get_column(i).view());
+    }
+  }
+  body += fmt::format(
+      "  for (int64_t first = {0} + row; first < {1}; first += {2} * {3}) {{\n"
+      "    int8_t f[{3}], st[{3}], d[{3}], tx[{3}];\n"
+      "    int16_t q[{3}], sh[{3}];\n"
+      "    int32_t p[{3}];\n"
+      "#pragma unroll\n"
+      "    for (int k = 0; k < {3}; ++k) {{\n"
+      "      const int64_t l = first + k * int64_t{{{2}}};\n"
+      "      const bool inside = l < {1};\n"
+      "      sh[k] = inside ? shipdate[l] : int16_t{{32767}};\n"
+      "      f[k] = inside ? flag[l] : int8_t{{0}};\n"
+      "      st[k] = inside ? status[l] : int8_t{{0}};\n"
+      "      q[k] = inside ? quantity[l] : int16_t{{0}};\n"
+      "      p[k] = inside ? price[l] : 0;\n"
+      "      d[k] = inside ? discount[l] : int8_t{{0}};\n"
+      "      tx[k] = inside ? tax[l] : int8_t{{0}};\n"
+      "    }}\n"
+      "#pragma unroll\n"
+      "    for (int k = 0; k < {3}; ++k) {{\n"
+      "      if (sh[k] > {4}) continue;\n"
+      "      const int group = f[k] * {5} + st[k];\n"
+      "      const int64_t discounted = int64_t{{p[k]}} * (100 - d[k]);\n"
+      "      const int64_t taxed = discounted * tx[k];\n",
+      0,
+      rows.size(),
+      threads,
+      kStrideUnroll,
+      dateLimit,
+      statuses);
+  for (int32_t g = 0; g < groups; ++g) {
+    body += "      if (group == " + std::to_string(g) + ") {\n";
+    for (int32_t k = 0; k < kSums; ++k) {
+      body += "        s" + std::to_string(g * kSums + k) + " += " + values[k] + ";\n";
+    }
+    body += "      }\n";
+  }
+  body += "    }\n";
+  body += "  }\n";
+  std::vector<std::pair<cudf::type_id, std::string>> outputs;
+  for (int32_t i = 0; i < fields; ++i) {
+    outputs.emplace_back(cudf::type_id::INT64, "o" + std::to_string(i));
+    body += "  *o" + std::to_string(i) + " = s" + std::to_string(i) + ";\n";
+  }
+  std::vector<ArrayInput> arrays = {
+      {"lineitem", "l_returnflag", "flag"},
+      {"lineitem", "l_linestatus", "status"},
+      {"lineitem", "l_quantity", "quantity"},
+      {"lineitem", "l_extendedprice", "price"},
+      {"lineitem", "l_discount", "discount"},
+      {"lineitem", "l_tax", "tax"},
+      {"lineitem", "l_shipdate", "shipdate"}};
+  for (auto& array : arrays) {
+    array.first = rows.begin;
+  }
+  return transformRows(ctx, threads, inputs, columns, arrays, outputs, body);
+}
+
+/// Adds the threads' sums `partial` of strideGroups to `totals`, in one
+/// reduction.
+void addStrideSums(
+    QueryContext& ctx,
+    const cudf::table_view& partial,
+    int32_t statuses,
+    int32_t groups,
+    std::map<std::pair<int8_t, int8_t>, Totals>& totals) {
+  GroupedSums total;
+  total.filter = "true";
+  std::vector<cudf::column_view> columns;
+  for (int32_t i = 0; i < partial.num_columns(); ++i) {
+    total.inputs += (i ? ", int64_t o" : "int64_t o") + std::to_string(i);
+    total.values.push_back("o" + std::to_string(i));
+    columns.push_back(partial.column(i));
+  }
+  const std::vector<int64_t> sums = sumGroups(ctx, total, columns);
+  for (int32_t g = 0; g < groups; ++g) {
+    const int64_t* s = &sums[g * kSums];
+    if (s[5] == 0) {
+      continue;
+    }
+    Totals& t = totals[{static_cast<int8_t>(g / statuses), static_cast<int8_t>(g % statuses)}];
+    t.quantity += s[0];
+    t.price += s[1];
+    t.discounted += s[2];
+    t.charge += static_cast<__int128>(s[2]) * 100 + s[3];
+    t.discount += s[4];
+    t.count += s[5];
+  }
+}
+
 } // namespace
 
 Result q1(QueryContext& ctx) {
@@ -296,15 +416,22 @@ Result q1(QueryContext& ctx) {
   const auto& statuses = ctx.meta("lineitem", "l_linestatus").dictionary;
   std::map<std::pair<int8_t, int8_t>, Totals> groups;
   const int64_t domain = static_cast<int64_t>(flags.size() * statuses.size());
-  if (domain <= kMostReducedGroups && useJit() && !std::getenv("SV_CUDF_GROUPBY")) {
-    reduceGroups(ctx, split.some, dateLimit, static_cast<int32_t>(statuses.size()), static_cast<int32_t>(domain), groups);
+  const auto statusCount = static_cast<int32_t>(statuses.size());
+  if (domain <= kMostReducedGroups && useJit() && !std::getenv("SV_CUDF_GROUPBY") && !std::getenv("SV_CUDF_REDUCE")) {
+    // Each batch's threads start from the last batch's sums.
+    std::unique_ptr<cudf::table> partial;
+    forEachBatch(ctx, split.some, split.some.size(), [&](RowRange batch) {
+      partial = strideGroups(ctx, batch, dateLimit, statusCount, static_cast<int32_t>(domain), std::move(partial));
+    });
+    if (partial) {
+      addStrideSums(ctx, partial->view(), statusCount, static_cast<int32_t>(domain), groups);
+    }
+  } else if (domain <= kMostReducedGroups && useJit() && !std::getenv("SV_CUDF_GROUPBY")) {
+    forEachBatch(ctx, split.some, split.some.size(), [&](RowRange batch) {
+      reduceGroups(ctx, batch, dateLimit, statusCount, static_cast<int32_t>(domain), groups);
+    });
   } else {
-    const int64_t batchRows = kBatchRows;
-    auto forBatches = [&](RowRange rows, auto&& body) {
-      for (int64_t begin = rows.begin; begin < rows.end; begin += batchRows) {
-        body(RowRange{begin, std::min(rows.end, begin + batchRows)});
-      }
-    };
+    auto forBatches = [&](RowRange rows, auto&& body) { forEachBatch(ctx, rows, kBatchRows, body); };
     forBatches(split.all, [&](RowRange batch) { aggregate(ctx, batch, nullptr, 0, groups); });
     for (RowRange rows : {RowRange{split.some.begin, split.all.begin}, RowRange{split.all.end, split.some.end}}) {
       forBatches(rows, [&](RowRange batch) {

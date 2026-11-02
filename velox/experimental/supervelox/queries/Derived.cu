@@ -94,8 +94,8 @@ const std::vector<int64_t>& lineIndex(QueryContext& ctx) {
   return index;
 }
 
-/// The first line of order row 'order', or the line count for the row past
-/// the last.
+} // namespace
+
 int64_t lineStart(QueryContext& ctx, int64_t order) {
   const auto& index = lineIndex(ctx);
   const int64_t orders = ctx.rows("orders");
@@ -119,6 +119,8 @@ int64_t lineStart(QueryContext& ctx, int64_t order) {
   }
   return line;
 }
+
+namespace {
 
 constexpr int kMaxPattern = 32;
 

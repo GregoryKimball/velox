@@ -13,6 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <limits>
+
 #include <fmt/format.h>
 
 #include "velox/experimental/supervelox/cudf/CudfBackend.h"
@@ -43,7 +45,45 @@ Result q8(QueryContext& ctx) {
   sums.groups = 2;
   sums.values = {"volume", fmt::format("supplier == {} ? volume : 0", nationKey(ctx, "BRAZIL"))};
   std::vector<int64_t> totals(4, 0);
-  for (const auto& [first, last] : orderChunks(ctx, begin, end)) {
+  const int64_t maxLines = useJit() ? std::numeric_limits<int64_t>::max() : int64_t{1} << 28;
+  for (const auto& [first, last] : orderChunks(ctx, begin, end, maxLines)) {
+    if (useJit()) {
+      // One reduction over the orders, each summing its lines' volumes.
+      GroupedSums perOrder;
+      const cudf::column_view customer = fixedView(ctx, "orders", "o_custkey", {first, last});
+      perOrder.inputs = fmt::format("int16_t date, {} customer", deviceType(customer.type().id()));
+      perOrder.arrays = withLines(
+          orderBatch(ctx, first, last),
+          {{"customer", "c_nationkey", "customerNation"},
+           {"lineitem", "l_partkey", "partkey"},
+           {"lineitem", "l_suppkey", "suppkey"},
+           {"lineitem", "l_extendedprice", "price"},
+           {"lineitem", "l_discount", "discount"},
+           {"part", "p_type", "type"},
+           {"supplier", "s_nationkey", "supplierNation"}});
+      perOrder.prelude = fmt::format(
+          "  int64_t all = 0, brazil = 0;\n"
+          "  if (({}u >> customerNation[customer - 1]) & 1) {{\n"
+          "    for (int64_t l = starts[row]; l < starts[row + 1]; ++l) {{\n"
+          "      if (type[partkey[l] - 1] != {}) continue;\n"
+          "      const int64_t volume = int64_t{{price[l]}} * (100 - discount[l]);\n"
+          "      all += volume;\n"
+          "      brazil += supplierNation[suppkey[l] - 1] == {} ? volume : 0;\n"
+          "    }}\n"
+          "  }}\n",
+          nationsInRegion(ctx, "AMERICA"),
+          ctx.meta("part", "p_type").code("ECONOMY ANODIZED STEEL"),
+          nationKey(ctx, "BRAZIL"));
+      perOrder.filter = "true";
+      perOrder.group = sums.group;
+      perOrder.groups = 2;
+      perOrder.values = {"all", "brazil"};
+      const auto part = sumGroups(ctx, perOrder, {fixedView(ctx, "orders", "o_orderdate", {first, last}), customer});
+      for (size_t i = 0; i < totals.size(); ++i) {
+        totals[i] += part[i];
+      }
+      continue;
+    }
     const OrderLines lines = orderLines(ctx, first, last);
     auto customers = keyRows(ctx, fixedView(ctx, "orders", "o_custkey", {first, last}));
     auto customerNation = gatherColumns(ctx, "customer", {"c_nationkey"}, customers->view());

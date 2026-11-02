@@ -40,8 +40,24 @@ Result q18(QueryContext& ctx) {
   const cudf::numeric_scalar<int64_t> limit(30000, true, ctx.stream());
   std::vector<std::pair<int64_t, int64_t>> found;
   for (const auto& [first, last] : orderChunks(ctx, 0, ctx.rows("orders"))) {
-    const OrderLines lines = orderLines(ctx, first, last);
-    auto quantity = sumPerOrder(ctx, fixedView(ctx, "lineitem", "l_quantity", lines.lines), lines);
+    std::unique_ptr<cudf::column> quantity;
+    if (useJit()) {
+      quantity = std::move(perOrderColumns(
+                               ctx,
+                               first,
+                               last,
+                               "",
+                               {},
+                               {{"lineitem", "l_quantity", "quantity"}},
+                               {{cudf::type_id::INT64, "sum"}},
+                               "  int64_t total = 0;",
+                               "    total += quantity[l];",
+                               "  *sum = total;")
+                               ->release()[0]);
+    } else {
+      const OrderLines lines = orderLines(ctx, first, last);
+      quantity = sumPerOrder(ctx, fixedView(ctx, "lineitem", "l_quantity", lines.lines), lines);
+    }
     auto large = cudf::binary_operation(
         quantity->view(), limit, cudf::binary_operator::GREATER, cudf::data_type{cudf::type_id::BOOL8}, ctx.stream());
     auto rows = sequence(ctx, last - first);

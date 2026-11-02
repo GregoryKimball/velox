@@ -45,17 +45,44 @@ Result q15(QueryContext& ctx) {
   if (rows.size() == 0) {
     return result;
   }
-  auto revenue = computeColumn(
-      ctx,
-      "int16_t ship, int32_t price, int8_t discount",
-      "ship >= " + std::to_string(low) + " && ship < " + std::to_string(high) +
-          " ? int64_t{price} * (100 - discount) : 0",
-      cudf::type_id::INT64,
-      {fixedView(ctx, "lineitem", "l_shipdate", rows),
-       fixedView(ctx, "lineitem", "l_extendedprice", rows),
-       fixedView(ctx, "lineitem", "l_discount", rows)});
-  auto grouped = groupBy(
-      ctx, cudf::table_view({fixedView(ctx, "lineitem", "l_suppkey", rows)}), {{revenue->view(), Aggregate::kSum}});
+  // The lines of `batch` shipped in the quarter, with their revenue.
+  auto shippedLines = [&](RowRange batch) {
+    auto revenue = computeColumn(
+        ctx,
+        "int16_t ship, int32_t price, int8_t discount",
+        "ship >= " + std::to_string(low) + " && ship < " + std::to_string(high) +
+            " ? int64_t{price} * (100 - discount) : 0",
+        cudf::type_id::INT64,
+        {fixedView(ctx, "lineitem", "l_shipdate", batch),
+         fixedView(ctx, "lineitem", "l_extendedprice", batch),
+         fixedView(ctx, "lineitem", "l_discount", batch)});
+    const cudf::numeric_scalar<int64_t> zero(0, true, ctx.stream());
+    auto shipped = cudf::binary_operation(
+        revenue->view(), zero, cudf::binary_operator::NOT_EQUAL, cudf::data_type{cudf::type_id::BOOL8}, ctx.stream());
+    return selectRows(
+        ctx, cudf::table_view({fixedView(ctx, "lineitem", "l_suppkey", batch), revenue->view()}), shipped->view());
+  };
+  Grouped grouped;
+  if (batched()) {
+    // Each batch's revenue per supplier, added to that so far in a
+    // streaming groupby sized to the suppliers.
+    StreamingGroups groups({Aggregate::kSum}, ctx.rows("supplier"));
+    forEachBatch(ctx, rows, rows.size(), [&](RowRange batch) {
+      auto kept = shippedLines(batch);
+      auto part = groupBy(
+          ctx, cudf::table_view({kept->get_column(0).view()}), {{kept->get_column(1).view(), Aggregate::kSum}});
+      groups.add(ctx, cudf::table_view({part.keys->get_column(0).view(), part.values[0]->view()}));
+    });
+    grouped = groups.finish(ctx);
+    if (!grouped.keys) {
+      return result;
+    }
+  } else {
+    // Only the lines shipped in the quarter go to groupby.
+    auto kept = shippedLines(rows);
+    grouped = groupBy(
+        ctx, cudf::table_view({kept->get_column(0).view()}), {{kept->get_column(1).view(), Aggregate::kSum}});
+  }
   const cudf::column_view sums = grouped.values[0]->view();
   auto maximum = cudf::reduce(
       sums, *cudf::make_max_aggregation<cudf::reduce_aggregation>(), sums.type(), ctx.stream());
@@ -65,8 +92,8 @@ Result q15(QueryContext& ctx) {
   }
   auto atBest = cudf::binary_operation(
       sums, *maximum, cudf::binary_operator::EQUAL, cudf::data_type{cudf::type_id::BOOL8}, ctx.stream());
-  auto kept = selectRows(ctx, grouped.keys->view(), atBest->view());
-  auto winners = downloadInts(ctx, kept->get_column(0).view());
+  auto top = selectRows(ctx, grouped.keys->view(), atBest->view());
+  auto winners = downloadInts(ctx, top->get_column(0).view());
   std::sort(winners.begin(), winners.end());
   const Column& name = ctx.meta("supplier", "s_name");
   const Column& address = ctx.meta("supplier", "s_address");

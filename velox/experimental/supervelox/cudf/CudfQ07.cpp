@@ -13,6 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <limits>
+
 #include <fmt/format.h>
 
 #include "velox/experimental/supervelox/cudf/CudfBackend.h"
@@ -53,7 +55,49 @@ Result q7(QueryContext& ctx) {
   sums.groups = 4;
   sums.values = {"int64_t{price} * (100 - discount)"};
   std::vector<int64_t> totals(4, 0);
-  for (const auto& [chunkBegin, chunkEnd] : orderChunks(ctx, begin, end)) {
+  const int64_t maxLines = useJit() ? std::numeric_limits<int64_t>::max() : int64_t{1} << 28;
+  for (const auto& [chunkBegin, chunkEnd] : orderChunks(ctx, begin, end, maxLines)) {
+    if (useJit()) {
+      // One reduction over the orders of French or German customers, each
+      // summing its lines into the four (supplier nation, year) bins.
+      const cudf::column_view customer = fixedView(ctx, "orders", "o_custkey", {chunkBegin, chunkEnd});
+      GroupedSums perOrder;
+      perOrder.inputs = fmt::format("{} customer", deviceType(customer.type().id()));
+      perOrder.arrays = withLines(
+          orderBatch(ctx, chunkBegin, chunkEnd),
+          {{"customer", "c_nationkey", "customerNation"},
+           {"lineitem", "l_suppkey", "suppkey"},
+           {"lineitem", "l_shipdate", "ship"},
+           {"lineitem", "l_extendedprice", "price"},
+           {"lineitem", "l_discount", "discount"},
+           {"supplier", "s_nationkey", "supplierNation"}});
+      perOrder.prelude = fmt::format(
+          "  const int nation = customerNation[customer - 1];\n"
+          "  int64_t bins[4] = {{0, 0, 0, 0}};\n"
+          "  if (nation == {2} || nation == {3}) {{\n"
+          "    const int other = nation == {2} ? {3} : {2};\n"
+          "    const int base = nation == {2} ? 2 : 0;\n"
+          "    for (int64_t l = starts[row]; l < starts[row + 1]; ++l) {{\n"
+          "      const int date = ship[l];\n"
+          "      if (date < {0} || date > {1} || supplierNation[suppkey[l] - 1] != other) continue;\n"
+          "      const int64_t volume = int64_t{{price[l]}} * (100 - discount[l]);\n"
+          "      if (date >= {4}) {{ if (base) bins[3] += volume; else bins[1] += volume; }}\n"
+          "      else {{ if (base) bins[2] += volume; else bins[0] += volume; }}\n"
+          "    }}\n"
+          "  }}\n",
+          dateLow,
+          dateHigh,
+          first,
+          second,
+          secondYear);
+      perOrder.filter = "true";
+      perOrder.values = {"bins[0]", "bins[1]", "bins[2]", "bins[3]"};
+      const auto part = sumGroups(ctx, perOrder, {customer});
+      for (size_t i = 0; i < totals.size(); ++i) {
+        totals[i] += part[i];
+      }
+      continue;
+    }
     const OrderLines lines = orderLines(ctx, chunkBegin, chunkEnd);
     auto customers = keyRows(ctx, fixedView(ctx, "orders", "o_custkey", {chunkBegin, chunkEnd}));
     auto customerNation = gatherColumns(ctx, "customer", {"c_nationkey"}, customers->view());

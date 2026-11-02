@@ -13,6 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <limits>
+
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column.hpp>
@@ -48,40 +50,52 @@ Result q4(QueryContext& ctx) {
   if (end <= begin) {
     return result;
   }
-  const uint32_t* starts = orderLineStarts(ctx);
-  const auto bounds = ctx.download(starts + begin, end - begin + 1);
-  const RowRange lines{bounds.front(), bounds.back()};
-
-  auto late = computeColumn(
-      ctx,
-      "int16_t commit, int16_t receipt",
-      "commit < receipt",
-      cudf::type_id::BOOL8,
-      {fixedView(ctx, "lineitem", "l_commitdate", lines), fixedView(ctx, "lineitem", "l_receiptdate", lines)});
-
-  const cudf::numeric_scalar<int32_t> base(static_cast<int32_t>(lines.begin), true, stream);
-  auto offsets = cudf::binary_operation(
-      deviceView(cudf::type_id::INT32, starts + begin, end - begin + 1),
-      base,
-      cudf::binary_operator::SUB,
-      cudf::data_type{cudf::type_id::INT32},
-      stream);
-  auto anyLate = cudf::segmented_reduce(
-      late->view(),
-      cudf::device_span<cudf::size_type const>(offsets->view().data<cudf::size_type>(), offsets->size()),
-      *cudf::make_any_aggregation<cudf::segmented_reduce_aggregation>(),
-      cudf::data_type{cudf::type_id::BOOL8},
-      cudf::null_policy::EXCLUDE,
-      stream);
-
-  GroupedSums sums;
-  sums.inputs = "int8_t priority, bool late";
-  sums.filter = "late";
-  sums.group = "priority";
-  sums.groups = static_cast<int32_t>(names.size());
-  sums.values = {"1"};
-  const auto counts = sumGroups(
-      ctx, sums, {fixedView(ctx, "orders", "o_orderpriority", {begin, end}), anyLate->view()});
+  std::vector<int64_t> counts(names.size(), 0);
+  for (const auto& [first, last] : orderChunks(ctx, begin, end, std::numeric_limits<int64_t>::max())) {
+    std::vector<int64_t> part;
+    if (useJit()) {
+      // One reduction over the orders, each scanning its lines until one is
+      // late.
+      GroupedSums sums;
+      sums.inputs = "int8_t priority";
+      sums.arrays = withLines(
+          orderBatch(ctx, first, last), {{"lineitem", "l_commitdate", "commit"}, {"lineitem", "l_receiptdate", "receipt"}});
+      sums.prelude =
+          "  bool late = false;\n"
+          "  for (int64_t l = starts[row]; l < starts[row + 1] && !late; ++l) late = commit[l] < receipt[l];\n";
+      sums.filter = "late";
+      sums.group = "priority";
+      sums.groups = static_cast<int32_t>(names.size());
+      sums.values = {"1"};
+      part = sumGroups(ctx, sums, {fixedView(ctx, "orders", "o_orderpriority", {first, last})});
+    } else {
+      const OrderLines lines = orderLines(ctx, first, last);
+      auto late = computeColumn(
+          ctx,
+          "int16_t commit, int16_t receipt",
+          "commit < receipt",
+          cudf::type_id::BOOL8,
+          {fixedView(ctx, "lineitem", "l_commitdate", lines.lines),
+           fixedView(ctx, "lineitem", "l_receiptdate", lines.lines)});
+      auto anyLate = cudf::segmented_reduce(
+          late->view(),
+          cudf::device_span<cudf::size_type const>(lines.offsets->view().data<cudf::size_type>(), lines.offsets->size()),
+          *cudf::make_any_aggregation<cudf::segmented_reduce_aggregation>(),
+          cudf::data_type{cudf::type_id::BOOL8},
+          cudf::null_policy::EXCLUDE,
+          stream);
+      GroupedSums sums;
+      sums.inputs = "int8_t priority, bool late";
+      sums.filter = "late";
+      sums.group = "priority";
+      sums.groups = static_cast<int32_t>(names.size());
+      sums.values = {"1"};
+      part = sumGroups(ctx, sums, {fixedView(ctx, "orders", "o_orderpriority", {first, last}), anyLate->view()});
+    }
+    for (size_t i = 0; i < names.size(); ++i) {
+      counts[i] += part[i];
+    }
+  }
   for (size_t i = 0; i < names.size(); ++i) {
     if (counts[i]) {
       result.strings[0].push_back(names[i]);

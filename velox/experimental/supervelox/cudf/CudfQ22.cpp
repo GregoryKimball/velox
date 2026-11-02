@@ -45,36 +45,58 @@ const std::vector<ResultField> kSchema = {
 Result q22(QueryContext& ctx) {
   const int64_t customers = ctx.rows("customer");
   const int64_t orders = ctx.rows("orders");
-  auto prefix = cudf::strings::slice_strings(
-      cudf::strings_column_view(stringView(ctx, "customer", "c_phone", {0, customers})), 0, 2, std::nullopt, ctx.stream());
-  auto code = cudf::strings::to_integers(
-      cudf::strings_column_view(prefix->view()), cudf::data_type{cudf::type_id::INT32}, ctx.stream());
-  prefix.reset();
   const cudf::numeric_scalar<bool> no(false, true, ctx.stream());
   const cudf::numeric_scalar<bool> yes(true, true, ctx.stream());
-  auto none = cudf::make_column_from_scalar(no, static_cast<cudf::size_type>(customers), ctx.stream());
-  auto ordering = keyRows(ctx, fixedView(ctx, "orders", "o_custkey", {0, orders}));
-  auto hasOrders = cudf::scatter(
-      std::vector<std::reference_wrapper<const cudf::scalar>>{yes},
-      ordering->view(),
-      cudf::table_view({none->view()}),
-      ctx.stream());
-  ordering.reset();
-  none.reset();
+  // Scattered by key, batch by batch of orders, into one more row than
+  // customers, so that row r of the customers is row r + 1.
+  std::vector<std::unique_ptr<cudf::column>> none;
+  none.push_back(cudf::make_column_from_scalar(no, static_cast<cudf::size_type>(customers + 1), ctx.stream()));
+  auto hasOrders = std::make_unique<cudf::table>(std::move(none));
+  forEachBatch(
+      ctx,
+      {0, orders},
+      orders,
+      [&](RowRange batch) {
+        hasOrders = cudf::scatter(
+            std::vector<std::reference_wrapper<const cudf::scalar>>{yes},
+            fixedView(ctx, "orders", "o_custkey", batch),
+            hasOrders->view(),
+            ctx.stream());
+      },
+      4);
 
   std::string prelude = "  const int bin = ";
   for (int i = 0; i < kCodes; ++i) {
     prelude += "code == " + std::to_string(kCountryCodes[i]) + " ? " + std::to_string(i) + " : ";
   }
   prelude += "-1;\n";
-  const std::vector<cudf::column_view> columns = {
-      code->view(), fixedView(ctx, "customer", "c_acctbal", {0, customers}), hasOrders->get_column(0).view()};
+  // The sums of `sums` over the customers, batch by batch.
+  auto sumCustomers = [&](const GroupedSums& sums) {
+    std::vector<int64_t> totals;
+    forEachBatch(ctx, {0, customers}, customers, [&](RowRange batch) {
+      auto prefix = cudf::strings::slice_strings(
+          cudf::strings_column_view(stringView(ctx, "customer", "c_phone", batch)), 0, 2, std::nullopt, ctx.stream());
+      auto code = cudf::strings::to_integers(
+          cudf::strings_column_view(prefix->view()), cudf::data_type{cudf::type_id::INT32}, ctx.stream());
+      prefix.reset();
+      const cudf::column_view has = cudf::slice(
+          hasOrders->get_column(0).view(),
+          {static_cast<cudf::size_type>(batch.begin + 1), static_cast<cudf::size_type>(batch.end + 1)})[0];
+      const auto part =
+          sumGroups(ctx, sums, {code->view(), fixedView(ctx, "customer", "c_acctbal", batch), has});
+      totals.resize(part.size(), 0);
+      for (size_t i = 0; i < part.size(); ++i) {
+        totals[i] += part[i];
+      }
+    });
+    return totals;
+  };
   GroupedSums positive;
   positive.inputs = "int32_t code, int32_t balance, bool has";
   positive.prelude = prelude;
   positive.filter = "balance > 0 && bin >= 0";
   positive.values = {"int64_t{balance}", "1"};
-  const auto average = sumGroups(ctx, positive, columns);
+  const auto average = sumCustomers(positive);
 
   GroupedSums bins = positive;
   // balance > avg, kept in integers.
@@ -83,7 +105,7 @@ Result q22(QueryContext& ctx) {
   bins.group = "bin";
   bins.groups = kCodes;
   bins.values = {"1", "int64_t{balance}"};
-  const auto totals = sumGroups(ctx, bins, columns);
+  const auto totals = sumCustomers(bins);
 
   std::vector<std::pair<int, int>> sorted;
   for (int i = 0; i < kCodes; ++i) {

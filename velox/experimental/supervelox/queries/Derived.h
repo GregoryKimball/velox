@@ -29,6 +29,10 @@ namespace facebook::velox::supervelox {
 /// the lines of order row o are [starts[o], starts[o + 1]).
 const uint32_t* orderLineStarts(QueryContext& ctx);
 
+/// The first line of order row 'order', or the line count for the row past
+/// the last, from a host index of every 4096th order's first line.
+int64_t lineStart(QueryContext& ctx, int64_t order);
+
 /// The lines of order rows [first, last): those of order row o are
 /// [base + starts[o], base + starts[o + 1]), with 'starts' valid at
 /// [first, last]. In one batch the whole orderLineStarts with base 0 and

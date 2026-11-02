@@ -13,7 +13,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <cudf/binaryop.hpp>
+#include <cudf/transform.hpp>
+#include <rmm/device_buffer.hpp>
+
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 
 #include <cudf/copying.hpp>
@@ -26,6 +31,8 @@ namespace {
 constexpr int kNations = 25;
 constexpr int kFirstYear = 1992;
 constexpr int kYears = 8;
+/// Lines a transform covers at a time.
+constexpr int64_t kLineChunk = int64_t{1} << 28;
 
 const std::vector<ResultField> kSchema = {
     {"nation", ResultType::kVarchar},
@@ -46,7 +53,84 @@ Result q9(QueryContext& ctx) {
     year += "  year += date >= " + std::to_string(days(y, 1, 1)) + ";\n";
   }
   std::vector<int64_t> profit(kNations * kYears, 0);
-  for (const auto& [first, last] : orderChunks(ctx, 0, ctx.rows("orders"))) {
+  if (useJit()) {
+    // Per line in one transform: whether its part is green, its partsupp row
+    // among the part's four, the cost there and the supplier's nation. Orders
+    // are sorted by date and lineitem follows them, so the year of line l is
+    // how many of the years' first lines it reaches.
+    std::vector<int64_t> yearLines;
+    for (int y = kFirstYear + 1; y < kFirstYear + kYears; ++y) {
+      const int64_t order =
+          sortedRange(ctx, "orders", "o_orderdate", days(y, 1, 1), std::numeric_limits<int32_t>::max()).first;
+      yearLines.push_back(lineStart(ctx, order));
+    }
+    std::string lineYear = "  int year = 0;\n";
+    for (int y = 0; y + 1 < kYears; ++y) {
+      lineYear += "  year += row >= years[" + std::to_string(y) + "];\n";
+    }
+    rmm::device_buffer years(yearLines.size() * sizeof(int64_t), ctx.stream());
+    auto greenBits = cudf::bools_to_mask(green->view(), ctx.stream());
+    const cudf::column_view greenWords =
+        deviceView(cudf::type_id::UINT32, greenBits.first->data(), (parts + 31) / 32);
+    const cudf::numeric_scalar<int32_t> dropped(-1, true, ctx.stream());
+    const int64_t lines = ctx.rows("lineitem");
+    forEachBatch(ctx, {0, lines}, kLineChunk, [&](RowRange chunk) {
+      std::vector<int64_t> chunkYears;
+      for (const int64_t line : yearLines) {
+        chunkYears.push_back(line - chunk.begin);
+      }
+      SV_CUDA(cudaMemcpyAsync(
+          years.data(), chunkYears.data(), years.size(), cudaMemcpyHostToDevice, ctx.stream()));
+      const std::vector<cudf::column_view> columns = {
+          fixedView(ctx, "lineitem", "l_partkey", chunk),
+          fixedView(ctx, "lineitem", "l_suppkey", chunk),
+          fixedView(ctx, "lineitem", "l_quantity", chunk),
+          fixedView(ctx, "lineitem", "l_extendedprice", chunk),
+          fixedView(ctx, "lineitem", "l_discount", chunk)};
+      const char* names[] = {"part", "supplier", "quantity", "price", "discount"};
+      std::string declared;
+      for (size_t i = 0; i < columns.size(); ++i) {
+        declared += std::string(i ? ", " : "") + deviceType(columns[i].type().id()) + " " + names[i];
+      }
+      auto binned = transformRows(
+          ctx,
+          chunk.size(),
+          declared,
+          columns,
+          {{.name = "green", .view = greenWords},
+           {.name = "years", .view = deviceView(cudf::type_id::INT64, years.data(), yearLines.size())},
+           {"partsupp", "ps_suppkey", "slots"},
+           {"partsupp", "ps_supplycost", "cost"},
+           {"supplier", "s_nationkey", "nation"}},
+          {{cudf::type_id::INT32, "bin"}, {cudf::type_id::INT64, "amount"}},
+          "  *amount = 0;\n"
+          "  if (!((green[(part - 1) >> 5] >> ((part - 1) & 31)) & 1)) {\n    *bin = -1;\n    return 0;\n  }\n"
+          "  const int64_t base = (int64_t{part} - 1) * 4;\n  int64_t at = -1;\n"
+          "  for (int k = 0; k < 4; ++k) {\n    if (slots[base + k] == supplier) {\n      at = base + k;\n      break;\n"
+          "    }\n  }\n"
+          "  if (at < 0) {\n    *bin = -2;\n    return 0;\n  }\n" +
+              lineYear + "  *bin = nation[supplier - 1] * " +
+              std::to_string(kYears) + " + year;\n  *amount = int64_t{price} * (100 - discount) - int64_t{cost[at]} * quantity;");
+      auto kept = cudf::binary_operation(
+          binned->get_column(0).view(),
+          dropped,
+          cudf::binary_operator::NOT_EQUAL,
+          cudf::data_type{cudf::type_id::BOOL8},
+          ctx.stream());
+      auto greenLines = selectRows(ctx, binned->view(), kept->view());
+      auto grouped = groupBy(
+          ctx, cudf::table_view({greenLines->get_column(0).view()}), {{greenLines->get_column(1).view(), Aggregate::kSum}});
+      const auto bins = download<int32_t>(ctx, grouped.keys->get_column(0).view());
+      const auto sums = download<int64_t>(ctx, grouped.values[0]->view());
+      for (size_t i = 0; i < bins.size(); ++i) {
+        if (bins[i] < 0) {
+          throw std::runtime_error("q9: lineitem (part, supplier) missing from partsupp layout");
+        }
+        profit[bins[i]] += sums[i];
+      }
+    });
+  }
+  for (const auto& [first, last] : orderChunks(ctx, 0, useJit() ? 0 : ctx.rows("orders"))) {
     const OrderLines lines = orderLines(ctx, first, last);
     const cudf::column_view partkey = fixedView(ctx, "lineitem", "l_partkey", lines.lines);
     auto partRows = keyRows(ctx, partkey);

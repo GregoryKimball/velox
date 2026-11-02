@@ -13,6 +13,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <limits>
+
+#include <fmt/format.h>
+
 #include "velox/experimental/supervelox/cudf/CudfBackend.h"
 
 namespace facebook::velox::supervelox::cudf_backend {
@@ -39,7 +43,40 @@ Result q5(QueryContext& ctx) {
   sums.groups = kNations;
   sums.values = {"int64_t{price} * (100 - discount)"};
   std::vector<int64_t> totals(kNations, 0);
-  for (const auto& [first, last] : orderChunks(ctx, begin, end)) {
+  const int64_t maxLines = useJit() ? std::numeric_limits<int64_t>::max() : int64_t{1} << 28;
+  for (const auto& [first, last] : orderChunks(ctx, begin, end, maxLines)) {
+    if (useJit()) {
+      // One reduction over the orders, each summing its lines from suppliers
+      // of the customer's nation.
+      const cudf::column_view customer = fixedView(ctx, "orders", "o_custkey", {first, last});
+      GroupedSums perOrder;
+      perOrder.inputs = fmt::format("{} customer", deviceType(customer.type().id()));
+      perOrder.arrays = withLines(
+          orderBatch(ctx, first, last),
+          {{"customer", "c_nationkey", "customerNation"},
+           {"lineitem", "l_suppkey", "suppkey"},
+           {"lineitem", "l_extendedprice", "price"},
+           {"lineitem", "l_discount", "discount"},
+           {"supplier", "s_nationkey", "supplierNation"}});
+      perOrder.prelude = fmt::format(
+          "  const int nation = customerNation[customer - 1];\n"
+          "  int64_t revenue = 0;\n"
+          "  if (({}u >> nation) & 1) {{\n"
+          "    for (int64_t l = starts[row]; l < starts[row + 1]; ++l) {{\n"
+          "      revenue += supplierNation[suppkey[l] - 1] == nation ? int64_t{{price[l]}} * (100 - discount[l]) : 0;\n"
+          "    }}\n"
+          "  }}\n",
+          nations);
+      perOrder.filter = "true";
+      perOrder.group = "nation";
+      perOrder.groups = kNations;
+      perOrder.values = {"revenue"};
+      const auto part = sumGroups(ctx, perOrder, {customer});
+      for (int32_t n = 0; n < kNations; ++n) {
+        totals[n] += part[n];
+      }
+      continue;
+    }
     const OrderLines lines = orderLines(ctx, first, last);
     auto customers = keyRows(ctx, fixedView(ctx, "orders", "o_custkey", {first, last}));
     auto customerNation = gatherColumns(ctx, "customer", {"c_nationkey"}, customers->view());

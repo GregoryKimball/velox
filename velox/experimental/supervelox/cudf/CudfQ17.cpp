@@ -45,27 +45,32 @@ Result q17(QueryContext& ctx) {
           " && container == " + std::to_string(ctx.meta("part", "p_container").code("MED BOX")),
       cudf::type_id::BOOL8,
       {fixedView(ctx, "part", "p_brand", {0, parts}), fixedView(ctx, "part", "p_container", {0, parts})});
-  std::vector<std::unique_ptr<cudf::table>> pieces;
   const int64_t rows = ctx.rows("lineitem");
-  for (int64_t begin = 0; begin < rows; begin += kChunkRows) {
-    const RowRange chunk{begin, std::min(rows, begin + kChunkRows)};
-    const cudf::column_view partkey = fixedView(ctx, "lineitem", "l_partkey", chunk);
-    auto partRows = keyRows(ctx, partkey);
-    auto keep = cudf::gather(
-        cudf::table_view({wanted->view()}), partRows->view(), cudf::out_of_bounds_policy::DONT_CHECK, ctx.stream());
-    partRows.reset();
-    pieces.push_back(selectRows(
-        ctx,
-        cudf::table_view(
-            {partkey, fixedView(ctx, "lineitem", "l_quantity", chunk), fixedView(ctx, "lineitem", "l_extendedprice", chunk)}),
-        keep->get_column(0).view()));
+  std::unique_ptr<cudf::table> lines;
+  if (useJit()) {
+    lines = linesOfParts(ctx, wanted->view(), {0, rows}, {}, "", {"l_partkey", "l_quantity", "l_extendedprice"});
+  } else {
+    std::vector<std::unique_ptr<cudf::table>> pieces;
+    forEachBatch(ctx, {0, rows}, kChunkRows, [&](RowRange chunk) {
+      const cudf::column_view partkey = fixedView(ctx, "lineitem", "l_partkey", chunk);
+      auto partRows = keyRows(ctx, partkey);
+      auto keep = cudf::gather(
+          cudf::table_view({wanted->view()}), partRows->view(), cudf::out_of_bounds_policy::DONT_CHECK, ctx.stream());
+      partRows.reset();
+      pieces.push_back(selectRows(
+          ctx,
+          cudf::table_view(
+              {partkey,
+               fixedView(ctx, "lineitem", "l_quantity", chunk),
+               fixedView(ctx, "lineitem", "l_extendedprice", chunk)}),
+          keep->get_column(0).view()));
+    });
+    std::vector<cudf::table_view> views;
+    for (const auto& piece : pieces) {
+      views.push_back(piece->view());
+    }
+    lines = cudf::concatenate(views, ctx.stream());
   }
-  std::vector<cudf::table_view> views;
-  for (const auto& piece : pieces) {
-    views.push_back(piece->view());
-  }
-  auto lines = cudf::concatenate(views, ctx.stream());
-  pieces.clear();
   Result result(kSchema);
   if (lines->num_rows() == 0) {
     result.doubles[0].push_back(0);

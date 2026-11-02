@@ -77,41 +77,45 @@ Result q6(QueryContext& ctx) {
     result.decimals[0].push_back(0);
     return result;
   }
-  const std::vector<cudf::column_view> lineitem = {
-      fixedView(ctx, "lineitem", "l_shipdate", split.some),
-      fixedView(ctx, "lineitem", "l_discount", split.some),
-      fixedView(ctx, "lineitem", "l_quantity", split.some),
-      fixedView(ctx, "lineitem", "l_extendedprice", split.some),
-  };
-  if (!useJit()) {
-    GroupedSums sums;
-    sums.inputs = "int16_t shipdate, int8_t discount, int16_t quantity, int32_t price";
-    sums.filter = fmt::format(
-        "shipdate >= {} && shipdate <= {} && discount >= {} && discount <= {} && quantity <= {}",
+  int64_t revenue = 0;
+  forEachBatch(ctx, split.some, split.some.size(), [&](RowRange rows) {
+    const std::vector<cudf::column_view> lineitem = {
+        fixedView(ctx, "lineitem", "l_shipdate", rows),
+        fixedView(ctx, "lineitem", "l_discount", rows),
+        fixedView(ctx, "lineitem", "l_quantity", rows),
+        fixedView(ctx, "lineitem", "l_extendedprice", rows),
+    };
+    if (!useJit()) {
+      GroupedSums sums;
+      sums.inputs = "int16_t shipdate, int8_t discount, int16_t quantity, int32_t price";
+      sums.filter = fmt::format(
+          "shipdate >= {} && shipdate <= {} && discount >= {} && discount <= {} && quantity <= {}",
+          dateLow,
+          dateHigh,
+          ctx.param("discount_min", 5),
+          ctx.param("discount_max", 7),
+          ctx.param("quantity_max", 2399));
+      sums.values = {"int64_t{price} * discount"};
+      revenue += sumGroups(ctx, sums, lineitem)[0];
+      return;
+    }
+    const auto& fragment = compileFragment(fmt::format(
+        kSource,
         dateLow,
         dateHigh,
         ctx.param("discount_min", 5),
         ctx.param("discount_max", 7),
-        ctx.param("quantity_max", 2399));
-    sums.values = {"int64_t{price} * discount"};
-    result.decimals[0].push_back(sumGroups(ctx, sums, lineitem)[0]);
-    return result;
-  }
-  const auto& fragment = compileFragment(fmt::format(
-      kSource,
-      dateLow,
-      dateHigh,
-      ctx.param("discount_min", 5),
-      ctx.param("discount_max", 7),
-      ctx.param("quantity_max", 2399)));
-  const std::vector<cudf::reduce_input> inputs(lineitem.begin(), lineitem.end());
-  const cudf::lto_fragment fragments[] = {{cudf::lto_binary_type::LTO_IR, fragment.view()}};
-  const cudf::reduce_udf udf{fragments, "q6_init", "q6_update", "q6_merge", "q6_finalize", "q6_filter"};
-  const cudf::data_type types[] = {cudf::data_type{cudf::type_id::INT64}};
-  auto columns = cudf::reduce_lto(udf, cudf::null_aware::NO, inputs, types, types, ctx.stream());
-  int64_t revenue = 0;
-  cudaMemcpyAsync(&revenue, columns[0]->view().head(), sizeof(revenue), cudaMemcpyDeviceToHost, ctx.stream());
-  cudaStreamSynchronize(ctx.stream());
+        ctx.param("quantity_max", 2399)));
+    const std::vector<cudf::reduce_input> inputs(lineitem.begin(), lineitem.end());
+    const cudf::lto_fragment fragments[] = {{cudf::lto_binary_type::LTO_IR, fragment.view()}};
+    const cudf::reduce_udf udf{fragments, "q6_init", "q6_update", "q6_merge", "q6_finalize", "q6_filter"};
+    const cudf::data_type types[] = {cudf::data_type{cudf::type_id::INT64}};
+    auto columns = cudf::reduce_lto(udf, cudf::null_aware::NO, inputs, types, types, ctx.stream());
+    int64_t sum = 0;
+    cudaMemcpyAsync(&sum, columns[0]->view().head(), sizeof(sum), cudaMemcpyDeviceToHost, ctx.stream());
+    cudaStreamSynchronize(ctx.stream());
+    revenue += sum;
+  });
   result.decimals[0].push_back(revenue);
   return result;
 }

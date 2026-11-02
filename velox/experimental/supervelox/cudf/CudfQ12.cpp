@@ -13,6 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <limits>
+
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/filling.hpp>
@@ -53,38 +55,75 @@ Result q12(QueryContext& ctx) {
   if (end <= begin) {
     return result;
   }
-  const uint32_t* starts = orderLineStarts(ctx);
-  const auto bounds = ctx.download(starts + begin, end - begin + 1);
-  const RowRange lines{bounds.front(), bounds.back()};
-
-  auto counts = cudf::binary_operation(
-      deviceView(cudf::type_id::INT32, starts + begin + 1, end - begin),
-      deviceView(cudf::type_id::INT32, starts + begin, end - begin),
-      cudf::binary_operator::SUB,
-      cudf::data_type{cudf::type_id::INT32},
-      stream);
-  auto priority = cudf::repeat(
-      cudf::table_view({fixedView(ctx, "orders", "o_orderpriority", {begin, end})}), counts->view(), stream);
-
-  GroupedSums sums;
-  sums.inputs = "int8_t mode, int16_t ship, int16_t commit, int16_t receipt, int8_t priority";
-  sums.filter = fmt::format(
-      "{} && receipt >= {} && receipt <= {} && commit < receipt && ship < commit",
-      codeTest("mode", modes),
-      dateLow,
-      dateHigh);
-  sums.group = "mode * 2 + (" + codeTest("priority", high) + " ? 0 : 1)";
-  sums.groups = static_cast<int32_t>(names.size()) * 2;
-  sums.values = {"1"};
-  const auto totals = sumGroups(
-      ctx,
-      sums,
-      {fixedView(ctx, "lineitem", "l_shipmode", lines),
-       fixedView(ctx, "lineitem", "l_shipdate", lines),
-       fixedView(ctx, "lineitem", "l_commitdate", lines),
-       fixedView(ctx, "lineitem", "l_receiptdate", lines),
-       priority->get_column(0).view()});
-  for (size_t mode = 0; mode < names.size(); ++mode) {
+  // Per (mode, priority), high priority first.
+  const size_t width = names.size();
+  std::vector<int64_t> totals(width * 2, 0);
+  for (const auto& [first, last] : orderChunks(ctx, begin, end, std::numeric_limits<int64_t>::max())) {
+    if (useJit()) {
+      // One reduction over the orders, grouped by high or low priority, each
+      // counting its qualifying lines by ship mode.
+      std::string counts = "  int64_t counts[" + std::to_string(std::max<size_t>(1, width)) + "] = {};\n";
+      std::string tally;
+      for (size_t mode = 0; mode < width; ++mode) {
+        if (modes.contains(mode)) {
+          tally += fmt::format("      counts[{0}] += mode[l] == {0};\n", mode);
+        }
+      }
+      GroupedSums sums;
+      sums.inputs = "int8_t priority";
+      sums.arrays = withLines(
+          orderBatch(ctx, first, last),
+          {{"lineitem", "l_shipmode", "mode"},
+           {"lineitem", "l_shipdate", "ship"},
+           {"lineitem", "l_commitdate", "commit"},
+           {"lineitem", "l_receiptdate", "receipt"}});
+      sums.prelude = counts +
+          fmt::format(
+                         "  for (int64_t l = starts[row]; l < starts[row + 1]; ++l) {{\n"
+                         "    const int r = receipt[l], c = commit[l];\n"
+                         "    if (r < {} || r > {} || c >= r || ship[l] >= c) continue;\n",
+                         dateLow,
+                         dateHigh) +
+          tally + "  }\n";
+      sums.filter = "true";
+      sums.group = "(" + codeTest("priority", high) + ") ? 0 : 1";
+      sums.groups = 2;
+      for (size_t mode = 0; mode < width; ++mode) {
+        sums.values.push_back("counts[" + std::to_string(mode) + "]");
+      }
+      const auto part = sumGroups(ctx, sums, {fixedView(ctx, "orders", "o_orderpriority", {first, last})});
+      for (size_t mode = 0; mode < width; ++mode) {
+        totals[mode * 2] += part[mode];
+        totals[mode * 2 + 1] += part[width + mode];
+      }
+      continue;
+    }
+    const OrderLines lines = orderLines(ctx, first, last);
+    auto priority = cudf::repeat(
+        cudf::table_view({fixedView(ctx, "orders", "o_orderpriority", {first, last})}), lines.counts->view(), stream);
+    GroupedSums sums;
+    sums.inputs = "int8_t mode, int16_t ship, int16_t commit, int16_t receipt, int8_t priority";
+    sums.filter = fmt::format(
+        "{} && receipt >= {} && receipt <= {} && commit < receipt && ship < commit",
+        codeTest("mode", modes),
+        dateLow,
+        dateHigh);
+    sums.group = "mode * 2 + (" + codeTest("priority", high) + " ? 0 : 1)";
+    sums.groups = static_cast<int32_t>(width) * 2;
+    sums.values = {"1"};
+    const auto part = sumGroups(
+        ctx,
+        sums,
+        {fixedView(ctx, "lineitem", "l_shipmode", lines.lines),
+         fixedView(ctx, "lineitem", "l_shipdate", lines.lines),
+         fixedView(ctx, "lineitem", "l_commitdate", lines.lines),
+         fixedView(ctx, "lineitem", "l_receiptdate", lines.lines),
+         priority->get_column(0).view()});
+    for (size_t i = 0; i < totals.size(); ++i) {
+      totals[i] += part[i];
+    }
+  }
+  for (size_t mode = 0; mode < width; ++mode) {
     if (modes.contains(mode) && totals[mode * 2] + totals[mode * 2 + 1]) {
       result.strings[0].push_back(names[mode]);
       result.ints[1].push_back(totals[mode * 2]);
