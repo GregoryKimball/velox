@@ -101,14 +101,23 @@ void aggregate(
   const cudf::column_view discount = fixedView(ctx, "lineitem", "l_discount", rows);
   const cudf::column_view tax = fixedView(ctx, "lineitem", "l_tax", rows);
 
-  const cudf::transform_input inputs[] = {price, discount, tax};
-  const cudf::transform_output outputs[] = {
-      {cudf::data_type{cudf::type_id::INT64}, cudf::output_nullability::ALL_VALID},
-      {cudf::data_type{cudf::type_id::DECIMAL128, numeric::scale_type{-6}}, cudf::output_nullability::ALL_VALID},
-  };
-  const auto& fragment = compileFragment(kTransform);
-  auto derived = cudf::transform_lto(
-      fragment.view(), cudf::lto_binary_type::LTO_IR, cudf::null_aware::NO, std::nullopt, inputs, outputs, {}, std::nullopt, stream);
+  // Without JIT, the charge is 100 * discounted + discounted * tax, summed
+  // as two int64 columns.
+  std::vector<std::unique_ptr<cudf::column>> derived;
+  if (useJit()) {
+    const cudf::transform_input inputs[] = {price, discount, tax};
+    const cudf::transform_output outputs[] = {
+        {cudf::data_type{cudf::type_id::INT64}, cudf::output_nullability::ALL_VALID},
+        {cudf::data_type{cudf::type_id::DECIMAL128, numeric::scale_type{-6}}, cudf::output_nullability::ALL_VALID},
+    };
+    derived = transformColumns(ctx, kTransform, inputs, outputs)->release();
+  } else {
+    const std::string declared = "int32_t price, int8_t discount, int8_t tax";
+    const std::string discounted = "int64_t{price} * (100 - discount)";
+    derived.push_back(computeColumn(ctx, declared, discounted, cudf::type_id::INT64, {price, discount, tax}));
+    derived.push_back(
+        computeColumn(ctx, declared, "(" + discounted + ") * tax", cudf::type_id::INT64, {price, discount, tax}));
+  }
 
   const cudf::column_view flag = fixedView(ctx, "lineitem", "l_returnflag", rows);
   const cudf::column_view keys[] = {
@@ -118,8 +127,8 @@ void aggregate(
   const cudf::column_view values[] = {
       fixedView(ctx, "lineitem", "l_quantity", rows),
       price,
-      derived->get_column(0).view(),
-      derived->get_column(1).view(),
+      derived[0]->view(),
+      derived[1]->view(),
       discount,
   };
   std::vector<cudf::groupby::aggregation_request> requests(std::size(values));
@@ -138,7 +147,8 @@ void aggregate(
   const auto count = download<int32_t>(ctx, results[0].results[1]->view());
   const auto priceSum = download<int64_t>(ctx, results[1].results[0]->view());
   const auto discounted = download<int64_t>(ctx, results[2].results[0]->view());
-  const auto charge = download<__int128>(ctx, results[3].results[0]->view());
+  const auto charge = useJit() ? download<__int128>(ctx, results[3].results[0]->view()) : std::vector<__int128>{};
+  const auto taxed = useJit() ? std::vector<int64_t>{} : download<int64_t>(ctx, results[3].results[0]->view());
   const auto discountSum = download<int64_t>(ctx, results[4].results[0]->view());
   cudaStreamSynchronize(stream);
   for (size_t g = 0; g < flags.size(); ++g) {
@@ -146,7 +156,7 @@ void aggregate(
     totals.quantity += quantity[g];
     totals.price += priceSum[g];
     totals.discounted += discounted[g];
-    totals.charge += charge[g];
+    totals.charge += useJit() ? charge[g] : static_cast<__int128>(discounted[g]) * 100 + taxed[g];
     totals.discount += discountSum[g];
     totals.count += count[g];
   }
@@ -161,8 +171,8 @@ shipdateMask(QueryContext& ctx, RowRange rows, int64_t limit) {
   const auto& shipdate = tree.push(cudf::ast::column_reference(0));
   const auto& literal = tree.push(cudf::ast::literal(bound));
   const auto& keep = tree.push(cudf::ast::operation(cudf::ast::ast_operator::LESS_EQUAL, shipdate, literal));
-  auto bools = cudf::compute_column_jit(
-      cudf::table_view({fixedView(ctx, "lineitem", "l_shipdate", rows)}), keep, stream);
+  const cudf::table_view table({fixedView(ctx, "lineitem", "l_shipdate", rows)});
+  auto bools = useJit() ? cudf::compute_column_jit(table, keep, stream) : cudf::compute_column(table, keep, stream);
   return cudf::bools_to_mask(bools->view(), stream);
 }
 
@@ -286,7 +296,7 @@ Result q1(QueryContext& ctx) {
   const auto& statuses = ctx.meta("lineitem", "l_linestatus").dictionary;
   std::map<std::pair<int8_t, int8_t>, Totals> groups;
   const int64_t domain = static_cast<int64_t>(flags.size() * statuses.size());
-  if (domain <= kMostReducedGroups && !std::getenv("SV_CUDF_GROUPBY")) {
+  if (domain <= kMostReducedGroups && useJit() && !std::getenv("SV_CUDF_GROUPBY")) {
     reduceGroups(ctx, split.some, dateLimit, static_cast<int32_t>(statuses.size()), static_cast<int32_t>(domain), groups);
   } else {
     const int64_t batchRows = kBatchRows;

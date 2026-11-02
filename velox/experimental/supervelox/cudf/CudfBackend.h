@@ -19,11 +19,13 @@
 #include <cudf/column/column_view.hpp>
 #include <cudf/groupby.hpp>
 #include <cudf/table/table.hpp>
+#include <cudf/transform.hpp>
 #include <cudf/types.hpp>
 #include <cudf/udf.hpp>
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -72,6 +74,21 @@ cudf::column_view deviceView(cudf::type_id type, const void* data, int64_t rows)
 /// LTO-IR of CUDA source using the bundled cuDF headers, compiled once per
 /// distinct source.
 const cudf::compiled_fragment& compileFragment(const std::string& source);
+
+/// Whether the queries use cuDF's LTO APIs, transform_lto and reduce_lto,
+/// or nothing compiled or linked at run time: each expression a cuDF AST
+/// that compute_column interprets, a boolean mask and stock reductions and
+/// group-bys.
+void setUseJit(bool use);
+bool useJit();
+
+/// The outputs of `source`, a transform_lto function `transform` returning
+/// 0, over `inputs`, as one transform_lto.
+std::unique_ptr<cudf::table> transformColumns(
+    QueryContext& ctx,
+    const std::string& source,
+    std::span<const cudf::transform_input> inputs,
+    std::span<const cudf::transform_output> outputs);
 
 /// A device expression true when `code` is one of `codes`.
 std::string codeTest(const std::string& code, const CodeSet& codes);

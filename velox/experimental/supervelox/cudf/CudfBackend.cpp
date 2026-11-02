@@ -15,7 +15,9 @@
  */
 #include "velox/experimental/supervelox/cudf/CudfBackend.h"
 
+#include <cudf/ast/expressions.hpp>
 #include <cudf/binaryop.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/strings/contains.hpp>
@@ -33,9 +35,15 @@
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <algorithm>
+#include <cctype>
+#include <cstring>
+#include <deque>
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
+#include <set>
+#include <sstream>
 #include <stdexcept>
 #include <tuple>
 
@@ -110,7 +118,495 @@ const std::vector<int2>& hostZones(QueryContext& ctx, const std::string& table, 
   return copy;
 }
 
+bool jitEnabled = true;
+
+/// The C subset of the queries' device expressions as a cuDF AST, which
+/// compute_column evaluates with its precompiled interpreter. Integers are
+/// evaluated as int64, since AST operands must share a type; `c ? a : b`,
+/// which the AST lacks, is int64(c) * a + int64(!c) * b, and the bit test
+/// `(maskU >> x) & 1` is x equal to one of the bits of the mask.
+class AstExpression {
+ public:
+  /// `inputs` declares one parameter per column of `table`; `prelude` holds
+  /// `const <type> <name> = <expression>;` definitions. The literals are
+  /// made and freed on `stream`, which evaluates the expression.
+  AstExpression(
+      const cudf::table_view& table,
+      const std::string& inputs,
+      const std::string& prelude,
+      cudaStream_t stream)
+      : stream_(stream) {
+    std::stringstream declared(inputs);
+    std::string declaration;
+    cudf::size_type index = 0;
+    while (std::getline(declared, declaration, ',')) {
+      const std::string name = declaration.substr(declaration.find_last_of(" \t") + 1);
+      const auto& reference = tree_.push(cudf::ast::column_reference(index));
+      if (table.column(index).type().id() == cudf::type_id::BOOL8) {
+        names_[name] = Value{&reference, true};
+      } else if (table.column(index).type().id() == cudf::type_id::INT64) {
+        names_[name] = Value{&reference, false};
+      } else {
+        names_[name] = Value{&operation(cudf::ast::ast_operator::CAST_TO_INT64, reference), false};
+      }
+      ++index;
+    }
+    std::stringstream statements(prelude);
+    std::string statement;
+    while (std::getline(statements, statement, ';')) {
+      const size_t equals = statement.find('=');
+      if (equals == std::string::npos) {
+        continue;
+      }
+      const bool adds = equals > 0 && statement[equals - 1] == '+';
+      std::string left = statement.substr(0, adds ? equals - 1 : equals);
+      left = left.substr(0, left.find_last_not_of(" \t\n") + 1);
+      const std::string name = left.substr(left.find_last_of(" \t\n") + 1);
+      Value value = parse(statement.substr(equals + 1));
+      if (adds) {
+        const Value sum = names_.at(name);
+        value = sum.constant && value.constant ? Value{.constant = *sum.constant + *value.constant}
+                                               : arithmetic(cudf::ast::ast_operator::ADD, sum, value);
+      }
+      names_[name] = value;
+    }
+  }
+
+  /// `expression` as a column of `type`, an integer type or BOOL8.
+  std::unique_ptr<cudf::column>
+  compute(QueryContext& ctx, const cudf::table_view& table, const std::string& expression, cudf::type_id type) {
+    const auto stream = ctx.stream();
+    const Value value = parse(expression);
+    const bool wantBool = type == cudf::type_id::BOOL8;
+    if (value.constant) {
+      if (wantBool) {
+        const cudf::numeric_scalar<bool> fill(*value.constant != 0, true, stream);
+        return cudf::make_column_from_scalar(fill, table.num_rows(), stream);
+      }
+      const cudf::numeric_scalar<int64_t> fill(*value.constant, true, stream);
+      auto column = cudf::make_column_from_scalar(fill, table.num_rows(), stream);
+      return type == cudf::type_id::INT64 ? std::move(column)
+                                          : cudf::cast(column->view(), cudf::data_type{type}, stream);
+    }
+    const auto& root =
+        operation(cudf::ast::ast_operator::IDENTITY, wantBool ? boolean(value) : integer(value));
+    auto column = cudf::compute_column(table, root, stream);
+    return column->type().id() == type ? std::move(column)
+                                       : cudf::cast(column->view(), cudf::data_type{type}, stream);
+  }
+
+ private:
+  /// An int64 or boolean expression, or a constant not yet made a literal.
+  /// `mask` is set for `maskU >> x`, whose x is `expression`.
+  struct Value {
+    const cudf::ast::expression* expression{nullptr};
+    bool isBool{false};
+    std::optional<int64_t> constant;
+    std::optional<uint64_t> mask;
+  };
+
+  const cudf::ast::expression& operation(cudf::ast::ast_operator op, const cudf::ast::expression& input) {
+    return tree_.push(cudf::ast::operation(op, input));
+  }
+
+  const cudf::ast::expression&
+  operation(cudf::ast::ast_operator op, const cudf::ast::expression& left, const cudf::ast::expression& right) {
+    return tree_.push(cudf::ast::operation(op, left, right));
+  }
+
+  const cudf::ast::expression& integer(const Value& value) {
+    if (value.mask) {
+      throw std::invalid_argument("a shifted mask is only tested with & 1");
+    }
+    if (value.constant) {
+      integers_.emplace_back(*value.constant, true, stream_);
+      return tree_.push(cudf::ast::literal(integers_.back()));
+    }
+    return value.isBool ? operation(cudf::ast::ast_operator::CAST_TO_INT64, *value.expression) : *value.expression;
+  }
+
+  const cudf::ast::expression& boolean(const Value& value) {
+    if (value.mask) {
+      throw std::invalid_argument("a shifted mask is only tested with & 1");
+    }
+    if (value.constant) {
+      booleans_.emplace_back(*value.constant != 0, true, stream_);
+      return tree_.push(cudf::ast::literal(booleans_.back()));
+    }
+    if (value.isBool) {
+      return *value.expression;
+    }
+    return operation(cudf::ast::ast_operator::NOT_EQUAL, *value.expression, integer(Value{.constant = 0}));
+  }
+
+  Value parse(const std::string& text) {
+    text_ = text;
+    at_ = 0;
+    Value value = ternary();
+    skipSpace();
+    if (at_ != text_.size()) {
+      throw std::invalid_argument("cannot translate to a cuDF AST: " + text_);
+    }
+    return value;
+  }
+
+  void skipSpace() {
+    while (at_ < text_.size() && std::isspace(static_cast<unsigned char>(text_[at_]))) {
+      ++at_;
+    }
+  }
+
+  bool accept(const char* token) {
+    skipSpace();
+    const size_t length = std::strlen(token);
+    if (text_.compare(at_, length, token) != 0) {
+      return false;
+    }
+    // Keeps & from matching &&, > from >> and >=, and so on.
+    const char next = at_ + length < text_.size() ? text_[at_ + length] : '\0';
+    if (length == 1 && ((next == token[0] && std::strchr("&|<>=", next)) || (next == '=' && std::strchr("<>!=", token[0])))) {
+      return false;
+    }
+    if (length == 2 && token[0] == '>' && token[1] == '>' && next == '=') {
+      return false;
+    }
+    at_ += length;
+    return true;
+  }
+
+  void expect(const char* token) {
+    if (!accept(token)) {
+      throw std::invalid_argument(std::string("expected ") + token + " in " + text_);
+    }
+  }
+
+  Value boolValue(const cudf::ast::expression& expression) {
+    return Value{&expression, true};
+  }
+
+  Value intValue(const cudf::ast::expression& expression) {
+    return Value{&expression, false};
+  }
+
+  Value ternary() {
+    Value condition = logicalOr();
+    if (!accept("?")) {
+      return condition;
+    }
+    Value whenTrue = ternary();
+    expect(":");
+    Value whenFalse = ternary();
+    if (condition.constant) {
+      return *condition.constant ? whenTrue : whenFalse;
+    }
+    const auto& test = boolean(condition);
+    if (whenTrue.isBool && whenFalse.isBool) {
+      return boolValue(operation(
+          cudf::ast::ast_operator::LOGICAL_OR,
+          operation(cudf::ast::ast_operator::LOGICAL_AND, test, boolean(whenTrue)),
+          operation(
+              cudf::ast::ast_operator::LOGICAL_AND,
+              operation(cudf::ast::ast_operator::NOT, test),
+              boolean(whenFalse))));
+    }
+    auto chosen = [&](const cudf::ast::expression& selector, const Value& value) -> const cudf::ast::expression* {
+      if (value.constant && *value.constant == 0) {
+        return nullptr;
+      }
+      return &operation(
+          cudf::ast::ast_operator::MUL,
+          operation(cudf::ast::ast_operator::CAST_TO_INT64, selector),
+          integer(value));
+    };
+    const auto* first = chosen(test, whenTrue);
+    const auto* second = chosen(operation(cudf::ast::ast_operator::NOT, test), whenFalse);
+    if (!first && !second) {
+      return Value{.constant = 0};
+    }
+    if (!first || !second) {
+      return intValue(first ? *first : *second);
+    }
+    return intValue(operation(cudf::ast::ast_operator::ADD, *first, *second));
+  }
+
+  Value logicalOr() {
+    Value left = logicalAnd();
+    while (accept("||")) {
+      Value right = logicalAnd();
+      left = boolValue(operation(cudf::ast::ast_operator::LOGICAL_OR, boolean(left), boolean(right)));
+    }
+    return left;
+  }
+
+  Value logicalAnd() {
+    Value left = bitAnd();
+    while (accept("&&")) {
+      Value right = bitAnd();
+      left = boolValue(operation(cudf::ast::ast_operator::LOGICAL_AND, boolean(left), boolean(right)));
+    }
+    return left;
+  }
+
+  Value bitAnd() {
+    Value left = equality();
+    while (accept("&")) {
+      Value right = equality();
+      if (left.mask && right.constant && *right.constant == 1) {
+        left = bitTest(*left.mask, *left.expression);
+      } else if (left.constant && right.constant) {
+        left = Value{.constant = *left.constant & *right.constant};
+      } else {
+        left = intValue(operation(cudf::ast::ast_operator::BITWISE_AND, integer(left), integer(right)));
+      }
+    }
+    return left;
+  }
+
+  Value bitTest(uint64_t mask, const cudf::ast::expression& index) {
+    const cudf::ast::expression* test = nullptr;
+    for (int64_t bit = 0; bit < 64; ++bit) {
+      if (mask >> bit & 1) {
+        const auto& equal = operation(cudf::ast::ast_operator::EQUAL, index, integer(Value{.constant = bit}));
+        test = test ? &operation(cudf::ast::ast_operator::LOGICAL_OR, *test, equal) : &equal;
+      }
+    }
+    return test ? boolValue(*test) : Value{.constant = 0};
+  }
+
+  Value compare(cudf::ast::ast_operator op, const Value& left, const Value& right) {
+    return boolValue(operation(op, integer(left), integer(right)));
+  }
+
+  Value equality() {
+    Value left = relational();
+    for (;;) {
+      if (accept("==")) {
+        left = compare(cudf::ast::ast_operator::EQUAL, left, relational());
+      } else if (accept("!=")) {
+        left = compare(cudf::ast::ast_operator::NOT_EQUAL, left, relational());
+      } else {
+        return left;
+      }
+    }
+  }
+
+  Value relational() {
+    Value left = shift();
+    for (;;) {
+      if (accept("<=")) {
+        left = compare(cudf::ast::ast_operator::LESS_EQUAL, left, shift());
+      } else if (accept(">=")) {
+        left = compare(cudf::ast::ast_operator::GREATER_EQUAL, left, shift());
+      } else if (accept("<")) {
+        left = compare(cudf::ast::ast_operator::LESS, left, shift());
+      } else if (accept(">")) {
+        left = compare(cudf::ast::ast_operator::GREATER, left, shift());
+      } else {
+        return left;
+      }
+    }
+  }
+
+  Value shift() {
+    Value left = additive();
+    while (accept(">>")) {
+      Value right = additive();
+      if (!left.constant || right.constant) {
+        throw std::invalid_argument("only a constant mask shifts by a column: " + text_);
+      }
+      left = Value{.expression = &integer(right), .mask = static_cast<uint64_t>(*left.constant)};
+    }
+    return left;
+  }
+
+  Value arithmetic(cudf::ast::ast_operator op, const Value& left, const Value& right) {
+    return intValue(operation(op, integer(left), integer(right)));
+  }
+
+  Value additive() {
+    Value left = multiplicative();
+    for (;;) {
+      if (accept("+")) {
+        left = arithmetic(cudf::ast::ast_operator::ADD, left, multiplicative());
+      } else if (accept("-")) {
+        left = arithmetic(cudf::ast::ast_operator::SUB, left, multiplicative());
+      } else {
+        return left;
+      }
+    }
+  }
+
+  Value multiplicative() {
+    Value left = unary();
+    for (;;) {
+      if (accept("*")) {
+        left = arithmetic(cudf::ast::ast_operator::MUL, left, unary());
+      } else if (accept("/")) {
+        left = arithmetic(cudf::ast::ast_operator::DIV, left, unary());
+      } else if (accept("%")) {
+        left = arithmetic(cudf::ast::ast_operator::MOD, left, unary());
+      } else {
+        return left;
+      }
+    }
+  }
+
+  Value unary() {
+    if (accept("!")) {
+      Value operand = unary();
+      if (operand.constant) {
+        return Value{.constant = *operand.constant == 0};
+      }
+      return boolValue(operation(cudf::ast::ast_operator::NOT, boolean(operand)));
+    }
+    if (accept("-")) {
+      Value operand = unary();
+      if (operand.constant) {
+        return Value{.constant = -*operand.constant};
+      }
+      return arithmetic(cudf::ast::ast_operator::SUB, Value{.constant = 0}, operand);
+    }
+    return primary();
+  }
+
+  Value primary() {
+    skipSpace();
+    if (accept("(")) {
+      Value inner = ternary();
+      expect(")");
+      return inner;
+    }
+    if (at_ < text_.size() && std::isdigit(static_cast<unsigned char>(text_[at_]))) {
+      size_t length = 0;
+      const int64_t number = std::stoll(text_.substr(at_), &length);
+      at_ += length;
+      while (at_ < text_.size() && std::strchr("uUlL", text_[at_])) {
+        ++at_;
+      }
+      return Value{.constant = number};
+    }
+    const size_t start = at_;
+    while (at_ < text_.size() && (std::isalnum(static_cast<unsigned char>(text_[at_])) || text_[at_] == '_')) {
+      ++at_;
+    }
+    const std::string word = text_.substr(start, at_ - start);
+    if (word == "true" || word == "false") {
+      return Value{.constant = word == "true"};
+    }
+    static const std::set<std::string> kTypes = {"int8_t", "int16_t", "int32_t", "int64_t", "int", "uint32_t"};
+    if (kTypes.contains(word)) {
+      // Every value fits the types the expressions convert to.
+      const bool braced = accept("{");
+      if (!braced) {
+        expect("(");
+      }
+      Value inner = ternary();
+      expect(braced ? "}" : ")");
+      return inner;
+    }
+    const auto it = names_.find(word);
+    if (word.empty() || it == names_.end()) {
+      throw std::invalid_argument("cannot translate '" + word + "' to a cuDF AST in " + text_);
+    }
+    return it->second;
+  }
+
+  cudaStream_t stream_;
+  cudf::ast::tree tree_;
+  std::deque<cudf::numeric_scalar<int64_t>> integers_;
+  std::deque<cudf::numeric_scalar<bool>> booleans_;
+  std::map<std::string, Value> names_;
+  std::string text_;
+  size_t at_{0};
+};
+
+/// Rows the stock libcudf version of sumGroups filters and sums at a time,
+/// bounding the value columns it makes.
+constexpr int64_t kStockRows = 128 << 20;
+
+/// sumGroups in stock libcudf: per chunk of rows, a boolean column of the
+/// filter, the rows that pass, a column per value and of the group, then a
+/// reduction or a groupby summing each value.
+std::vector<int64_t>
+stockSumGroups(QueryContext& ctx, const GroupedSums& sums, const std::vector<cudf::column_view>& columns) {
+  const auto stream = ctx.stream();
+  const auto values = static_cast<int32_t>(sums.values.size());
+  std::vector<int64_t> totals(sums.groups * values, 0);
+  const int64_t rows = columns[0].size();
+  for (int64_t begin = 0; begin < rows; begin += kStockRows) {
+    const std::vector<cudf::size_type> bounds{
+        static_cast<cudf::size_type>(begin), static_cast<cudf::size_type>(std::min(rows, begin + kStockRows))};
+    const auto slice = cudf::slice(cudf::table_view(columns), bounds)[0];
+    const std::vector<cudf::column_view> chunk(slice.begin(), slice.end());
+    const auto keep = computeColumn(ctx, sums.inputs, sums.filter, cudf::type_id::BOOL8, chunk, sums.prelude);
+    const auto kept = cudf::apply_boolean_mask(slice, keep->view(), stream);
+    if (kept->num_rows() == 0) {
+      continue;
+    }
+    std::vector<cudf::column_view> passed;
+    for (cudf::size_type i = 0; i < kept->num_columns(); ++i) {
+      passed.push_back(kept->get_column(i).view());
+    }
+    std::vector<std::unique_ptr<cudf::column>> computed;
+    for (const auto& value : sums.values) {
+      computed.push_back(computeColumn(ctx, sums.inputs, value, cudf::type_id::INT64, passed, sums.prelude));
+    }
+    if (sums.groups == 1) {
+      for (int32_t k = 0; k < values; ++k) {
+        const auto sum = cudf::reduce(
+            computed[k]->view(),
+            *cudf::make_sum_aggregation<cudf::reduce_aggregation>(),
+            cudf::data_type{cudf::type_id::INT64},
+            stream);
+        totals[k] += static_cast<const cudf::numeric_scalar<int64_t>&>(*sum).value(stream);
+      }
+      continue;
+    }
+    const auto group = computeColumn(ctx, sums.inputs, sums.group, cudf::type_id::INT32, passed, sums.prelude);
+    std::vector<cudf::groupby::aggregation_request> requests(values);
+    for (int32_t k = 0; k < values; ++k) {
+      requests[k].values = computed[k]->view();
+      requests[k].aggregations.push_back(cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+    }
+    cudf::groupby::groupby groupby(cudf::table_view({group->view()}));
+    auto [keys, results] = groupby.aggregate(requests, stream);
+    const auto ids = ctx.download(keys->get_column(0).view().data<int32_t>(), keys->num_rows());
+    for (int32_t k = 0; k < values; ++k) {
+      const auto sumsOfGroups = ctx.download(results[k].results[0]->view().data<int64_t>(), ids.size());
+      for (size_t g = 0; g < ids.size(); ++g) {
+        totals[ids[g] * values + k] += sumsOfGroups[g];
+      }
+    }
+  }
+  return totals;
+}
+
 } // namespace
+
+void setUseJit(bool use) {
+  jitEnabled = use;
+}
+
+bool useJit() {
+  return jitEnabled;
+}
+
+std::unique_ptr<cudf::table> transformColumns(
+    QueryContext& ctx,
+    const std::string& source,
+    std::span<const cudf::transform_input> inputs,
+    std::span<const cudf::transform_output> outputs) {
+  return cudf::transform_lto(
+      compileFragment(source).view(),
+      cudf::lto_binary_type::LTO_IR,
+      cudf::null_aware::NO,
+      std::nullopt,
+      inputs,
+      outputs,
+      {},
+      std::nullopt,
+      ctx.stream());
+}
 
 cudf::column_view fixedView(QueryContext& ctx, const std::string& table, const std::string& name, RowRange rows) {
   const Column& column = ctx.meta(table, name);
@@ -240,6 +736,9 @@ extern "C" {
   if (columns.empty() || columns[0].size() == 0) {
     return totals;
   }
+  if (!useJit()) {
+    return stockSumGroups(ctx, sums, columns);
+  }
   const auto& fragment = compileFragment(source);
   const std::vector<cudf::reduce_input> inputs(columns.begin(), columns.end());
   const cudf::lto_fragment fragments[] = {{cudf::lto_binary_type::LTO_IR, fragment.view()}};
@@ -291,6 +790,10 @@ std::unique_ptr<cudf::column> computeColumn(
     cudf::type_id type,
     const std::vector<cudf::column_view>& columns,
     const std::string& prelude) {
+  if (!useJit()) {
+    const cudf::table_view table(columns);
+    return AstExpression(table, inputs, prelude, ctx.stream()).compute(ctx, table, expression, type);
+  }
   const std::string source = std::string(R"(
 #include <cuda/std/cstdint>
 
@@ -300,17 +803,7 @@ extern "C" __device__ int transform()") +
       deviceType(type) + "* out, " + inputs + ") {\n" + prelude + "  *out = " + expression + ";\n  return 0;\n}\n";
   const std::vector<cudf::transform_input> in(columns.begin(), columns.end());
   const cudf::transform_output out[] = {{cudf::data_type{type}, cudf::output_nullability::ALL_VALID}};
-  auto table = cudf::transform_lto(
-      compileFragment(source).view(),
-      cudf::lto_binary_type::LTO_IR,
-      cudf::null_aware::NO,
-      std::nullopt,
-      in,
-      out,
-      {},
-      std::nullopt,
-      ctx.stream());
-  return std::move(table->release()[0]);
+  return std::move(transformColumns(ctx, source, in, out)->release()[0]);
 }
 
 std::unique_ptr<cudf::column> keyRows(QueryContext& ctx, const cudf::column_view& keys) {

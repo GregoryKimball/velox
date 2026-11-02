@@ -71,6 +71,32 @@ const std::vector<ResultField> kSchema = {{"revenue", ResultType::kDecimal, 38, 
 Result q6(QueryContext& ctx) {
   const int64_t dateLow = ctx.param("shipdate_min", days(1994, 1, 1));
   const int64_t dateHigh = ctx.param("shipdate_max", days(1994, 12, 31));
+  const ZoneSplit split = splitZones(ctx, "lineitem", "l_shipdate", dateLow, dateHigh);
+  Result result(kSchema);
+  if (split.some.size() == 0) {
+    result.decimals[0].push_back(0);
+    return result;
+  }
+  const std::vector<cudf::column_view> lineitem = {
+      fixedView(ctx, "lineitem", "l_shipdate", split.some),
+      fixedView(ctx, "lineitem", "l_discount", split.some),
+      fixedView(ctx, "lineitem", "l_quantity", split.some),
+      fixedView(ctx, "lineitem", "l_extendedprice", split.some),
+  };
+  if (!useJit()) {
+    GroupedSums sums;
+    sums.inputs = "int16_t shipdate, int8_t discount, int16_t quantity, int32_t price";
+    sums.filter = fmt::format(
+        "shipdate >= {} && shipdate <= {} && discount >= {} && discount <= {} && quantity <= {}",
+        dateLow,
+        dateHigh,
+        ctx.param("discount_min", 5),
+        ctx.param("discount_max", 7),
+        ctx.param("quantity_max", 2399));
+    sums.values = {"int64_t{price} * discount"};
+    result.decimals[0].push_back(sumGroups(ctx, sums, lineitem)[0]);
+    return result;
+  }
   const auto& fragment = compileFragment(fmt::format(
       kSource,
       dateLow,
@@ -78,19 +104,7 @@ Result q6(QueryContext& ctx) {
       ctx.param("discount_min", 5),
       ctx.param("discount_max", 7),
       ctx.param("quantity_max", 2399)));
-
-  const ZoneSplit split = splitZones(ctx, "lineitem", "l_shipdate", dateLow, dateHigh);
-  Result result(kSchema);
-  if (split.some.size() == 0) {
-    result.decimals[0].push_back(0);
-    return result;
-  }
-  const cudf::reduce_input inputs[] = {
-      fixedView(ctx, "lineitem", "l_shipdate", split.some),
-      fixedView(ctx, "lineitem", "l_discount", split.some),
-      fixedView(ctx, "lineitem", "l_quantity", split.some),
-      fixedView(ctx, "lineitem", "l_extendedprice", split.some),
-  };
+  const std::vector<cudf::reduce_input> inputs(lineitem.begin(), lineitem.end());
   const cudf::lto_fragment fragments[] = {{cudf::lto_binary_type::LTO_IR, fragment.view()}};
   const cudf::reduce_udf udf{fragments, "q6_init", "q6_update", "q6_merge", "q6_finalize", "q6_filter"};
   const cudf::data_type types[] = {cudf::data_type{cudf::type_id::INT64}};

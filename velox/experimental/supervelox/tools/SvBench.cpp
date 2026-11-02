@@ -71,6 +71,11 @@ DEFINE_bool(filters_as_node, false, "With --tpch_plans, put filters in filter no
 DEFINE_string(backend, "handwritten", "Who runs the fused queries: handwritten, cudf or meld");
 DEFINE_string(query_backends, "", "Per-query backends overriding --backend, as 1=cudf,6=handwritten");
 DEFINE_bool(compare_handwritten, false, "Also run each query with the hand-written kernels and compare answers");
+DEFINE_bool(
+    cudf_jit,
+    true,
+    "With --backend cudf, use transform_lto and reduce_lto; false compiles and links nothing at run time: each "
+    "expression is a cuDF AST for compute_column's interpreter, then a boolean mask and stock reductions and group-bys");
 DEFINE_string(meld_library, "", "libmeld-velox.so to load for the meld backend");
 DEFINE_int64(
     batch_rows,
@@ -351,6 +356,7 @@ int main(int argc, char** argv) {
   setBatchRows(FLAGS_batch_rows);
 #ifdef SUPERVELOX_CUDF
   cudf_backend::registerCudfBackend();
+  cudf_backend::setUseJit(FLAGS_cudf_jit);
 #endif
 #ifdef SUPERVELOX_MELD
   if (!FLAGS_meld_library.empty()) {

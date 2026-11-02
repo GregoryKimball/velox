@@ -28,18 +28,6 @@
 namespace facebook::velox::supervelox::cudf_backend {
 namespace {
 
-/// Lines with the ship instruction and one of the ship modes.
-constexpr const char* kKeep = R"(
-#include <cuda/std/cstdint>
-
-using namespace cuda::std;
-
-extern "C" __device__ int transform(bool* keep, int8_t instruct, int8_t mode) {{
-  *keep = instruct == {} && {};
-  return 0;
-}}
-)";
-
 const std::vector<ResultField> kSchema = {{"revenue", ResultType::kDecimal, 38, 4}};
 
 } // namespace
@@ -54,28 +42,19 @@ Result q19(QueryContext& ctx) {
       codesParam(ctx, "shipmodes", dictionaryCodes(ctx, "lineitem", "l_shipmode", {"AIR", "AIR REG"}));
   const RowRange lines{0, ctx.rows("lineitem")};
 
-  const cudf::transform_input keepInputs[] = {
-      fixedView(ctx, "lineitem", "l_shipinstruct", lines), fixedView(ctx, "lineitem", "l_shipmode", lines)};
-  const cudf::transform_output keepOutputs[] = {
-      {cudf::data_type{cudf::type_id::BOOL8}, cudf::output_nullability::ALL_VALID}};
-  const auto& keepFragment = compileFragment(fmt::format(kKeep, instruct, codeTest("mode", modes)));
-  auto keep = cudf::transform_lto(
-      keepFragment.view(),
-      cudf::lto_binary_type::LTO_IR,
-      cudf::null_aware::NO,
-      std::nullopt,
-      keepInputs,
-      keepOutputs,
-      {},
-      std::nullopt,
-      stream);
+  auto keep = computeColumn(
+      ctx,
+      "int8_t instruct, int8_t mode",
+      "instruct == " + std::to_string(instruct) + " && " + codeTest("mode", modes),
+      cudf::type_id::BOOL8,
+      {fixedView(ctx, "lineitem", "l_shipinstruct", lines), fixedView(ctx, "lineitem", "l_shipmode", lines)});
   auto kept = cudf::apply_retention_mask(
       cudf::table_view(
           {fixedView(ctx, "lineitem", "l_partkey", lines),
            fixedView(ctx, "lineitem", "l_quantity", lines),
            fixedView(ctx, "lineitem", "l_extendedprice", lines),
            fixedView(ctx, "lineitem", "l_discount", lines)}),
-      keep->get_column(0).view(),
+      keep->view(),
       stream);
   keep.reset();
 

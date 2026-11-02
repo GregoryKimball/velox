@@ -25,17 +25,6 @@
 namespace facebook::velox::supervelox::cudf_backend {
 namespace {
 
-constexpr const char* kLate = R"(
-#include <cuda/std/cstdint>
-
-using namespace cuda::std;
-
-extern "C" __device__ int transform(bool* late, int16_t commit, int16_t receipt) {
-  *late = commit < receipt;
-  return 0;
-}
-)";
-
 const std::vector<ResultField> kSchema = {
     {"o_orderpriority", ResultType::kVarchar},
     {"order_count", ResultType::kBigint},
@@ -63,20 +52,12 @@ Result q4(QueryContext& ctx) {
   const auto bounds = ctx.download(starts + begin, end - begin + 1);
   const RowRange lines{bounds.front(), bounds.back()};
 
-  const cudf::transform_input lateInputs[] = {
-      fixedView(ctx, "lineitem", "l_commitdate", lines), fixedView(ctx, "lineitem", "l_receiptdate", lines)};
-  const cudf::transform_output lateOutputs[] = {
-      {cudf::data_type{cudf::type_id::BOOL8}, cudf::output_nullability::ALL_VALID}};
-  auto late = cudf::transform_lto(
-      compileFragment(kLate).view(),
-      cudf::lto_binary_type::LTO_IR,
-      cudf::null_aware::NO,
-      std::nullopt,
-      lateInputs,
-      lateOutputs,
-      {},
-      std::nullopt,
-      stream);
+  auto late = computeColumn(
+      ctx,
+      "int16_t commit, int16_t receipt",
+      "commit < receipt",
+      cudf::type_id::BOOL8,
+      {fixedView(ctx, "lineitem", "l_commitdate", lines), fixedView(ctx, "lineitem", "l_receiptdate", lines)});
 
   const cudf::numeric_scalar<int32_t> base(static_cast<int32_t>(lines.begin), true, stream);
   auto offsets = cudf::binary_operation(
@@ -86,7 +67,7 @@ Result q4(QueryContext& ctx) {
       cudf::data_type{cudf::type_id::INT32},
       stream);
   auto anyLate = cudf::segmented_reduce(
-      late->get_column(0).view(),
+      late->view(),
       cudf::device_span<cudf::size_type const>(offsets->view().data<cudf::size_type>(), offsets->size()),
       *cudf::make_any_aggregation<cudf::segmented_reduce_aggregation>(),
       cudf::data_type{cudf::type_id::BOOL8},
