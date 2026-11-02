@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <sstream>
 
 #include <folly/executors/IOThreadPoolExecutor.h>
@@ -82,22 +83,57 @@ DEFINE_bool(
     "Parquet");
 DEFINE_int64(scan_rows, 1 << 24, "With --velox_cudf, rows per table scan split, each one batch");
 DEFINE_int32(drivers, 16, "Drivers per pipeline for --tpch_plans");
-DEFINE_bool(
-    pregroup,
-    true,
-    "With --velox_cudf, aggregate in one step over pre-grouped input where a scanned table keeps rows "
-    "with equal grouping keys adjacent");
+DEFINE_string(
+    rules,
+    "",
+    "With --velox_cudf, the comma separated rules to apply, none by default: decode_filter_gather (read a scan's "
+    "columns encoded, evaluate its filters in one kernel, compact and decode the rows that pass), "
+    "expression_project (also evaluate the filters and projections above the scan in those kernels), order_aware "
+    "(aggregate in one step over pre-grouped input where a scanned table keeps rows with equal grouping keys "
+    "adjacent), direct (aggregate by keys that the store bounds to small ranges into slots indexed by key; dense "
+    "is the old name), streaming_groupby (cuDF's streaming group-by for final aggregations), fuse (evaluate the "
+    "filters and projections below an aggregation into few groups inside one reduction), exists_aggregation (semi "
+    "and anti joins filtered by an inequality, as for exists subqueries, join with the min and max per key of a "
+    "table clustered by it), key_pushdown (an aggregation inner joined on its grouping key with a side whose keys "
+    "come from a filtered scan semi joins its input with that scan), key_filter (with decode_filter_gather, the scan "
+    "below a join's probe side passes only the keys of the filtered scan its build side keys come from)");
 DEFINE_bool(plan_stats, false, "With --tpch_plans, print each run's plan with the time and rows of every node");
-DEFINE_bool(
-    dense_aggregation,
-    true,
-    "With --velox_cudf, aggregate by one integer key that the store bounds to a small range into slots indexed by key");
 DEFINE_string(cudf_config, "", "With --velox_cudf, more CudfConfig entries as key=value,key=value");
 DEFINE_bool(cudf_debug, false, "With --velox_cudf, log which operators Velox-cuDF replaces");
 DEFINE_int32(cudf_memory_percent, 50, "With --velox_cudf, percent of GPU memory the cuDF memory pool starts with");
 using namespace facebook::velox;
 using namespace facebook::velox::supervelox;
 using exec::test::PlanBuilder;
+
+namespace {
+
+/// The rules named by --rules.
+const std::set<std::string>& rules() {
+  static const std::set<std::string> parsed = [] {
+    static const std::set<std::string> known{
+        "decode_filter_gather",
+        "expression_project",
+        "order_aware",
+        "direct",
+        "dense",
+        "streaming_groupby",
+        "fuse",
+        "exists_aggregation",
+        "key_pushdown",
+        "key_filter"};
+    std::set<std::string> out;
+    std::stringstream names(FLAGS_rules);
+    std::string name;
+    while (std::getline(names, name, ',')) {
+      VELOX_CHECK(known.count(name), "Unknown rule {} in --rules", name);
+      out.insert(name == "dense" ? "direct" : name);
+    }
+    return out;
+  }();
+  return parsed;
+}
+
+} // namespace
 
 namespace {
 
@@ -333,6 +369,9 @@ int main(int argc, char** argv) {
     std::unordered_map<std::string, std::string> cudfConfig{
         {cudf_velox::CudfConfig::kCudfMemoryPercent, std::to_string(FLAGS_cudf_memory_percent)},
         {cudf_velox::CudfConfig::kCudfDebugEnabled, FLAGS_cudf_debug ? "true" : "false"}};
+    if (rules().count("streaming_groupby")) {
+      cudfConfig["cudf.streaming_groupby_enabled"] = "true";
+    }
     std::stringstream entries(FLAGS_cudf_config);
     std::string entry;
     while (std::getline(entries, entry, ',')) {
@@ -383,7 +422,16 @@ int main(int argc, char** argv) {
         planNode = tables.plan;
         std::map<std::string, std::vector<std::string>> splitKeys;
         auto rewrite = cudf_backend::rewriteAggregations(
-            tables.plan, *cache, {.preGroup = FLAGS_pregroup, .dense = FLAGS_dense_aggregation});
+            tables.plan,
+            *cache,
+            {.decode = rules().count("decode_filter_gather") > 0,
+             .project = rules().count("expression_project") > 0,
+             .preGroup = rules().count("order_aware") > 0,
+             .direct = rules().count("direct") > 0,
+             .fuse = rules().count("fuse") > 0,
+             .existsAggregation = rules().count("exists_aggregation") > 0,
+             .keyPushdown = rules().count("key_pushdown") > 0,
+             .keyFilter = rules().count("key_filter") > 0});
         planNode = rewrite.plan;
         splitKeys = std::move(rewrite.splitKeys);
         for (const auto& line : rewrite.log) {
@@ -393,7 +441,7 @@ int main(int argc, char** argv) {
           const auto keys = splitKeys.find(table);
           return cache->splits(table, keys == splitKeys.end() ? std::vector<std::string>{} : keys->second);
         };
-        printf("q%d: Velox-cuDF over the HBM cache\n", query);
+        printf("q%d: Velox-cuDF over the HBM cache, rules: %s\n", query, FLAGS_rules.empty() ? "none" : FLAGS_rules.c_str());
       }
 #endif
     }
