@@ -18,6 +18,7 @@
 #include <deque>
 
 #include "velox/experimental/cudf/exec/DenseGroupby.h"
+#include "velox/experimental/cudf/exec/FusedAggregation.h"
 
 #include "velox/experimental/cudf/exec/CudfAggregation.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
@@ -268,6 +269,8 @@ class CudfGroupby : public CudfOperatorBase {
   const DenseAggregationNode* denseNode_{nullptr};
   std::shared_ptr<DenseGroupby> dense_;
   bool denseEmits_{false};
+  // Set for a FusedAggregationNode: reduces each batch into 'dense_'.
+  std::unique_ptr<FusedReduction> fused_;
   CudfVectorPtr preGroupedTail_;
   std::deque<CudfVectorPtr> preGroupedOutputs_;
   // Incremental aggregation is disabled if companion aggregates are present.

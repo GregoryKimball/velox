@@ -360,8 +360,12 @@ class AggregationAdapter : public OperatorAdapter {
     auto aggregationPlanNode =
         std::dynamic_pointer_cast<const core::AggregationNode>(planNode);
 
-    bool isGlobal = aggregationPlanNode->groupingKeys().empty();
-    bool isDistinct = !isGlobal && aggregationPlanNode->aggregates().empty();
+    // A dense node without keys is a global aggregation that CudfGroupby runs.
+    const bool dense =
+        dynamic_cast<const DenseAggregationNode*>(aggregationPlanNode.get()) !=
+        nullptr;
+    bool isGlobal = !dense && aggregationPlanNode->groupingKeys().empty();
+    bool isDistinct = !dense && !isGlobal && aggregationPlanNode->aggregates().empty();
 
     std::vector<std::unique_ptr<exec::Operator>> result;
     if (CudfConfig::getInstance().concatOptimizationEnabled) {

@@ -116,7 +116,37 @@ class DenseGroupby {
       const std::vector<cudf::column_view>& input,
       cuda::stream_ref stream);
 
-  /// The key and aggregate columns of the groups with rows.
+  /// Combines partial states into the accumulators, whose addresses come from
+  /// rowsAt, countAt and valueAt.
+  void merge(const std::vector<dense::Merge>& merges, cuda::stream_ref stream);
+
+  int64_t slots() const {
+    return slots_;
+  }
+
+  /// Slot = sum over keys of (key - low) * stride.
+  const std::vector<int64_t>& strides() const {
+    return strides_;
+  }
+
+  /// The row count of 'slot'.
+  void* rowsAt(int64_t slot);
+
+  /// The count of non-null inputs of 'aggregate' in 'slot', or null for
+  /// count(*).
+  void* countAt(size_t aggregate, int64_t slot);
+
+  /// The int128 or double sum, or int64 or double extreme, of 'aggregate' in
+  /// 'slot', or null for counts.
+  void* valueAt(size_t aggregate, int64_t slot);
+
+  /// Whether 'aggregate' accumulates doubles.
+  bool floating(size_t aggregate) const {
+    return states_[aggregate].floating;
+  }
+
+  /// The key and aggregate columns of the groups with rows, or without keys
+  /// the one global group.
   std::vector<std::unique_ptr<cudf::column>> release(
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr);

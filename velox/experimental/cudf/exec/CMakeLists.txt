@@ -43,6 +43,7 @@ add_library(
   DecimalAggregationHostOps.cpp
   DecimalAggregationState.cpp
   DenseGroupby.cpp
+  FusedAggregation.cpp
   GpuCapabilities.cpp
   GpuResources.cpp
   OperatorAdapters.cpp

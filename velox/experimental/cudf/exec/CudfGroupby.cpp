@@ -1704,7 +1704,14 @@ void CudfGroupby::initialize() {
               denseNode_->groupingKeys()[k]->name())),
           denseNode_->outputType()->childAt(k)});
     }
-    auto aggregates = DenseGroupby::aggregates(*denseNode_, inputRow);
+    std::vector<DenseGroupby::Aggregate> aggregates;
+    if (const auto* fused =
+            dynamic_cast<const FusedAggregationNode*>(denseNode_)) {
+      fused_ = std::make_unique<FusedReduction>(*fused, inputRow);
+      aggregates = fused_->aggregates();
+    } else {
+      aggregates = DenseGroupby::aggregates(*denseNode_, inputRow);
+    }
     dense_ = DenseGroupby::shared(
         operatorCtx_->task().get(), planNodeId(), [&]() {
           return std::make_shared<DenseGroupby>(
@@ -1948,6 +1955,15 @@ void CudfGroupby::doAddInput(RowVectorPtr input) {
 
   if (preGrouped_) {
     computePreGroupedGroupby(std::move(cudfInput));
+    return;
+  }
+
+  if (fused_) {
+    const auto view = cudfInput->getTableView();
+    fused_->add(
+        std::vector<cudf::column_view>(view.begin(), view.end()),
+        *dense_,
+        cudfInput->stream());
     return;
   }
 
@@ -2297,6 +2313,7 @@ void CudfGroupby::doClose() {
   preGroupedTail_.reset();
   preGroupedOutputs_.clear();
   dense_.reset();
+  fused_.reset();
   aggregators_.clear();
   intermediateAggregators_.clear();
   partialAggregators_.clear();

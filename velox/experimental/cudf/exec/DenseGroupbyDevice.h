@@ -93,6 +93,30 @@ void add(
     unsigned long long* counts,
     cuda::stream_ref stream);
 
+/// How a partial state field combines into an accumulator.
+enum class MergeOp : int32_t {
+  kAddCount,
+  kAddInt128,
+  kAddDouble,
+  kMinInteger,
+  kMaxInteger,
+  kMinDouble,
+  kMaxDouble
+};
+
+/// One partial state field, or for kAddInt128 its low and high halves, and
+/// the accumulator it combines into. Sources point to device memory.
+struct Merge {
+  MergeOp op;
+  const void* source;
+  const void* sourceHigh;
+  void* target;
+};
+
+/// Combines every merge in 'merges', a device array of 'count', atomically
+/// into its target.
+void merge(const Merge* merges, int32_t count, cuda::stream_ref stream);
+
 /// The slots with rows, in order.
 rmm::device_uvector<cudf::size_type> occupied(
     const unsigned long long* rows,

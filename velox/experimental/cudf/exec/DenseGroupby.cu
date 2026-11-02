@@ -497,6 +497,40 @@ __global__ void resultsKernel(
   }
 }
 
+__global__ void mergeKernel(const Merge* merges, int32_t count) {
+  for (int32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += gridDim.x * blockDim.x) {
+    const Merge& merge = merges[i];
+    switch (merge.op) {
+      case MergeOp::kAddCount:
+        atomicAdd(
+            static_cast<unsigned long long*>(merge.target),
+            static_cast<unsigned long long>(*static_cast<const int64_t*>(merge.source)));
+        break;
+      case MergeOp::kAddInt128:
+        addInt128Parts(
+            static_cast<unsigned long long*>(merge.target),
+            static_cast<unsigned long long>(*static_cast<const int64_t*>(merge.source)),
+            static_cast<unsigned long long>(*static_cast<const int64_t*>(merge.sourceHigh)));
+        break;
+      case MergeOp::kAddDouble:
+        atomicAdd(static_cast<double*>(merge.target), *static_cast<const double*>(merge.source));
+        break;
+      case MergeOp::kMinInteger:
+        atomicMin(static_cast<long long*>(merge.target), *static_cast<const long long*>(merge.source));
+        break;
+      case MergeOp::kMaxInteger:
+        atomicMax(static_cast<long long*>(merge.target), *static_cast<const long long*>(merge.source));
+        break;
+      case MergeOp::kMinDouble:
+        minDouble(static_cast<double*>(merge.target), *static_cast<const double*>(merge.source));
+        break;
+      case MergeOp::kMaxDouble:
+        maxDouble(static_cast<double*>(merge.target), *static_cast<const double*>(merge.source));
+        break;
+    }
+  }
+}
+
 struct Occupied {
   const unsigned long long* rows;
 
@@ -509,6 +543,14 @@ struct Occupied {
 
 void fill(int64_t* out, int64_t count, int64_t value, cuda::stream_ref stream) {
   fillKernel<<<blocks(count), kBlock, 0, stream.get()>>>(out, count, value);
+  CUDF_CUDA_TRY(cudaGetLastError());
+}
+
+void merge(const Merge* merges, int32_t count, cuda::stream_ref stream) {
+  if (count == 0) {
+    return;
+  }
+  mergeKernel<<<blocks(count), kBlock, 0, stream.get()>>>(merges, count);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 

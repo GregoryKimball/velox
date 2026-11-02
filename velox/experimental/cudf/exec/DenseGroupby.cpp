@@ -225,7 +225,6 @@ DenseGroupby::DenseGroupby(
       slots_(slotCount(keys_)),
       rows_(slots_ * sizeof(int64_t), stream, mr),
       outOfRange_(sizeof(int), stream, mr) {
-  VELOX_CHECK(!keys_.empty());
   strides_.resize(keys_.size());
   int64_t stride = 1;
   for (int64_t k = keys_.size() - 1; k >= 0; --k) {
@@ -283,9 +282,50 @@ DenseGroupby::DenseGroupby(
   stream.sync();
 }
 
+void DenseGroupby::merge(
+    const std::vector<dense::Merge>& merges,
+    cuda::stream_ref stream) {
+  rmm::device_uvector<dense::Merge> device(merges.size(), stream);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      device.data(),
+      merges.data(),
+      merges.size() * sizeof(dense::Merge),
+      cudaMemcpyHostToDevice,
+      stream.get()));
+  dense::merge(device.data(), static_cast<int32_t>(merges.size()), stream);
+  stream.sync();
+}
+
+void* DenseGroupby::rowsAt(int64_t slot) {
+  return static_cast<int64_t*>(rows_.data()) + slot;
+}
+
+void* DenseGroupby::countAt(size_t aggregate, int64_t slot) {
+  auto& state = states_[aggregate];
+  return state.aggregate.kind == Kind::kCountRows
+      ? nullptr
+      : static_cast<int64_t*>(state.counts.data()) + slot;
+}
+
+void* DenseGroupby::valueAt(size_t aggregate, int64_t slot) {
+  auto& state = states_[aggregate];
+  switch (state.aggregate.kind) {
+    case Kind::kSum:
+    case Kind::kAvg:
+      return static_cast<int64_t*>(state.values.data()) +
+          (state.floating ? 1 : 2) * slot;
+    case Kind::kMin:
+    case Kind::kMax:
+      return static_cast<int64_t*>(state.values.data()) + slot;
+    default:
+      return nullptr;
+  }
+}
+
 void DenseGroupby::add(
     const std::vector<cudf::column_view>& input,
     cuda::stream_ref stream) {
+  VELOX_CHECK(!keys_.empty(), "A global dense aggregation takes only merges");
   const auto rowCount = input[keys_[0].channel].size();
   if (rowCount == 0) {
     return;
@@ -388,7 +428,13 @@ std::vector<std::unique_ptr<cudf::column>> DenseGroupby::release(
       "A dense aggregation key is outside its range");
 
   const auto* rows = static_cast<const unsigned long long*>(rows_.data());
-  const auto slots = dense::occupied(rows, slots_, stream, mr);
+  rmm::device_uvector<cudf::size_type> slots(0, stream, mr);
+  if (keys_.empty()) {
+    slots.resize(1, stream);
+    CUDF_CUDA_TRY(cudaMemsetAsync(slots.data(), 0, sizeof(cudf::size_type), stream.get()));
+  } else {
+    slots = dense::occupied(rows, slots_, stream, mr);
+  }
   const auto groups = static_cast<cudf::size_type>(slots.size());
 
   std::vector<std::unique_ptr<cudf::column>> columns;
