@@ -23,6 +23,16 @@ target_link_libraries(
   velox_tpch_benchmark_lib
 )
 
+add_executable(velox_cudf_encoded_tpch_benchmark EncodedTpchBenchmark.cpp)
+
+target_link_libraries(
+  velox_cudf_encoded_tpch_benchmark
+  velox_cudf_encoded_connector
+  velox_cudf_exec
+  velox_cudf_exec_test_lib
+  velox_tpch_benchmark_lib
+)
+
 # --- TPC-DS benchmarks ---
 
 add_executable(velox_cudf_tpcds_benchmark CudfTpcdsBenchmark.cpp)
