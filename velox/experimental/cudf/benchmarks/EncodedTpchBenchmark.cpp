@@ -17,7 +17,8 @@
 // Runs the TPC-H plans of TpchQueryBuilder with every table scan reading the
 // EncodedColumnCache instead of Parquet. The tables are loaded from
 // --data_path and encoded on the GPU before any query runs. With
-// --encoded_device=gpu they stay in device memory and the plans run on cuDF;
+// --encoded_device=gpu the plans run on cuDF and the tables stay in device
+// memory, or with --encoded_memory=pinned_host move to pinned host memory;
 // with --encoded_device=cpu they are copied to host memory, the device copies
 // are freed, and the plans run on CPU Velox.
 
@@ -33,6 +34,7 @@
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
 
 #include <rmm/mr/per_device_resource.hpp>
+#include <rmm/mr/pinned_host_memory_resource.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -46,6 +48,12 @@ DEFINE_string(
     encoded_device,
     "gpu",
     "Where the encoded tables live and the plans run: gpu or cpu.");
+
+DEFINE_string(
+    encoded_memory,
+    "device",
+    "With --encoded_device=gpu, where the encoded tables are kept: device, or "
+    "pinned_host to have the decode kernels read them from host memory.");
 
 DEFINE_int32(
     encoded_segment_rows,
@@ -122,6 +130,10 @@ class EncodedTpchBenchmark : public TpchBenchmark {
     VELOX_USER_CHECK(
         FLAGS_encoded_device == "gpu" || FLAGS_encoded_device == "cpu",
         "--encoded_device must be gpu or cpu");
+    VELOX_USER_CHECK(
+        FLAGS_encoded_memory == "device" ||
+            FLAGS_encoded_memory == "pinned_host",
+        "--encoded_memory must be device or pinned_host");
     const bool gpu = FLAGS_encoded_device == "gpu";
     connector::ConnectorRegistry::global().erase(exec::test::kHiveConnectorId);
     connector::ConnectorRegistry::global().insert(
@@ -205,6 +217,17 @@ class EncodedTpchBenchmark : public TpchBenchmark {
                        loaded.numSegments,
                        bytes,
                        ms)
+                << std::endl;
+    }
+    if (gpu && FLAGS_encoded_memory == "pinned_host") {
+      static rmm::mr::pinned_host_memory_resource pinnedHost;
+      const auto start = std::chrono::steady_clock::now();
+      cache.moveTo(stream, pinnedHost);
+      std::cout << fmt::format(
+                       "Moved encoded tables to pinned host memory: {} ms",
+                       std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count())
                 << std::endl;
     }
     if (!gpu) {

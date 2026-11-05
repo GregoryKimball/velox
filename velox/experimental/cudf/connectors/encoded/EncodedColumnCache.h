@@ -150,6 +150,11 @@ class EncodedColumnCache {
   /// 'releaseDevice', frees the device copies afterwards.
   void copyToHost(cuda::stream_ref stream, bool releaseDevice);
 
+  /// Moves the encoded streams and value columns of every loaded table into
+  /// memory from 'mr', e.g. pinned host memory that kernels read in place.
+  /// 'mr' must outlive the cache contents.
+  void moveTo(cuda::stream_ref stream, rmm::device_async_resource_ref mr);
+
   /// CSV size report: rows, codec, device and host bytes per column.
   std::string sizeReport() const;
 

@@ -658,6 +658,23 @@ void EncodedColumnCache::copyToHost(cuda::stream_ref stream, bool releaseDevice)
   stream.sync();
 }
 
+void EncodedColumnCache::moveTo(
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  for (auto& [_, table] : tables_) {
+    for (auto& column : table->columns) {
+      column->packed = rmm::device_uvector<uint64_t>(column->packed, stream, mr);
+      column->segmentParams = rmm::device_uvector<SegmentParams>(
+          column->segmentParams, stream, mr);
+      if (column->values) {
+        column->values =
+            std::make_unique<cudf::column>(column->values->view(), stream, mr);
+      }
+      stream.sync();
+    }
+  }
+}
+
 std::string EncodedColumnCache::sizeReport() const {
   std::vector<std::string> tableNames;
   for (const auto& [name, _] : tables_) {
