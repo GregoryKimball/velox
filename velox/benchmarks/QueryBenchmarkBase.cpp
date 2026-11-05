@@ -16,6 +16,7 @@
 
 #include "velox/benchmarks/QueryBenchmarkBase.h"
 #include <folly/String.h>
+#include <chrono>
 #include <iostream>
 #include "velox/common/base/SuccinctPrinter.h"
 #include "velox/common/file/FileSystems.h"
@@ -168,7 +169,11 @@ void QueryBenchmarkBase::printResults(
       printType = false;
     }
     for (vector_size_t i = 0; i < vector->size(); ++i) {
-      out << vector->toString(i) << std::endl;
+      std::vector<std::string> fields;
+      for (const auto& child : vector->children()) {
+        fields.push_back(child->toString(i));
+      }
+      out << "{" << folly::join(", ", fields) << "}" << std::endl;
     }
   }
 }
@@ -321,8 +326,16 @@ QueryBenchmarkBase::run(
         }
         taskCursor->setNoMoreSplits();
       };
+      const auto start = std::chrono::steady_clock::now();
       auto result = readCursor(params, addSplits);
       ensureTaskCompletion(result.first->task().get());
+      std::cout << fmt::format(
+                       "Repeat {} wall time us: {}",
+                       repeat,
+                       std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count())
+                << std::endl;
       if (++repeat >= FLAGS_num_repeats) {
         return result;
       }
