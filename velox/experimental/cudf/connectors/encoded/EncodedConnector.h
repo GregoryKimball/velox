@@ -17,17 +17,12 @@
 #pragma once
 
 #include "velox/experimental/cudf/connectors/encoded/EncodedColumnCache.h"
-#include "velox/experimental/cudf/exec/NvtxHelper.h"
-#include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
 #include "velox/connectors/Connector.h"
 #include "velox/connectors/hive/TableHandle.h"
 #include "velox/core/QueryCtx.h"
 #include "velox/exec/OperatorUtils.h"
 #include "velox/expression/Expr.h"
-
-#include <cudf/ast/expressions.hpp>
-#include <cudf/scalar/scalar.hpp>
 
 namespace facebook::velox::cudf_velox::connector::encoded {
 
@@ -59,8 +54,8 @@ makeEncodedSplits(
 
 /// Where scans of the encoded tables run.
 enum class EncodedDevice {
-  /// Device-resident tables, decoded and filtered by cuDF; batches are
-  /// CudfVectors.
+  /// Device-resident tables, decoded and filtered by cuDF in CudfEncodedScan,
+  /// which replaces the TableScan; batches are CudfVectors.
   kGpu,
   /// Host-resident tables, decoded and filtered on the CPU; batches are Velox
   /// vectors, with dictionary strings as DictionaryVectors.
@@ -97,8 +92,8 @@ class EncodedConnector final : public velox::connector::Connector {
   const EncodedDevice device_;
 };
 
-/// The columns and filters of one scan, shared by the GPU and CPU data
-/// sources.
+/// The columns and filters of one scan, shared by CudfEncodedScan and the CPU
+/// data source.
 struct EncodedScanSpec {
   EncodedScanSpec(
       const RowTypePtr& outputType,
@@ -133,64 +128,7 @@ struct EncodedScanSpec {
   RowTypePtr filterType;
 };
 
-/// Per split: prunes segments by min/max against the pushed-down filters,
-/// decodes the filter columns and evaluates the filters on the GPU, then
-/// decodes only the surviving rows of the other output columns.
-class EncodedDataSource : public velox::connector::DataSource,
-                          public NvtxHelper {
- public:
-  EncodedDataSource(
-      const RowTypePtr& outputType,
-      const velox::connector::ConnectorTableHandlePtr& tableHandle,
-      const velox::connector::ColumnHandleMap& columnHandles,
-      velox::connector::ConnectorQueryCtx* connectorQueryCtx);
-
-  void addSplit(std::shared_ptr<velox::connector::ConnectorSplit> split) override;
-
-  std::optional<RowVectorPtr> next(uint64_t size, ContinueFuture& future)
-      override;
-
-  void addDynamicFilter(
-      column_index_t /*outputChannel*/,
-      const std::shared_ptr<common::Filter>& /*filter*/) override {
-    VELOX_NYI("Dynamic filters are not supported by the encoded connector");
-  }
-
-  const common::SubfieldFilters* getFilters() const override {
-    return &spec_.subfieldFilters;
-  }
-
-  uint64_t getCompletedBytes() override {
-    return 0;
-  }
-
-  uint64_t getCompletedRows() override {
-    return completedRows_;
-  }
-
-  std::unordered_map<std::string, RuntimeMetric> getRuntimeStats() override;
-
- private:
-  const RowTypePtr outputType_;
-  memory::MemoryPool* const pool_;
-  EncodedScanSpec spec_;
-
-  cudf::ast::tree subfieldTree_;
-  std::vector<std::unique_ptr<cudf::scalar>> subfieldScalars_;
-  const cudf::ast::expression* subfieldAst_{nullptr};
-  std::shared_ptr<CudfExpression> remainingFilterExpression_;
-
-  std::shared_ptr<EncodedConnectorSplit> split_;
-
-  uint64_t completedRows_{0};
-  uint64_t segmentsScanned_{0};
-  uint64_t segmentsPruned_{0};
-  uint64_t rowsDecodedForFilter_{0};
-  uint64_t rowsPassed_{0};
-  uint64_t decodeFilterTimeNs_{0};
-};
-
-/// The CPU counterpart of EncodedDataSource over the host copies of the
+/// The CPU counterpart of CudfEncodedScan over the host copies of the
 /// tables. Per batch of rows: applies each pushed-down filter to the rows that
 /// passed the previous ones, decoding one value at a time (filters on
 /// dictionary strings test the code against a per-code result computed once),
@@ -275,9 +213,9 @@ class EncodedCpuDataSource : public velox::connector::DataSource {
   uint64_t rowsPassed_{0};
 };
 
-/// Registers a TableScan adapter ahead of the built-in one that keeps scans of
-/// a GPU EncodedConnector on the GPU and defers other scans to the next
-/// adapter. Call after registerCudf().
+/// Registers a TableScan adapter ahead of the built-in one that replaces scans
+/// of a GPU EncodedConnector with CudfEncodedScan and defers other scans to
+/// the next adapter. Call after registerCudf().
 void registerEncodedTableScanAdapter();
 
 } // namespace facebook::velox::cudf_velox::connector::encoded

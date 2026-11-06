@@ -63,7 +63,8 @@ DEFINE_int32(
 DEFINE_int32(
     encoded_segments_per_split,
     4,
-    "Segments per split; each split is decoded and filtered as one batch.");
+    "Segments per split, the unit of work handed to scan drivers. GPU scans "
+    "batch segments across splits up to the cuDF batch-size targets.");
 
 DEFINE_bool(
     encoded_cluster,

@@ -14,6 +14,7 @@
 
 add_library(
   velox_cudf_encoded_connector
+  CudfEncodedScan.cpp
   EncodedColumnCache.cu
   EncodedConnector.cpp
   EncodedCpuDataSource.cpp
