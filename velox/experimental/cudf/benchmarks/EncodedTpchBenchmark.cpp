@@ -41,6 +41,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 
 DECLARE_string(data_path);
 
@@ -97,6 +98,15 @@ DEFINE_string(
     cudf_properties,
     "",
     "Path to a properties file for CudfConfig. Each line should be key=value.");
+
+DEFINE_string(
+    run_queries,
+    "",
+    "Comma-separated query numbers to run verbosely one after another in this "
+    "process, loading the tables once. Each query's output starts with a "
+    "'Running query N' line. Overrides --run_query_verbose.");
+
+DECLARE_int32(run_query_verbose);
 
 using namespace facebook::velox;
 namespace encoded = facebook::velox::cudf_velox::connector::encoded;
@@ -278,5 +288,27 @@ int main(int argc, char** argv) {
       "Benchmarks TPC-H on cuDF over the encoded in-memory column cache.");
   folly::Init init{&argc, &argv, false};
   benchmark = std::make_unique<EncodedTpchBenchmark>();
-  tpchBenchmarkMain();
+  if (FLAGS_run_queries.empty()) {
+    tpchBenchmarkMain();
+    return 0;
+  }
+  std::vector<int32_t> queries;
+  std::stringstream list(FLAGS_run_queries);
+  for (std::string query; std::getline(list, query, ',');) {
+    queries.push_back(std::stoi(query));
+  }
+  benchmark->initialize();
+  for (const auto query : queries) {
+    FLAGS_run_query_verbose = query;
+    std::cout << "Running query " << query << std::endl;
+    try {
+      RunStats ignore;
+      benchmark->runMain(std::cout, ignore);
+    } catch (const std::exception& e) {
+      std::cout << "Query " << query << " failed: " << e.what() << std::endl;
+    }
+    std::cout << "Finished query " << query << std::endl;
+  }
+  benchmark->shutdown();
+  return 0;
 }
