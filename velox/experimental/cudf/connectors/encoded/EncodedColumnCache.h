@@ -160,6 +160,22 @@ class EncodedColumnCache {
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr);
 
+  /// Loads like loadTable() without a cluster key, but reads one row group at
+  /// a time, so tables larger than device memory load. String columns take
+  /// the dictionary codec on the same distinct-count thresholds, from a first
+  /// pass over the row groups. The packed streams and kPlain value columns are
+  /// stored in memory from 'storageMr'. With 'hostResident' that is pinned
+  /// host memory, and the table is marked EncodedTable::hostResident as by
+  /// moveTo(). Dictionaries and segment params use 'mr'.
+  void loadTableByRowGroups(
+      const std::string& name,
+      const std::vector<std::string>& parquetFiles,
+      int32_t segmentRows,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr,
+      rmm::device_async_resource_ref storageMr,
+      bool hostResident);
+
   /// Returns the table, or null if it is not loaded.
   const EncodedTable* findTable(const std::string& name) const;
 

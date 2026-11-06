@@ -53,7 +53,7 @@ DEFINE_string(
     encoded_memory,
     "device",
     "With --encoded_device=gpu, where the encoded tables are kept: device, or "
-    "pinned_host to have the decode kernels read them from host memory.");
+    "pinned_host to have scans copy each batch to the device before decoding.");
 
 DEFINE_int32(
     encoded_segment_rows,
@@ -70,6 +70,13 @@ DEFINE_bool(
     encoded_cluster,
     true,
     "Sort lineitem by l_shipdate and orders by o_orderdate when loading.");
+
+DEFINE_bool(
+    encoded_load_row_groups,
+    false,
+    "Load each table one Parquet row group at a time, storing the encoded "
+    "data directly in its final memory, for tables larger than device memory. "
+    "Needs --encoded_cluster=false; sort the files beforehand to cluster.");
 
 DEFINE_string(
     encoded_size_report,
@@ -194,15 +201,31 @@ class EncodedTpchBenchmark : public TpchBenchmark {
     const auto mr = gpu ? cudf_velox::get_output_mr()
                         : rmm::mr::get_current_device_resource_ref();
     auto& cache = encoded::EncodedColumnCache::instance();
+    static rmm::mr::pinned_host_memory_resource pinnedHost;
+    const bool hostStorage = !gpu || FLAGS_encoded_memory == "pinned_host";
+    VELOX_USER_CHECK(
+        !FLAGS_encoded_load_row_groups || !FLAGS_encoded_cluster,
+        "--encoded_load_row_groups needs --encoded_cluster=false");
     for (const auto& [table, clusterKey] : kTables) {
       const auto start = std::chrono::steady_clock::now();
-      cache.loadTable(
-          table,
-          parquetFiles(FLAGS_data_path + "/" + table),
-          FLAGS_encoded_cluster ? clusterKey : "",
-          FLAGS_encoded_segment_rows,
-          stream,
-          mr);
+      if (FLAGS_encoded_load_row_groups) {
+        cache.loadTableByRowGroups(
+            table,
+            parquetFiles(FLAGS_data_path + "/" + table),
+            FLAGS_encoded_segment_rows,
+            stream,
+            mr,
+            hostStorage ? rmm::device_async_resource_ref(pinnedHost) : mr,
+            hostStorage);
+      } else {
+        cache.loadTable(
+            table,
+            parquetFiles(FLAGS_data_path + "/" + table),
+            FLAGS_encoded_cluster ? clusterKey : "",
+            FLAGS_encoded_segment_rows,
+            stream,
+            mr);
+      }
       const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::steady_clock::now() - start)
                           .count();
@@ -220,8 +243,8 @@ class EncodedTpchBenchmark : public TpchBenchmark {
                        ms)
                 << std::endl;
     }
-    if (gpu && FLAGS_encoded_memory == "pinned_host") {
-      static rmm::mr::pinned_host_memory_resource pinnedHost;
+    if (gpu && FLAGS_encoded_memory == "pinned_host" &&
+        !FLAGS_encoded_load_row_groups) {
       const auto start = std::chrono::steady_clock::now();
       cache.moveTo(stream, pinnedHost);
       std::cout << fmt::format(

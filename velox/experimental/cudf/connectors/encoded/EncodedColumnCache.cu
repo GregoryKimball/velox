@@ -17,13 +17,16 @@
 #include "velox/experimental/cudf/connectors/encoded/EncodedColumnCache.h"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/encode.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/reduction/distinct_count.hpp>
+#include <cudf/search.hpp>
 #include <cudf/sorting.hpp>
+#include <cudf/stream_compaction.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
@@ -576,6 +579,321 @@ void EncodedColumnCache::loadTable(
   tables_[name] = std::move(table);
 }
 
+namespace {
+
+constexpr cudf::size_type kMaxDictionaryKeys = 1 << 16;
+
+// Reads row groups of 'files' one at a time and calls 'consume' with each,
+// after normalize(), and whether it is the last.
+template <typename Consume>
+void forEachRowGroup(
+    const std::vector<std::string>& files,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr,
+    Consume consume) {
+  std::vector<std::pair<size_t, cudf::size_type>> rowGroups;
+  for (size_t f = 0; f < files.size(); ++f) {
+    const auto metadata =
+        cudf::io::read_parquet_metadata(cudf::io::source_info(files[f]));
+    for (cudf::size_type g = 0; g < metadata.num_rowgroups(); ++g) {
+      rowGroups.emplace_back(f, g);
+    }
+  }
+  for (size_t i = 0; i < rowGroups.size(); ++i) {
+    const auto [file, group] = rowGroups[i];
+    auto options = cudf::io::parquet_reader_options::builder(
+                       cudf::io::source_info(files[file]))
+                       .row_groups({{group}})
+                       .build();
+    auto read = cudf::io::read_parquet(options, stream, mr);
+    auto columns = read.tbl->release();
+    for (auto& column : columns) {
+      check(
+          column->null_count() == 0, "Encoded tables do not support nulls yet");
+      column = normalize(std::move(column), stream, mr);
+    }
+    consume(
+        std::make_unique<cudf::table>(std::move(columns)),
+        read.metadata,
+        i + 1 == rowGroups.size());
+  }
+}
+
+// Bit-packed segments encoded piece by piece and stored in 'storageMr'.
+struct PackedPieces {
+  std::vector<rmm::device_uvector<uint64_t>> words;
+  std::vector<SegmentParams> params;
+  uint64_t numWords{0};
+};
+
+void appendPacked(
+    EncodedColumn& column,
+    PackedPieces& pieces,
+    cudf::column_view values,
+    int32_t segmentRows,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr,
+    rmm::device_async_resource_ref storageMr) {
+  EncodedColumn piece(stream, mr);
+  encodeForBitpack(piece, values, segmentRows, stream, mr);
+  std::vector<SegmentParams> params(piece.segmentParams.size());
+  checkCuda(
+      cudaMemcpyAsync(
+          params.data(),
+          piece.segmentParams.data(),
+          params.size() * sizeof(SegmentParams),
+          cudaMemcpyDeviceToHost,
+          stream.get()),
+      "copy piece segment params");
+  const uint64_t words = piece.packed.size() - 1;
+  rmm::device_uvector<uint64_t> stored(words, stream, storageMr);
+  checkCuda(
+      cudaMemcpyAsync(
+          stored.data(),
+          piece.packed.data(),
+          words * sizeof(uint64_t),
+          cudaMemcpyDefault,
+          stream.get()),
+      "store packed words");
+  stream.sync();
+  for (auto p : params) {
+    p.bitOffset += pieces.numWords * 64;
+    pieces.params.push_back(p);
+  }
+  pieces.words.push_back(std::move(stored));
+  pieces.numWords += words;
+  column.segmentMin.insert(
+      column.segmentMin.end(), piece.segmentMin.begin(), piece.segmentMin.end());
+  column.segmentMax.insert(
+      column.segmentMax.end(), piece.segmentMax.begin(), piece.segmentMax.end());
+  column.segmentBitWidth.insert(
+      column.segmentBitWidth.end(),
+      piece.segmentBitWidth.begin(),
+      piece.segmentBitWidth.end());
+}
+
+void finishPacked(
+    EncodedColumn& column,
+    PackedPieces& pieces,
+    bool hostResident,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr,
+    rmm::device_async_resource_ref storageMr) {
+  column.packed =
+      rmm::device_uvector<uint64_t>(pieces.numWords + 1, stream, storageMr);
+  uint64_t offset = 0;
+  for (const auto& words : pieces.words) {
+    checkCuda(
+        cudaMemcpyAsync(
+            column.packed.data() + offset,
+            words.data(),
+            words.size() * sizeof(uint64_t),
+            cudaMemcpyDefault,
+            stream.get()),
+        "concatenate packed words");
+    offset += words.size();
+  }
+  const uint64_t zero = 0;
+  checkCuda(
+      cudaMemcpyAsync(
+          column.packed.data() + pieces.numWords,
+          &zero,
+          sizeof(uint64_t),
+          cudaMemcpyDefault,
+          stream.get()),
+      "clear padding word");
+  column.segmentParams =
+      rmm::device_uvector<SegmentParams>(pieces.params.size(), stream, mr);
+  checkCuda(
+      cudaMemcpyAsync(
+          column.segmentParams.data(),
+          pieces.params.data(),
+          pieces.params.size() * sizeof(SegmentParams),
+          cudaMemcpyHostToDevice,
+          stream.get()),
+      "copy segment params");
+  stream.sync();
+  if (hostResident) {
+    column.hostSegmentParams = std::move(pieces.params);
+  }
+  pieces = PackedPieces{};
+}
+
+} // namespace
+
+void EncodedColumnCache::loadTableByRowGroups(
+    const std::string& name,
+    const std::vector<std::string>& parquetFiles,
+    int32_t segmentRows,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr,
+    rmm::device_async_resource_ref storageMr,
+    bool hostResident) {
+  check(segmentRows > 0, "segmentRows must be positive");
+
+  // Pass 1: names, types, row count, and the distinct values of each string
+  // column while there are few enough of them for a dictionary.
+  std::vector<std::string> names;
+  std::vector<cudf::data_type> types;
+  std::vector<std::unique_ptr<cudf::column>> keys;
+  std::vector<bool> manyValues;
+  int64_t numRows = 0;
+  forEachRowGroup(
+      parquetFiles,
+      stream,
+      mr,
+      [&](std::unique_ptr<cudf::table> rows, const auto& metadata, bool) {
+        if (names.empty()) {
+          for (const auto& info : metadata.schema_info) {
+            names.push_back(info.name);
+          }
+          for (const auto& column : rows->view()) {
+            types.push_back(column.type());
+          }
+          keys.resize(names.size());
+          manyValues.assign(names.size(), false);
+        }
+        numRows += rows->num_rows();
+        for (size_t i = 0; i < names.size(); ++i) {
+          const auto values = rows->view().column(i);
+          if (values.type().id() != cudf::type_id::STRING || manyValues[i]) {
+            continue;
+          }
+          std::vector<cudf::column_view> parts{values};
+          if (keys[i]) {
+            parts.push_back(keys[i]->view());
+          }
+          auto all = cudf::concatenate(parts, stream, mr);
+          auto distinct = cudf::distinct(
+              cudf::table_view({all->view()}),
+              {0},
+              cudf::duplicate_keep_option::KEEP_ANY,
+              cudf::null_equality::EQUAL,
+              cudf::nan_equality::ALL_EQUAL,
+              stream,
+              mr);
+          if (distinct->num_rows() > kMaxDictionaryKeys) {
+            manyValues[i] = true;
+            keys[i].reset();
+          } else {
+            keys[i] = std::move(distinct->release()[0]);
+          }
+        }
+      });
+  check(!names.empty(), "No row groups in " + name);
+
+  auto table = std::make_unique<EncodedTable>();
+  table->name = name;
+  table->numRows = numRows;
+  table->segmentRows = segmentRows;
+  table->numSegments =
+      static_cast<int32_t>((numRows + segmentRows - 1) / segmentRows);
+  table->hostResident = hostResident;
+  for (size_t i = 0; i < names.size(); ++i) {
+    auto encoded = std::make_unique<EncodedColumn>(stream, mr);
+    encoded->name = names[i];
+    encoded->type = types[i];
+    if (isIntegerLike(types[i])) {
+      encoded->codec = Codec::kForBitpack;
+    } else if (
+        types[i].id() == cudf::type_id::STRING && !manyValues[i] &&
+        int64_t{keys[i]->size()} * 8 < numRows) {
+      encoded->codec = Codec::kDictionary;
+      auto sorted = cudf::stable_sort(
+          cudf::table_view({keys[i]->view()}), {}, {}, stream, mr);
+      encoded->values = std::move(sorted->release()[0]);
+    } else {
+      encoded->codec = Codec::kPlain;
+    }
+    keys[i].reset();
+    table->columnIndex.emplace(encoded->name, static_cast<int32_t>(i));
+    table->columns.push_back(std::move(encoded));
+  }
+
+  // Pass 2: encode whole segments as they fill, carrying the rest of each row
+  // group into the next.
+  std::vector<PackedPieces> packed(names.size());
+  std::vector<std::vector<std::unique_ptr<cudf::column>>> plain(names.size());
+  std::unique_ptr<cudf::table> carry;
+  auto encodePiece = [&](cudf::table_view piece) {
+    for (size_t i = 0; i < names.size(); ++i) {
+      auto& column = *table->columns[i];
+      const auto values = piece.column(i);
+      switch (column.codec) {
+        case Codec::kForBitpack:
+          appendPacked(
+              column, packed[i], values, segmentRows, stream, mr, storageMr);
+          break;
+        case Codec::kDictionary: {
+          auto codes = cudf::lower_bound(
+              cudf::table_view({column.values->view()}),
+              cudf::table_view({values}),
+              {cudf::order::ASCENDING},
+              {cudf::null_order::AFTER},
+              stream,
+              mr);
+          appendPacked(
+              column,
+              packed[i],
+              codes->view(),
+              segmentRows,
+              stream,
+              mr,
+              storageMr);
+          break;
+        }
+        case Codec::kPlain: {
+          std::vector<cudf::column_view> parts{values};
+          plain[i].push_back(cudf::concatenate(parts, stream, storageMr));
+          break;
+        }
+      }
+    }
+    stream.sync();
+  };
+  forEachRowGroup(
+      parquetFiles,
+      stream,
+      mr,
+      [&](std::unique_ptr<cudf::table> rows, const auto&, bool last) {
+        if (carry) {
+          std::vector<cudf::table_view> parts{carry->view(), rows->view()};
+          rows = cudf::concatenate(parts, stream, mr);
+          carry.reset();
+        }
+        const auto total = rows->num_rows();
+        const auto whole = last ? total : total / segmentRows * segmentRows;
+        if (whole > 0) {
+          encodePiece(cudf::slice(rows->view(), {0, whole}, stream)[0]);
+        }
+        if (whole < total) {
+          std::vector<cudf::table_view> rest{
+              cudf::slice(rows->view(), {whole, total}, stream)[0]};
+          carry = cudf::concatenate(rest, stream, mr);
+        }
+      });
+
+  for (size_t i = 0; i < names.size(); ++i) {
+    auto& column = *table->columns[i];
+    if (column.codec == Codec::kPlain) {
+      if (plain[i].size() == 1) {
+        column.values = std::move(plain[i][0]);
+      } else {
+        std::vector<cudf::column_view> parts;
+        for (const auto& part : plain[i]) {
+          parts.push_back(part->view());
+        }
+        column.values = cudf::concatenate(parts, stream, storageMr);
+      }
+      plain[i].clear();
+    } else {
+      finishPacked(column, packed[i], hostResident, stream, mr, storageMr);
+    }
+    stream.sync();
+  }
+  tables_[name] = std::move(table);
+}
+
 const EncodedTable* EncodedColumnCache::findTable(const std::string& name) const {
   auto it = tables_.find(name);
   return it == tables_.end() ? nullptr : it->second.get();
@@ -597,7 +915,7 @@ void EncodedColumnCache::copyToHost(cuda::stream_ref stream, bool releaseDevice)
               column->hostPacked.data(),
               column->packed.data(),
               column->packed.size() * sizeof(uint64_t),
-              cudaMemcpyDeviceToHost,
+              cudaMemcpyDefault,
               stream.get()),
           "copy packed words to host");
       column->hostSegmentParams.resize(column->segmentParams.size());
@@ -606,7 +924,7 @@ void EncodedColumnCache::copyToHost(cuda::stream_ref stream, bool releaseDevice)
               column->hostSegmentParams.data(),
               column->segmentParams.data(),
               column->segmentParams.size() * sizeof(SegmentParams),
-              cudaMemcpyDeviceToHost,
+              cudaMemcpyDefault,
               stream.get()),
           "copy segment params to host");
       if (column->values) {
@@ -623,7 +941,7 @@ void EncodedColumnCache::copyToHost(cuda::stream_ref stream, bool releaseDevice)
                   column->hostOffsets.data(),
                   offsets.data<int64_t>(),
                   numOffsets * sizeof(int64_t),
-                  cudaMemcpyDeviceToHost,
+                  cudaMemcpyDefault,
                   stream.get()),
               "copy string offsets to host");
         } else {
@@ -633,7 +951,7 @@ void EncodedColumnCache::copyToHost(cuda::stream_ref stream, bool releaseDevice)
                   narrow.data(),
                   offsets.data<int32_t>(),
                   numOffsets * sizeof(int32_t),
-                  cudaMemcpyDeviceToHost,
+                  cudaMemcpyDefault,
                   stream.get()),
               "copy string offsets to host");
           stream.sync();
@@ -645,7 +963,7 @@ void EncodedColumnCache::copyToHost(cuda::stream_ref stream, bool releaseDevice)
                 column->hostChars.data(),
                 strings.chars_begin(stream),
                 column->hostChars.size(),
-                cudaMemcpyDeviceToHost,
+                cudaMemcpyDefault,
                 stream.get()),
             "copy string characters to host");
       }
