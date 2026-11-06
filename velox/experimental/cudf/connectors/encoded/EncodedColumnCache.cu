@@ -719,6 +719,34 @@ void finishPacked(
   pieces = PackedPieces{};
 }
 
+// A string column coded piece by piece before its dictionary is known: each
+// piece holds codes into its own sorted distinct values, recoded to the
+// table's dictionary once every piece is read.
+struct DictionaryPieces {
+  std::vector<std::unique_ptr<cudf::column>> keys;
+  std::vector<std::unique_ptr<cudf::column>> codes;
+  std::unique_ptr<cudf::column> allKeys;
+};
+
+// The strings of each piece of 'pieces', stored in 'storageMr'.
+void decodePieces(
+    DictionaryPieces& pieces,
+    std::vector<std::unique_ptr<cudf::column>>& plain,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref storageMr) {
+  for (size_t p = 0; p < pieces.keys.size(); ++p) {
+    auto strings = cudf::gather(
+        cudf::table_view({pieces.keys[p]->view()}),
+        pieces.codes[p]->view(),
+        cudf::out_of_bounds_policy::DONT_CHECK,
+        stream,
+        storageMr);
+    plain.push_back(std::move(strings->release()[0]));
+  }
+  stream.sync();
+  pieces = DictionaryPieces{};
+}
+
 } // namespace
 
 void EncodedColumnCache::loadTableByRowGroups(
@@ -731,40 +759,52 @@ void EncodedColumnCache::loadTableByRowGroups(
     bool hostResident) {
   check(segmentRows > 0, "segmentRows must be positive");
 
-  // Pass 1: names, types, row count, and the distinct values of each string
-  // column while there are few enough of them for a dictionary.
-  std::vector<std::string> names;
-  std::vector<cudf::data_type> types;
-  std::vector<std::unique_ptr<cudf::column>> keys;
-  std::vector<bool> manyValues;
-  int64_t numRows = 0;
-  forEachRowGroup(
-      parquetFiles,
-      stream,
-      mr,
-      [&](std::unique_ptr<cudf::table> rows, const auto& metadata, bool) {
-        if (names.empty()) {
-          for (const auto& info : metadata.schema_info) {
-            names.push_back(info.name);
-          }
-          for (const auto& column : rows->view()) {
-            types.push_back(column.type());
-          }
-          keys.resize(names.size());
-          manyValues.assign(names.size(), false);
-        }
-        numRows += rows->num_rows();
-        for (size_t i = 0; i < names.size(); ++i) {
-          const auto values = rows->view().column(i);
-          if (values.type().id() != cudf::type_id::STRING || manyValues[i]) {
-            continue;
-          }
-          std::vector<cudf::column_view> parts{values};
-          if (keys[i]) {
-            parts.push_back(keys[i]->view());
+  auto table = std::make_unique<EncodedTable>();
+  table->name = name;
+  table->segmentRows = segmentRows;
+  table->hostResident = hostResident;
+  // String columns start as kDictionary and become kPlain once they have more
+  // distinct values than a dictionary may hold.
+  std::vector<PackedPieces> packed;
+  std::vector<DictionaryPieces> dictionaries;
+  std::vector<std::vector<std::unique_ptr<cudf::column>>> plain;
+  auto toPlain = [&](size_t i) {
+    decodePieces(dictionaries[i], plain[i], stream, storageMr);
+    table->columns[i]->codec = Codec::kPlain;
+  };
+
+  auto encodePiece = [&](cudf::table_view piece) {
+    for (size_t i = 0; i < table->columns.size(); ++i) {
+      auto& column = *table->columns[i];
+      const auto values = piece.column(i);
+      if (column.codec == Codec::kDictionary) {
+        auto& dictionary = dictionaries[i];
+        auto distinct = cudf::distinct(
+            cudf::table_view({values}),
+            {0},
+            cudf::duplicate_keep_option::KEEP_ANY,
+            cudf::null_equality::EQUAL,
+            cudf::nan_equality::ALL_EQUAL,
+            stream,
+            mr);
+        if (distinct->num_rows() > kMaxDictionaryKeys) {
+          toPlain(i);
+        } else {
+          auto sorted = cudf::sort(distinct->view(), {}, {}, stream, mr);
+          auto keys = std::move(sorted->release()[0]);
+          auto codes = cudf::lower_bound(
+              cudf::table_view({keys->view()}),
+              cudf::table_view({values}),
+              {cudf::order::ASCENDING},
+              {cudf::null_order::AFTER},
+              stream,
+              storageMr);
+          std::vector<cudf::column_view> parts{keys->view()};
+          if (dictionary.allKeys) {
+            parts.push_back(dictionary.allKeys->view());
           }
           auto all = cudf::concatenate(parts, stream, mr);
-          auto distinct = cudf::distinct(
+          auto allDistinct = cudf::distinct(
               cudf::table_view({all->view()}),
               {0},
               cudf::duplicate_keep_option::KEEP_ANY,
@@ -772,90 +812,52 @@ void EncodedColumnCache::loadTableByRowGroups(
               cudf::nan_equality::ALL_EQUAL,
               stream,
               mr);
-          if (distinct->num_rows() > kMaxDictionaryKeys) {
-            manyValues[i] = true;
-            keys[i].reset();
-          } else {
-            keys[i] = std::move(distinct->release()[0]);
+          dictionary.allKeys = std::move(allDistinct->release()[0]);
+          dictionary.keys.push_back(std::move(keys));
+          dictionary.codes.push_back(std::move(codes));
+          if (dictionary.allKeys->size() > kMaxDictionaryKeys) {
+            toPlain(i);
           }
+          continue;
         }
-      });
-  check(!names.empty(), "No row groups in " + name);
-
-  auto table = std::make_unique<EncodedTable>();
-  table->name = name;
-  table->numRows = numRows;
-  table->segmentRows = segmentRows;
-  table->numSegments =
-      static_cast<int32_t>((numRows + segmentRows - 1) / segmentRows);
-  table->hostResident = hostResident;
-  for (size_t i = 0; i < names.size(); ++i) {
-    auto encoded = std::make_unique<EncodedColumn>(stream, mr);
-    encoded->name = names[i];
-    encoded->type = types[i];
-    if (isIntegerLike(types[i])) {
-      encoded->codec = Codec::kForBitpack;
-    } else if (
-        types[i].id() == cudf::type_id::STRING && !manyValues[i] &&
-        int64_t{keys[i]->size()} * 8 < numRows) {
-      encoded->codec = Codec::kDictionary;
-      auto sorted = cudf::stable_sort(
-          cudf::table_view({keys[i]->view()}), {}, {}, stream, mr);
-      encoded->values = std::move(sorted->release()[0]);
-    } else {
-      encoded->codec = Codec::kPlain;
-    }
-    keys[i].reset();
-    table->columnIndex.emplace(encoded->name, static_cast<int32_t>(i));
-    table->columns.push_back(std::move(encoded));
-  }
-
-  // Pass 2: encode whole segments as they fill, carrying the rest of each row
-  // group into the next.
-  std::vector<PackedPieces> packed(names.size());
-  std::vector<std::vector<std::unique_ptr<cudf::column>>> plain(names.size());
-  std::unique_ptr<cudf::table> carry;
-  auto encodePiece = [&](cudf::table_view piece) {
-    for (size_t i = 0; i < names.size(); ++i) {
-      auto& column = *table->columns[i];
-      const auto values = piece.column(i);
-      switch (column.codec) {
-        case Codec::kForBitpack:
-          appendPacked(
-              column, packed[i], values, segmentRows, stream, mr, storageMr);
-          break;
-        case Codec::kDictionary: {
-          auto codes = cudf::lower_bound(
-              cudf::table_view({column.values->view()}),
-              cudf::table_view({values}),
-              {cudf::order::ASCENDING},
-              {cudf::null_order::AFTER},
-              stream,
-              mr);
-          appendPacked(
-              column,
-              packed[i],
-              codes->view(),
-              segmentRows,
-              stream,
-              mr,
-              storageMr);
-          break;
-        }
-        case Codec::kPlain: {
-          std::vector<cudf::column_view> parts{values};
-          plain[i].push_back(cudf::concatenate(parts, stream, storageMr));
-          break;
-        }
+      }
+      if (column.codec == Codec::kForBitpack) {
+        appendPacked(
+            column, packed[i], values, segmentRows, stream, mr, storageMr);
+      } else {
+        std::vector<cudf::column_view> parts{values};
+        plain[i].push_back(cudf::concatenate(parts, stream, storageMr));
       }
     }
     stream.sync();
   };
+
+  // Encode whole segments as they fill, carrying the rest of each row group
+  // into the next.
+  std::unique_ptr<cudf::table> carry;
   forEachRowGroup(
       parquetFiles,
       stream,
       mr,
-      [&](std::unique_ptr<cudf::table> rows, const auto&, bool last) {
+      [&](std::unique_ptr<cudf::table> rows, const auto& metadata, bool last) {
+        if (table->columns.empty()) {
+          for (size_t i = 0; i < metadata.schema_info.size(); ++i) {
+            auto encoded = std::make_unique<EncodedColumn>(stream, mr);
+            encoded->name = metadata.schema_info[i].name;
+            encoded->type = rows->view().column(i).type();
+            encoded->codec = isIntegerLike(encoded->type) ? Codec::kForBitpack
+                : encoded->type.id() == cudf::type_id::STRING
+                ? Codec::kDictionary
+                : Codec::kPlain;
+            table->columnIndex.emplace(
+                encoded->name, static_cast<int32_t>(i));
+            table->columns.push_back(std::move(encoded));
+          }
+          packed.resize(table->columns.size());
+          dictionaries.resize(table->columns.size());
+          plain.resize(table->columns.size());
+        }
+        table->numRows += rows->num_rows();
         if (carry) {
           std::vector<cudf::table_view> parts{carry->view(), rows->view()};
           rows = cudf::concatenate(parts, stream, mr);
@@ -872,9 +874,48 @@ void EncodedColumnCache::loadTableByRowGroups(
           carry = cudf::concatenate(rest, stream, mr);
         }
       });
+  check(!table->columns.empty(), "No row groups in " + name);
+  table->numSegments = static_cast<int32_t>(
+      (table->numRows + segmentRows - 1) / segmentRows);
 
-  for (size_t i = 0; i < names.size(); ++i) {
+  for (size_t i = 0; i < table->columns.size(); ++i) {
     auto& column = *table->columns[i];
+    if (column.codec == Codec::kDictionary &&
+        int64_t{dictionaries[i].allKeys->size()} * 8 >= table->numRows) {
+      toPlain(i);
+    }
+    if (column.codec == Codec::kDictionary) {
+      auto& dictionary = dictionaries[i];
+      auto sorted = cudf::stable_sort(
+          cudf::table_view({dictionary.allKeys->view()}), {}, {}, stream, mr);
+      column.values = std::move(sorted->release()[0]);
+      for (size_t p = 0; p < dictionary.keys.size(); ++p) {
+        auto recode = cudf::lower_bound(
+            cudf::table_view({column.values->view()}),
+            cudf::table_view({dictionary.keys[p]->view()}),
+            {cudf::order::ASCENDING},
+            {cudf::null_order::AFTER},
+            stream,
+            mr);
+        auto codes = cudf::gather(
+            cudf::table_view({recode->view()}),
+            dictionary.codes[p]->view(),
+            cudf::out_of_bounds_policy::DONT_CHECK,
+            stream,
+            mr);
+        appendPacked(
+            column,
+            packed[i],
+            codes->view().column(0),
+            segmentRows,
+            stream,
+            mr,
+            storageMr);
+        dictionary.keys[p].reset();
+        dictionary.codes[p].reset();
+      }
+      dictionaries[i] = DictionaryPieces{};
+    }
     if (column.codec == Codec::kPlain) {
       if (plain[i].size() == 1) {
         column.values = std::move(plain[i][0]);

@@ -162,8 +162,10 @@ class EncodedColumnCache {
 
   /// Loads like loadTable() without a cluster key, but reads one row group at
   /// a time, so tables larger than device memory load. String columns take
-  /// the dictionary codec on the same distinct-count thresholds, from a first
-  /// pass over the row groups. The packed streams and kPlain value columns are
+  /// the dictionary codec on the same distinct-count thresholds; each row
+  /// group is read once, its strings coded against its own distinct values and
+  /// recoded to the table's dictionary at the end. The packed streams, those
+  /// interim codes and kPlain value columns are
   /// stored in memory from 'storageMr'. With 'hostResident' that is pinned
   /// host memory, and the table is marked EncodedTable::hostResident as by
   /// moveTo(). Dictionaries and segment params use 'mr'.
