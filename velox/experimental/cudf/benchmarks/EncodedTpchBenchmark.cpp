@@ -125,14 +125,14 @@ std::vector<std::string> parquetFiles(const std::string& tableDir) {
   return files;
 }
 
-class EncodedTpchBenchmark : public TpchBenchmark {
+class EncodedTpchBenchmark : public VerboseTpchBenchmark {
  public:
   void initialize() override {
     if (!FLAGS_cudf_properties.empty()) {
       cudf_velox::CudfConfig::getInstance().initialize(
           cudf_velox::loadPropertiesFile(FLAGS_cudf_properties));
     }
-    TpchBenchmark::initialize();
+    VerboseTpchBenchmark::initialize();
 
     VELOX_USER_CHECK(
         FLAGS_encoded_device == "gpu" || FLAGS_encoded_device == "cpu",
@@ -186,7 +186,7 @@ class EncodedTpchBenchmark : public TpchBenchmark {
     if (FLAGS_encoded_device == "gpu") {
       cudf_velox::unregisterCudf();
     }
-    TpchBenchmark::shutdown();
+    VerboseTpchBenchmark::shutdown();
   }
 
  private:

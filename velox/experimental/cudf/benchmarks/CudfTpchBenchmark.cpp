@@ -87,7 +87,7 @@ void CudfTpchBenchmark::initialize() {
         cudf_velox::loadPropertiesFile(FLAGS_cudf_properties));
   }
 
-  TpchBenchmark::initialize();
+  VerboseTpchBenchmark::initialize();
 
   if (FLAGS_velox_cudf_table_scan) {
     connector::ConnectorRegistry::global().erase(
@@ -186,7 +186,7 @@ CudfTpchBenchmark::listSplits(
 
 void CudfTpchBenchmark::shutdown() {
   cudf_velox::unregisterCudf();
-  TpchBenchmark::shutdown();
+  VerboseTpchBenchmark::shutdown();
 }
 
 int main(int argc, char** argv) {

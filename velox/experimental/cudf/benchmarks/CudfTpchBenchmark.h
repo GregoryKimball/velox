@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "velox/benchmarks/tpch/TpchBenchmark.h"
+#include "velox/experimental/cudf/benchmarks/VerboseTpchBenchmark.h"
 #include "velox/common/base/Exceptions.h"
 
 #include <algorithm>
@@ -27,7 +27,7 @@
 #include <unordered_map>
 #include <vector>
 
-class CudfTpchBenchmark : public TpchBenchmark {
+class CudfTpchBenchmark : public VerboseTpchBenchmark {
  public:
   void initialize() override;
 
