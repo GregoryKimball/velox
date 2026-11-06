@@ -105,6 +105,11 @@ struct EncodedTable {
   int32_t numSegments{0};
   /// Column the rows were sorted by when loaded, or empty.
   std::string clusterKey;
+  /// Set by EncodedColumnCache::moveTo(): the packed streams and kPlain value
+  /// columns are in host memory, and scans stage them with stageSegments().
+  /// Dictionaries and segment params stay in device memory, and
+  /// EncodedColumn::hostSegmentParams holds a host copy of the params.
+  bool hostResident{false};
   std::vector<std::unique_ptr<EncodedColumn>> columns;
   std::unordered_map<std::string, int32_t> columnIndex;
 
@@ -123,6 +128,20 @@ std::unique_ptr<cudf::column> decodeColumn(
     std::span<const int32_t> segments,
     const rmm::device_uvector<int32_t>& deviceSegments,
     std::optional<cudf::column_view> rows,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr);
+
+/// Copies 'columnNames' of a host-resident 'table' for 'segments' into device
+/// memory from 'mr' with bulk copies on 'stream', merging adjacent segments
+/// into one copy. 'segments' must be ascending with only the last one possibly
+/// short. The result holds those segments in order as segments 0 to n-1, so
+/// decodeColumn() reads it with segment ids 0 to n-1. Copies issued from
+/// pinned host memory are asynchronous; keep the result alive until work on
+/// 'stream' that reads it has completed.
+std::unique_ptr<EncodedTable> stageSegments(
+    const EncodedTable& table,
+    const std::vector<std::string>& columnNames,
+    std::span<const int32_t> segments,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr);
 
@@ -150,9 +169,10 @@ class EncodedColumnCache {
   /// 'releaseDevice', frees the device copies afterwards.
   void copyToHost(cuda::stream_ref stream, bool releaseDevice);
 
-  /// Moves the encoded streams and value columns of every loaded table into
-  /// memory from 'mr', e.g. pinned host memory that kernels read in place.
-  /// 'mr' must outlive the cache contents.
+  /// Moves the packed streams and kPlain value columns of every loaded table
+  /// into pinned host memory from 'mr' and marks the tables hostResident.
+  /// Dictionaries and segment params stay in device memory. 'mr' must outlive
+  /// the cache contents.
   void moveTo(cuda::stream_ref stream, rmm::device_async_resource_ref mr);
 
   /// CSV size report: rows, codec, device and host bytes per column.

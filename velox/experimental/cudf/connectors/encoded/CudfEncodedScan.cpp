@@ -33,6 +33,7 @@
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 
 #include <algorithm>
+#include <numeric>
 
 namespace facebook::velox::cudf_velox::connector::encoded {
 
@@ -75,6 +76,17 @@ CudfEncodedScan::CudfEncodedScan(
         connectorQueryCtx_->memoryPool(),
         spec_.optimizeQueryCtx->queryConfig());
   }
+  if (spec_.table->hostResident) {
+    stagedColumnNames_ = spec_.filterColumnNames;
+    stagedColumnNames_.insert(
+        stagedColumnNames_.end(),
+        spec_.outputColumnNames.begin(),
+        spec_.outputColumnNames.end());
+  }
+}
+
+void CudfEncodedScan::EventDeleter::operator()(cudaEvent_t event) const {
+  cudaEventDestroy(event);
 }
 
 exec::BlockingReason CudfEncodedScan::isBlocked(ContinueFuture* future) {
@@ -86,7 +98,7 @@ exec::BlockingReason CudfEncodedScan::isBlocked(ContinueFuture* future) {
 }
 
 bool CudfEncodedScan::isFinished() {
-  return noMoreSplits_ && pendingSegments_.empty();
+  return noMoreSplits_ && pendingSegments_.empty() && !prefetched_;
 }
 
 int64_t CudfEncodedScan::decodeRowsTarget() const {
@@ -149,33 +161,91 @@ bool CudfEncodedScan::fillPending(int64_t decodeRows) {
   return true;
 }
 
+bool CudfEncodedScan::takeBatch(Batch& batch) {
+  const auto decodeRows = decodeRowsTarget();
+  if (!fillPending(decodeRows)) {
+    return false;
+  }
+  if (pendingSegments_.empty()) {
+    return true;
+  }
+  const auto& table = *spec_.table;
+  int64_t rows = 0;
+  for (;;) {
+    const auto segment = pendingSegments_.front();
+    pendingSegments_.pop_front();
+    batch.segments.push_back(segment);
+    rows += table.segmentSize(segment);
+    if (pendingSegments_.empty() ||
+        table.segmentSize(segment) < table.segmentRows ||
+        pendingSegments_.front() <= segment ||
+        rows + table.segmentSize(pendingSegments_.front()) > decodeRows) {
+      break;
+    }
+  }
+  pendingRows_ -= rows;
+  if (!table.hostResident) {
+    return true;
+  }
+  uint64_t timeUs{0};
+  {
+    MicrosecondWallTimer timer(&timeUs);
+    auto stream = cudfGlobalStreamPool().get_stream();
+    batch.table = stageSegments(
+        table, stagedColumnNames_, batch.segments, stream, get_temp_mr());
+    cudaEvent_t event;
+    VELOX_CHECK(
+        cudaEventCreateWithFlags(&event, cudaEventDisableTiming) ==
+            cudaSuccess,
+        "Creating a staging event failed");
+    batch.staged.reset(event);
+    VELOX_CHECK(
+        cudaEventRecord(event, stream.get()) == cudaSuccess,
+        "Recording a staging event failed");
+  }
+  int64_t stagedBytes = 0;
+  for (const auto& column : batch.table->columns) {
+    stagedBytes += column->encodedBytes();
+  }
+  auto lockedStats = stats_.wlock();
+  lockedStats->addRuntimeStat(
+      "encodedStagedBytes",
+      RuntimeCounter(stagedBytes, RuntimeCounter::Unit::kBytes));
+  lockedStats->addRuntimeStat(
+      "encodedStageIssueTime",
+      RuntimeCounter(timeUs * 1000, RuntimeCounter::Unit::kNanos));
+  return true;
+}
+
 RowVectorPtr CudfEncodedScan::doGetOutput() {
   blockingReason_ = exec::BlockingReason::kNotBlocked;
-  while (!isFinished()) {
-    const auto decodeRows = decodeRowsTarget();
-    if (!fillPending(decodeRows)) {
-      return nullptr;
+  for (;;) {
+    Batch batch;
+    if (prefetched_) {
+      batch = std::move(*prefetched_);
+      prefetched_.reset();
+    } else if (isFinished()) {
+      break;
+    } else {
+      if (!takeBatch(batch)) {
+        return nullptr;
+      }
+      if (batch.segments.empty()) {
+        continue;
+      }
     }
-    if (pendingSegments_.empty()) {
-      continue;
+    if (spec_.table->hostResident) {
+      Batch next;
+      if (takeBatch(next) && !next.segments.empty()) {
+        prefetched_ = std::move(next);
+      }
     }
-    std::vector<int32_t> segments;
-    int64_t rows = 0;
-    do {
-      const auto segment = pendingSegments_.front();
-      pendingSegments_.pop_front();
-      segments.push_back(segment);
-      rows += spec_.table->segmentSize(segment);
-    } while (!pendingSegments_.empty() &&
-             rows + spec_.table->segmentSize(pendingSegments_.front()) <=
-                 decodeRows);
-    pendingRows_ -= rows;
-    auto output = decodeBatch(segments);
-    if (pendingSegments_.empty() && unfinishedSplits_ > 0) {
+    auto output = decodeBatch(batch);
+    if (pendingSegments_.empty() && !prefetched_ && unfinishedSplits_ > 0) {
       driverCtx_->task->splitsFinished(planNodeId(), *driverCtx_);
       unfinishedSplits_ = 0;
     }
-    if (output != nullptr) {
+    if (output != nullptr || blockingFuture_.valid()) {
       return output;
     }
   }
@@ -186,14 +256,23 @@ RowVectorPtr CudfEncodedScan::doGetOutput() {
   return nullptr;
 }
 
-RowVectorPtr CudfEncodedScan::decodeBatch(
-    const std::vector<int32_t>& segments) {
+RowVectorPtr CudfEncodedScan::decodeBatch(const Batch& batch) {
   uint64_t timeUs{0};
   std::optional<MicrosecondWallTimer> timer(std::in_place, &timeUs);
   auto stream = cudfGlobalStreamPool().get_stream();
   auto outputMr = get_output_mr();
   auto tempMr = get_temp_mr();
 
+  // A staged batch holds its segments as segments 0 to n-1 of 'table'.
+  const auto& table = batch.table ? *batch.table : *spec_.table;
+  std::vector<int32_t> segments = batch.segments;
+  if (batch.table) {
+    std::iota(segments.begin(), segments.end(), 0);
+    VELOX_CHECK(
+        cudaStreamWaitEvent(stream.get(), batch.staged.get(), 0) ==
+            cudaSuccess,
+        "Waiting for staged segments failed");
+  }
   rmm::device_uvector<int32_t> deviceSegments(segments.size(), stream, tempMr);
   VELOX_CHECK(
       cudaMemcpyAsync(
@@ -204,7 +283,7 @@ RowVectorPtr CudfEncodedScan::decodeBatch(
           stream.get()) == cudaSuccess,
       "Copying segment ids to the device failed");
   int64_t numRows = 0;
-  for (auto segment : segments) {
+  for (auto segment : batch.segments) {
     numRows += spec_.table->segmentSize(segment);
   }
   const int64_t inputRows = numRows;
@@ -218,8 +297,8 @@ RowVectorPtr CudfEncodedScan::decodeBatch(
     std::vector<cudf::column_view> views;
     for (const auto& name : spec_.filterColumnNames) {
       decoded.push_back(decodeColumn(
-          *spec_.table,
-          spec_.table->column(name),
+          table,
+          table.column(name),
           segments,
           deviceSegments,
           std::nullopt,
@@ -283,8 +362,8 @@ RowVectorPtr CudfEncodedScan::decodeBatch(
       continue;
     }
     columns.push_back(decodeColumn(
-        *spec_.table,
-        spec_.table->column(name),
+        table,
+        table.column(name),
         segments,
         deviceSegments,
         rows ? std::optional<cudf::column_view>(rows->view()) : std::nullopt,
@@ -301,7 +380,7 @@ RowVectorPtr CudfEncodedScan::decodeBatch(
     lockedStats->rawInputPositions += inputRows;
     lockedStats->addRuntimeStat("encodedBatches", RuntimeCounter(1));
     lockedStats->addRuntimeStat(
-        "encodedBatchSegments", RuntimeCounter(segments.size()));
+        "encodedBatchSegments", RuntimeCounter(batch.segments.size()));
     if (!spec_.filterColumnNames.empty()) {
       lockedStats->addRuntimeStat(
           "encodedRowsDecodedForFilter", RuntimeCounter(inputRows));

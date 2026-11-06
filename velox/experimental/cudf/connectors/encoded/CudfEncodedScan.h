@@ -25,7 +25,10 @@
 #include <cudf/ast/expressions.hpp>
 #include <cudf/scalar/scalar.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <deque>
+#include <optional>
 
 namespace facebook::velox::cudf_velox::connector::encoded {
 
@@ -40,6 +43,12 @@ namespace facebook::velox::cudf_velox::connector::encoded {
 /// uses the pass rate observed so far, starting from one segment. A batch
 /// decodes at most CudfConfig::batchSizeMaxThreshold rows, or
 /// kDefaultMaxDecodeRows when that is unset, but always at least one segment.
+/// A batch ends after a short segment or before a segment that does not follow
+/// the previous one in order.
+///
+/// For a host-resident table, each batch's columns are first copied to device
+/// memory with bulk copies (stageSegments()), and the copies of the next batch
+/// are issued on their own stream before the current batch is decoded.
 class CudfEncodedScan : public CudfSourceOperatorBase {
  public:
   static constexpr int64_t kDefaultMaxDecodeRows = 1 << 24;
@@ -57,6 +66,18 @@ class CudfEncodedScan : public CudfSourceOperatorBase {
   RowVectorPtr doGetOutput() override;
 
  private:
+  struct EventDeleter {
+    void operator()(cudaEvent_t event) const;
+  };
+
+  struct Batch {
+    std::vector<int32_t> segments;
+    // Device copy of 'segments' of a host-resident table, complete when
+    // 'staged' is reached.
+    std::unique_ptr<EncodedTable> table;
+    std::unique_ptr<CUevent_st, EventDeleter> staged;
+  };
+
   // Queues the surviving segments of splits until 'decodeRows' rows are
   // pending, the splits run out, or the task blocks. Returns false if blocked.
   bool fillPending(int64_t decodeRows);
@@ -64,8 +85,12 @@ class CudfEncodedScan : public CudfSourceOperatorBase {
   // Rows to decode for the next batch, from the targets and the pass rate.
   int64_t decodeRowsTarget() const;
 
-  // Decodes and filters 'segments' into one batch, or null if no row passes.
-  RowVectorPtr decodeBatch(const std::vector<int32_t>& segments);
+  // Takes the next batch of pending segments into 'batch', empty if none are
+  // pending, and starts staging it. Returns false if blocked.
+  bool takeBatch(Batch& batch);
+
+  // Decodes and filters 'batch' into one vector, or null if no row passes.
+  RowVectorPtr decodeBatch(const Batch& batch);
 
   exec::DriverCtx* const driverCtx_;
   memory::MemoryPool* const connectorPool_;
@@ -83,6 +108,10 @@ class CudfEncodedScan : public CudfSourceOperatorBase {
   bool noMoreSplits_{false};
   // Splits taken from the task since splitsFinished() was last called.
   int32_t unfinishedSplits_{0};
+  // The next batch of a host-resident table, taken and staging.
+  std::optional<Batch> prefetched_;
+  // Columns copied to device memory for each batch of a host-resident table.
+  std::vector<std::string> stagedColumnNames_;
 
   exec::BlockingReason blockingReason_{exec::BlockingReason::kNotBlocked};
   ContinueFuture blockingFuture_{ContinueFuture::makeEmpty()};

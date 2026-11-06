@@ -21,6 +21,7 @@
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/encode.hpp>
 #include <cudf/io/parquet.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/reduction/distinct_count.hpp>
 #include <cudf/sorting.hpp>
 #include <cudf/strings/strings_column_view.hpp>
@@ -29,6 +30,7 @@
 #include <cudf/unary.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
+#include <rmm/device_buffer.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cub/block/block_reduce.cuh>
@@ -37,6 +39,7 @@
 #include <cuda/std/limits>
 
 #include <algorithm>
+#include <functional>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -663,16 +666,273 @@ void EncodedColumnCache::moveTo(
     rmm::device_async_resource_ref mr) {
   for (auto& [_, table] : tables_) {
     for (auto& column : table->columns) {
+      column->hostSegmentParams.resize(column->segmentParams.size());
+      checkCuda(
+          cudaMemcpyAsync(
+              column->hostSegmentParams.data(),
+              column->segmentParams.data(),
+              column->segmentParams.size() * sizeof(SegmentParams),
+              cudaMemcpyDeviceToHost,
+              stream.get()),
+          "copy segment params to host");
       column->packed = rmm::device_uvector<uint64_t>(column->packed, stream, mr);
-      column->segmentParams = rmm::device_uvector<SegmentParams>(
-          column->segmentParams, stream, mr);
-      if (column->values) {
+      if (column->values && column->codec == Codec::kPlain) {
         column->values =
             std::make_unique<cudf::column>(column->values->view(), stream, mr);
       }
       stream.sync();
     }
+    table->hostResident = true;
   }
+}
+
+namespace {
+
+template <typename T>
+__global__ void addToOffsetsKernel(T* offsets, int64_t n, T delta) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) {
+    offsets[i] += delta;
+  }
+}
+
+// Ascending runs of adjacent segments, as [first, last] segment ids.
+std::vector<std::pair<int32_t, int32_t>> segmentRuns(
+    std::span<const int32_t> segments) {
+  std::vector<std::pair<int32_t, int32_t>> runs;
+  for (auto segment : segments) {
+    if (!runs.empty() && runs.back().second + 1 == segment) {
+      runs.back().second = segment;
+    } else {
+      runs.emplace_back(segment, segment);
+    }
+  }
+  return runs;
+}
+
+void copyToDevice(void* dst, const void* src, size_t bytes, cuda::stream_ref stream) {
+  if (bytes > 0) {
+    checkCuda(
+        cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream.get()),
+        "stage to device");
+  }
+}
+
+// Work queued after every copy from pageable memory. A copy from pageable
+// memory waits for the work already on the stream, so the bulk copies from
+// pinned memory are queued last to keep them asynchronous.
+using Deferred = std::vector<std::function<void()>>;
+
+// Stages the packed words and params of 'segments' of a bit-packed stream.
+void stagePacked(
+    const EncodedTable& table,
+    const EncodedColumn& column,
+    std::span<const int32_t> segments,
+    EncodedColumn& staged,
+    Deferred& deferred,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  const auto& params = column.hostSegmentParams;
+  check(
+      params.size() == static_cast<size_t>(table.numSegments),
+      "Host segment params missing for " + column.name);
+  auto wordsOf = [&](int32_t segment) {
+    return (static_cast<uint64_t>(table.segmentSize(segment)) *
+                params[segment].bitWidth +
+            63) /
+        64;
+  };
+  std::vector<SegmentParams> stagedParams;
+  uint64_t numWords = 0;
+  for (auto segment : segments) {
+    auto p = params[segment];
+    p.bitOffset = numWords * 64;
+    stagedParams.push_back(p);
+    numWords += wordsOf(segment);
+  }
+  staged.segmentParams =
+      rmm::device_uvector<SegmentParams>(stagedParams.size(), stream, mr);
+  copyToDevice(
+      staged.segmentParams.data(),
+      stagedParams.data(),
+      stagedParams.size() * sizeof(SegmentParams),
+      stream);
+  staged.packed = rmm::device_uvector<uint64_t>(numWords + 1, stream, mr);
+  checkCuda(
+      cudaMemsetAsync(
+          staged.packed.data() + numWords, 0, sizeof(uint64_t), stream.get()),
+      "clear padding word");
+  uint64_t word = 0;
+  for (const auto& [first, last] : segmentRuns(segments)) {
+    uint64_t runWords = 0;
+    for (int32_t s = first; s <= last; ++s) {
+      runWords += wordsOf(s);
+    }
+    deferred.push_back([dst = staged.packed.data() + word,
+                        src = column.packed.data() + params[first].bitOffset / 64,
+                        bytes = runWords * sizeof(uint64_t),
+                        stream] { copyToDevice(dst, src, bytes, stream); });
+    word += runWords;
+  }
+}
+
+// Each run copies one offset past its end, which the next run overwrites, so
+// the last offset of the staged column is its character count.
+template <typename OffsetT>
+std::unique_ptr<cudf::column> stageStrings(
+    const EncodedTable& table,
+    cudf::strings_column_view strings,
+    std::span<const int32_t> segments,
+    Deferred& deferred,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  const auto* offsets = strings.offsets().data<OffsetT>();
+  const char* chars = strings.parent().data<char>();
+  std::vector<std::pair<int64_t, int64_t>> rowRuns;
+  int64_t numRows = 0;
+  int64_t numChars = 0;
+  for (const auto& [first, last] : segmentRuns(segments)) {
+    const int64_t begin = int64_t{first} * table.segmentRows;
+    const int64_t end = int64_t{last} * table.segmentRows + table.segmentSize(last);
+    rowRuns.emplace_back(begin, end);
+    numRows += end - begin;
+    numChars += offsets[end] - offsets[begin];
+  }
+  auto stagedOffsets = cudf::make_fixed_width_column(
+      strings.offsets().type(),
+      static_cast<cudf::size_type>(numRows + 1),
+      cudf::mask_state::UNALLOCATED,
+      stream,
+      mr);
+  auto* outOffsets = stagedOffsets->mutable_view().data<OffsetT>();
+  rmm::device_buffer stagedChars(numChars, stream, mr);
+  auto* outChars = static_cast<char*>(stagedChars.data());
+  int64_t row = 0;
+  int64_t charBase = 0;
+  for (const auto& [begin, end] : rowRuns) {
+    const int64_t runRows = end - begin;
+    const int64_t runChars = offsets[end] - offsets[begin];
+    const auto delta = static_cast<OffsetT>(charBase - offsets[begin]);
+    deferred.push_back([=] {
+      copyToDevice(outChars + charBase, chars + offsets[begin], runChars, stream);
+      copyToDevice(
+          outOffsets + row,
+          offsets + begin,
+          (runRows + 1) * sizeof(OffsetT),
+          stream);
+      addToOffsetsKernel<OffsetT>
+          <<<numBlocks(runRows + 1), kThreads, 0, stream.get()>>>(
+              outOffsets + row, runRows + 1, delta);
+      checkCuda(cudaGetLastError(), "addToOffsetsKernel");
+    });
+    row += runRows;
+    charBase += runChars;
+  }
+  return cudf::make_strings_column(
+      static_cast<cudf::size_type>(numRows),
+      std::move(stagedOffsets),
+      std::move(stagedChars),
+      0,
+      cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
+}
+
+std::unique_ptr<cudf::column> stageFixedWidth(
+    const EncodedTable& table,
+    cudf::column_view values,
+    std::span<const int32_t> segments,
+    Deferred& deferred,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  const auto width = cudf::size_of(values.type());
+  int64_t numRows = 0;
+  for (auto segment : segments) {
+    numRows += table.segmentSize(segment);
+  }
+  auto staged = cudf::make_fixed_width_column(
+      values.type(),
+      static_cast<cudf::size_type>(numRows),
+      cudf::mask_state::UNALLOCATED,
+      stream,
+      mr);
+  auto* out = static_cast<char*>(staged->mutable_view().head());
+  const auto* in = static_cast<const char*>(values.head()) + values.offset() * width;
+  int64_t row = 0;
+  for (const auto& [first, last] : segmentRuns(segments)) {
+    const int64_t begin = int64_t{first} * table.segmentRows;
+    const int64_t end = int64_t{last} * table.segmentRows + table.segmentSize(last);
+    deferred.push_back([dst = out + row * width,
+                        src = in + begin * width,
+                        bytes = (end - begin) * width,
+                        stream] { copyToDevice(dst, src, bytes, stream); });
+    row += end - begin;
+  }
+  return staged;
+}
+
+} // namespace
+
+std::unique_ptr<EncodedTable> stageSegments(
+    const EncodedTable& table,
+    const std::vector<std::string>& columnNames,
+    std::span<const int32_t> segments,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  check(table.hostResident, "stageSegments needs a host-resident table");
+  check(!segments.empty(), "stageSegments needs segments");
+  for (size_t i = 0; i + 1 < segments.size(); ++i) {
+    check(
+        segments[i] < segments[i + 1] &&
+            table.segmentSize(segments[i]) == table.segmentRows,
+        "Staged segments must be ascending with only the last one short");
+  }
+  auto staged = std::make_unique<EncodedTable>();
+  staged->name = table.name;
+  staged->segmentRows = table.segmentRows;
+  staged->numSegments = static_cast<int32_t>(segments.size());
+  staged->numRows = int64_t{table.segmentRows} * (staged->numSegments - 1) +
+      table.segmentSize(segments.back());
+  staged->clusterKey = table.clusterKey;
+  Deferred deferred;
+  for (const auto& name : columnNames) {
+    if (staged->columnIndex.count(name)) {
+      continue;
+    }
+    const auto& column = table.column(name);
+    auto out = std::make_unique<EncodedColumn>(stream, mr);
+    out->name = column.name;
+    out->type = column.type;
+    out->codec = column.codec;
+    switch (column.codec) {
+      case Codec::kForBitpack:
+        stagePacked(table, column, segments, *out, deferred, stream, mr);
+        break;
+      case Codec::kDictionary:
+        stagePacked(table, column, segments, *out, deferred, stream, mr);
+        out->values = std::make_unique<cudf::column>(
+            column.values->view(), stream, mr);
+        break;
+      case Codec::kPlain:
+        if (column.values->type().id() == cudf::type_id::STRING) {
+          cudf::strings_column_view strings(column.values->view());
+          out->values = strings.offsets().type().id() == cudf::type_id::INT64
+              ? stageStrings<int64_t>(
+                    table, strings, segments, deferred, stream, mr)
+              : stageStrings<int32_t>(
+                    table, strings, segments, deferred, stream, mr);
+        } else {
+          out->values = stageFixedWidth(
+              table, column.values->view(), segments, deferred, stream, mr);
+        }
+        break;
+    }
+    staged->columnIndex.emplace(
+        name, static_cast<int32_t>(staged->columns.size()));
+    staged->columns.push_back(std::move(out));
+  }
+  for (auto& work : deferred) {
+    work();
+  }
+  return staged;
 }
 
 std::string EncodedColumnCache::sizeReport() const {
