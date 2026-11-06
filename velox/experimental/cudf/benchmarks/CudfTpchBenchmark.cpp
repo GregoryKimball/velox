@@ -361,6 +361,9 @@ void CudfTpchBenchmark::runMain(std::ostream& out, RunStats& runStats) {
       std::vector<RowVectorPtr>>
       result;
   for (int32_t repeat = 0; repeat < repeats; ++repeat) {
+    // The previous run's vectors must go before the cursor owning their pool.
+    result.second.clear();
+    result.first.reset();
     const auto start = std::chrono::steady_clock::now();
     result = run(plan, queryConfigs_);
     if (result.first) {
