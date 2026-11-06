@@ -52,25 +52,15 @@ makeEncodedSplits(
     const std::string& table,
     int32_t segmentsPerSplit);
 
-/// Where scans of the encoded tables run.
-enum class EncodedDevice {
-  /// Device-resident tables, decoded and filtered by cuDF in CudfEncodedScan,
-  /// which replaces the TableScan; batches are CudfVectors.
-  kGpu,
-  /// Host-resident tables, decoded and filtered on the CPU; batches are Velox
-  /// vectors, with dictionary strings as DictionaryVectors.
-  kCpu,
-};
-
-/// Scans tables of the EncodedColumnCache. Takes Hive table and column
-/// handles, so plans built for the Hive connector run unchanged.
+/// Scans tables of the EncodedColumnCache on the GPU: each TableScan over it is
+/// replaced by CudfEncodedScan. Takes Hive table and column handles, so plans
+/// built for the Hive connector run unchanged.
 class EncodedConnector final : public velox::connector::Connector {
  public:
   EncodedConnector(
       const std::string& id,
-      EncodedDevice device,
       std::shared_ptr<const config::ConfigBase> config = nullptr)
-      : Connector(id, std::move(config)), device_(device) {}
+      : Connector(id, std::move(config)) {}
 
   std::unique_ptr<velox::connector::DataSource> createDataSource(
       const RowTypePtr& outputType,
@@ -83,17 +73,9 @@ class EncodedConnector final : public velox::connector::Connector {
       velox::connector::ConnectorInsertTableHandlePtr insertTableHandle,
       velox::connector::ConnectorQueryCtx* connectorQueryCtx,
       velox::connector::CommitStrategy commitStrategy) override;
-
-  EncodedDevice device() const {
-    return device_;
-  }
-
- private:
-  const EncodedDevice device_;
 };
 
-/// The columns and filters of one scan, shared by CudfEncodedScan and the CPU
-/// data source.
+/// The columns and filters of one CudfEncodedScan.
 struct EncodedScanSpec {
   EncodedScanSpec(
       const RowTypePtr& outputType,
@@ -128,93 +110,8 @@ struct EncodedScanSpec {
   RowTypePtr filterType;
 };
 
-/// The CPU counterpart of CudfEncodedScan over the host copies of the
-/// tables. Per batch of rows: applies each pushed-down filter to the rows that
-/// passed the previous ones, decoding one value at a time (filters on
-/// dictionary strings test the code against a per-code result computed once),
-/// then evaluates the remaining filter, then decodes only the surviving rows
-/// of the other output columns.
-class EncodedCpuDataSource : public velox::connector::DataSource {
- public:
-  EncodedCpuDataSource(
-      const RowTypePtr& outputType,
-      const velox::connector::ConnectorTableHandlePtr& tableHandle,
-      const velox::connector::ColumnHandleMap& columnHandles,
-      velox::connector::ConnectorQueryCtx* connectorQueryCtx);
-
-  void addSplit(std::shared_ptr<velox::connector::ConnectorSplit> split) override;
-
-  std::optional<RowVectorPtr> next(uint64_t size, ContinueFuture& future)
-      override;
-
-  void addDynamicFilter(
-      column_index_t /*outputChannel*/,
-      const std::shared_ptr<common::Filter>& /*filter*/) override {
-    VELOX_NYI("Dynamic filters are not supported by the encoded connector");
-  }
-
-  const common::SubfieldFilters* getFilters() const override {
-    return &spec_.subfieldFilters;
-  }
-
-  uint64_t getCompletedBytes() override {
-    return 0;
-  }
-
-  uint64_t getCompletedRows() override {
-    return completedRows_;
-  }
-
-  std::unordered_map<std::string, RuntimeMetric> getRuntimeStats() override;
-
- private:
-  struct ColumnFilter {
-    const EncodedColumn* column;
-    const common::Filter* filter;
-    // For kDictionary columns: whether each code passes the filter.
-    std::vector<bool> codePasses;
-  };
-
-  // Decodes 'column' at 'rows' of 'segment' into a vector of 'type'.
-  VectorPtr decode(
-      const EncodedColumn& column,
-      const TypePtr& type,
-      int32_t segment,
-      const std::vector<int32_t>& rows);
-
-  // Returns the dictionary values of a kDictionary column as a flat vector,
-  // built on first use.
-  const VectorPtr& dictionaryValues(const EncodedColumn& column);
-
-  // Returns the next non-empty batch of the current split, or null.
-  RowVectorPtr nextBatch(uint64_t size);
-
-  const RowTypePtr outputType_;
-  memory::MemoryPool* const pool_;
-  core::ExpressionEvaluator* const expressionEvaluator_;
-  EncodedScanSpec spec_;
-
-  std::vector<ColumnFilter> columnFilters_;
-  std::unique_ptr<exec::ExprSet> remainingFilterExprSet_;
-  exec::FilterEvalCtx filterEvalCtx_;
-  std::unordered_map<const EncodedColumn*, VectorPtr> dictionaryValues_;
-  // Keeps the host string data of the tables referenced without copying.
-  std::unordered_map<const EncodedColumn*, BufferPtr> charBuffers_;
-
-  std::shared_ptr<EncodedConnectorSplit> split_;
-  std::vector<int32_t> segments_;
-  size_t segmentIndex_{0};
-  int32_t rowInSegment_{0};
-
-  uint64_t completedRows_{0};
-  uint64_t segmentsScanned_{0};
-  uint64_t segmentsPruned_{0};
-  uint64_t rowsDecodedForFilter_{0};
-  uint64_t rowsPassed_{0};
-};
-
 /// Registers a TableScan adapter ahead of the built-in one that replaces scans
-/// of a GPU EncodedConnector with CudfEncodedScan and defers other scans to
+/// of an EncodedConnector with CudfEncodedScan and defers other scans to
 /// the next adapter. Call after registerCudf().
 void registerEncodedTableScanAdapter();
 

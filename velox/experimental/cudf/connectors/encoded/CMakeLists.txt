@@ -17,7 +17,6 @@ add_library(
   CudfEncodedScan.cpp
   EncodedColumnCache.cu
   EncodedConnector.cpp
-  EncodedCpuDataSource.cpp
 )
 
 target_link_libraries(

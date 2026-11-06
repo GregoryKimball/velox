@@ -77,14 +77,8 @@ struct EncodedColumn {
   /// kPlain: the whole column. kDictionary: the sorted distinct values.
   std::unique_ptr<cudf::column> values;
 
-  /// Host copies of the streams above, filled by
-  /// EncodedColumnCache::copyToHost() for CPU scans. 'hostOffsets' and
-  /// 'hostChars' hold the strings of 'values': numValues + 1 offsets and the
-  /// characters.
-  std::vector<uint64_t> hostPacked;
+  /// Host copy of 'segmentParams' of a host-resident table.
   std::vector<SegmentParams> hostSegmentParams;
-  std::vector<int64_t> hostOffsets;
-  std::vector<char> hostChars;
 
   EncodedColumn(cuda::stream_ref stream, rmm::device_async_resource_ref mr);
 
@@ -168,10 +162,6 @@ class EncodedColumnCache {
   const EncodedTable* findTable(const std::string& name) const;
 
   const EncodedTable& table(const std::string& name) const;
-
-  /// Copies every loaded table to host memory for CPU scans. With
-  /// 'releaseDevice', frees the device copies afterwards.
-  void copyToHost(cuda::stream_ref stream, bool releaseDevice);
 
   void clear();
 

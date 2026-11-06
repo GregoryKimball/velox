@@ -31,7 +31,6 @@
 #include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/device_buffer.hpp>
-#include <rmm/mr/per_device_resource.hpp>
 
 #include <cub/block/block_reduce.cuh>
 #include <cuda/functional>
@@ -853,80 +852,6 @@ const EncodedTable& EncodedColumnCache::table(const std::string& name) const {
   const auto* table = findTable(name);
   check(table != nullptr, "Encoded table " + name + " is not loaded");
   return *table;
-}
-
-void EncodedColumnCache::copyToHost(cuda::stream_ref stream, bool releaseDevice) {
-  auto mr = rmm::mr::get_current_device_resource_ref();
-  for (auto& [_, table] : tables_) {
-    for (auto& column : table->columns) {
-      column->hostPacked.resize(column->packed.size());
-      checkCuda(
-          cudaMemcpyAsync(
-              column->hostPacked.data(),
-              column->packed.data(),
-              column->packed.size() * sizeof(uint64_t),
-              cudaMemcpyDefault,
-              stream.get()),
-          "copy packed words to host");
-      column->hostSegmentParams.resize(column->segmentParams.size());
-      checkCuda(
-          cudaMemcpyAsync(
-              column->hostSegmentParams.data(),
-              column->segmentParams.data(),
-              column->segmentParams.size() * sizeof(SegmentParams),
-              cudaMemcpyDefault,
-              stream.get()),
-          "copy segment params to host");
-      if (column->values) {
-        check(
-            column->values->type().id() == cudf::type_id::STRING,
-            "Host copies support only string value columns");
-        cudf::strings_column_view strings(column->values->view());
-        const auto numOffsets = strings.size() + 1;
-        const auto offsets = strings.offsets();
-        column->hostOffsets.resize(numOffsets);
-        if (offsets.type().id() == cudf::type_id::INT64) {
-          checkCuda(
-              cudaMemcpyAsync(
-                  column->hostOffsets.data(),
-                  offsets.data<int64_t>(),
-                  numOffsets * sizeof(int64_t),
-                  cudaMemcpyDefault,
-                  stream.get()),
-              "copy string offsets to host");
-        } else {
-          std::vector<int32_t> narrow(numOffsets);
-          checkCuda(
-              cudaMemcpyAsync(
-                  narrow.data(),
-                  offsets.data<int32_t>(),
-                  numOffsets * sizeof(int32_t),
-                  cudaMemcpyDefault,
-                  stream.get()),
-              "copy string offsets to host");
-          stream.sync();
-          std::copy(narrow.begin(), narrow.end(), column->hostOffsets.begin());
-        }
-        column->hostChars.resize(strings.chars_size(stream));
-        checkCuda(
-            cudaMemcpyAsync(
-                column->hostChars.data(),
-                strings.chars_begin(stream),
-                column->hostChars.size(),
-                cudaMemcpyDefault,
-                stream.get()),
-            "copy string characters to host");
-      }
-      stream.sync();
-      if (releaseDevice) {
-        column->packed = rmm::device_uvector<uint64_t>(0, stream, mr);
-        column->segmentParams =
-            rmm::device_uvector<SegmentParams>(0, stream, mr);
-        column->values.reset();
-      }
-    }
-  }
-  stream.sync();
 }
 
 namespace {

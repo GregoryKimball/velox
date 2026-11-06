@@ -80,16 +80,12 @@ std::vector<std::shared_ptr<ConnectorSplit>> makeEncodedSplits(
 }
 
 std::unique_ptr<DataSource> EncodedConnector::createDataSource(
-    const RowTypePtr& outputType,
-    const ConnectorTableHandlePtr& tableHandle,
-    const ColumnHandleMap& columnHandles,
-    ConnectorQueryCtx* connectorQueryCtx) {
-  if (device_ == EncodedDevice::kCpu) {
-    return std::make_unique<EncodedCpuDataSource>(
-        outputType, tableHandle, columnHandles, connectorQueryCtx);
-  }
+    const RowTypePtr& /*outputType*/,
+    const ConnectorTableHandlePtr& /*tableHandle*/,
+    const ColumnHandleMap& /*columnHandles*/,
+    ConnectorQueryCtx* /*connectorQueryCtx*/) {
   VELOX_FAIL(
-      "GPU scans of the encoded connector run as CudfEncodedScan; call "
+      "Scans of the encoded connector run as CudfEncodedScan; call "
       "registerEncodedTableScanAdapter() after registerCudf()");
 }
 
@@ -223,8 +219,8 @@ std::vector<int32_t> EncodedScanSpec::pruneSegments(
 
 namespace {
 
-// Whether 'op' is a TableScan over a GPU EncodedConnector.
-bool isGpuEncodedScan(const exec::Operator* op) {
+// Whether 'op' is a TableScan over an EncodedConnector.
+bool isEncodedScan(const exec::Operator* op) {
   if (!op->is<exec::TableScan>()) {
     return false;
   }
@@ -235,9 +231,9 @@ bool isGpuEncodedScan(const exec::Operator* op) {
   if (scanNode == nullptr) {
     return false;
   }
-  const auto connector = std::dynamic_pointer_cast<EncodedConnector>(
-      ConnectorRegistry::tryGet(scanNode->tableHandle()->connectorId()));
-  return connector != nullptr && connector->device() == EncodedDevice::kGpu;
+  return std::dynamic_pointer_cast<EncodedConnector>(
+             ConnectorRegistry::tryGet(
+                 scanNode->tableHandle()->connectorId())) != nullptr;
 }
 
 class EncodedTableScanAdapter : public OperatorAdapter {
@@ -245,7 +241,7 @@ class EncodedTableScanAdapter : public OperatorAdapter {
   EncodedTableScanAdapter() : OperatorAdapter("EncodedTableScan") {}
 
   bool canHandle(const exec::Operator* op) const override {
-    return isGpuEncodedScan(op);
+    return isEncodedScan(op);
   }
 
   bool canRunOnGPU(
