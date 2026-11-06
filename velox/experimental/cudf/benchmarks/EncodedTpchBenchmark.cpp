@@ -41,7 +41,6 @@
 
 #include <chrono>
 #include <filesystem>
-#include <fstream>
 #include <sstream>
 
 DECLARE_string(data_path);
@@ -67,11 +66,6 @@ DEFINE_int32(
     4,
     "Segments per split, the unit of work handed to scan drivers. GPU scans "
     "batch segments across splits up to the cuDF batch-size targets.");
-
-DEFINE_string(
-    encoded_size_report,
-    "",
-    "If set, writes per-column codec and encoded bytes as CSV to this path.");
 
 DEFINE_uint64(
     cudf_local_exchange_buffer_size,
@@ -239,9 +233,6 @@ class EncodedTpchBenchmark : public VerboseTpchBenchmark {
                            std::chrono::steady_clock::now() - start)
                            .count())
                 << std::endl;
-    }
-    if (!FLAGS_encoded_size_report.empty()) {
-      std::ofstream(FLAGS_encoded_size_report) << cache.sizeReport();
     }
   }
 };

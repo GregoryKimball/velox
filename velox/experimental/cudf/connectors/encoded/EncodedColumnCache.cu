@@ -41,7 +41,6 @@
 #include <algorithm>
 #include <functional>
 #include <limits>
-#include <sstream>
 #include <stdexcept>
 
 namespace facebook::velox::cudf_velox::connector::encoded {
@@ -367,18 +366,6 @@ std::unique_ptr<cudf::column> normalize(
 
 } // namespace
 
-const char* codecName(Codec codec) {
-  switch (codec) {
-    case Codec::kPlain:
-      return "plain";
-    case Codec::kForBitpack:
-      return "for_bitpack";
-    case Codec::kDictionary:
-      return "dictionary";
-  }
-  return "unknown";
-}
-
 EncodedColumn::EncodedColumn(
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr)
@@ -391,12 +378,6 @@ int64_t EncodedColumn::encodedBytes() const {
     bytes += values->alloc_size();
   }
   return bytes;
-}
-
-int64_t EncodedColumn::hostBytes() const {
-  return hostPacked.size() * sizeof(uint64_t) +
-      hostSegmentParams.size() * sizeof(SegmentParams) +
-      hostOffsets.size() * sizeof(int64_t) + hostChars.size();
 }
 
 const EncodedColumn& EncodedTable::column(const std::string& columnName) const {
@@ -1194,32 +1175,6 @@ std::unique_ptr<EncodedTable> stageSegments(
     work();
   }
   return staged;
-}
-
-std::string EncodedColumnCache::sizeReport() const {
-  std::vector<std::string> tableNames;
-  for (const auto& [name, _] : tables_) {
-    tableNames.push_back(name);
-  }
-  std::sort(tableNames.begin(), tableNames.end());
-  std::string report = "table,column,codec,rows,segments,encoded_bytes,"
-                       "host_bytes,max_bit_width\n";
-  for (const auto& tableName : tableNames) {
-    const auto& table = *tables_.at(tableName);
-    for (const auto& column : table.columns) {
-      uint32_t maxWidth = 0;
-      for (auto width : column->segmentBitWidth) {
-        maxWidth = std::max(maxWidth, width);
-      }
-      std::ostringstream line;
-      line << tableName << ',' << column->name << ','
-           << codecName(column->codec) << ',' << table.numRows << ','
-           << table.numSegments << ',' << column->encodedBytes() << ','
-           << column->hostBytes() << ',' << maxWidth << '\n';
-      report += line.str();
-    }
-  }
-  return report;
 }
 
 void EncodedColumnCache::clear() {

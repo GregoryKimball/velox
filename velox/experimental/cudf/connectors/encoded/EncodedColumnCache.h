@@ -48,8 +48,6 @@ enum class Codec : uint8_t {
   kDictionary,
 };
 
-const char* codecName(Codec codec);
-
 /// Decode parameters of one segment of a bit-packed stream.
 struct SegmentParams {
   int64_t base;
@@ -92,9 +90,6 @@ struct EncodedColumn {
 
   /// Device bytes held by the column.
   int64_t encodedBytes() const;
-
-  /// Host bytes held by the column.
-  int64_t hostBytes() const;
 };
 
 /// A table held in device memory in encoded form.
@@ -177,9 +172,6 @@ class EncodedColumnCache {
   /// Copies every loaded table to host memory for CPU scans. With
   /// 'releaseDevice', frees the device copies afterwards.
   void copyToHost(cuda::stream_ref stream, bool releaseDevice);
-
-  /// CSV size report: rows, codec, device and host bytes per column.
-  std::string sizeReport() const;
 
   void clear();
 
