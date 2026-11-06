@@ -27,9 +27,15 @@
 #include <unordered_map>
 #include <vector>
 
+/// With --run_query_verbose, prints the wall time of each of the
+/// --num_repeats runs ('Repeat N wall time us: T'), and with --include_results
+/// every column of every result row as '{a, b, ...}'.
 class CudfTpchBenchmark : public TpchBenchmark {
  public:
   void initialize() override;
+
+  void runMain(std::ostream& out, facebook::velox::RunStats& runStats)
+      override;
 
   std::shared_ptr<facebook::velox::config::ConfigBase> makeConnectorProperties()
       override;
@@ -41,6 +47,9 @@ class CudfTpchBenchmark : public TpchBenchmark {
       const facebook::velox::exec::test::TpchPlan& plan) override;
 
   void shutdown() override;
+
+ private:
+  std::shared_ptr<facebook::velox::exec::test::TpchQueryBuilder> queryBuilder_;
 };
 
 namespace facebook::velox::cudf_velox {
