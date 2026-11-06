@@ -16,11 +16,12 @@
 
 // Runs the TPC-H plans of TpchQueryBuilder with every table scan reading the
 // EncodedColumnCache instead of Parquet. The tables are loaded from
-// --data_path and encoded on the GPU before any query runs. With
-// --encoded_device=gpu the plans run on cuDF and the tables stay in device
-// memory, or with --encoded_memory=pinned_host move to pinned host memory;
-// with --encoded_device=cpu they are copied to host memory, the device copies
-// are freed, and the plans run on CPU Velox.
+// --data_path one row group at a time, in file order, and encoded on the GPU
+// before any query runs; sort the files beforehand to cluster them. With
+// --encoded_device=gpu the plans run on cuDF and the tables are kept in device
+// memory, or with --encoded_memory=pinned_host in pinned host memory; with
+// --encoded_device=cpu they are copied to host memory and the plans run on CPU
+// Velox.
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/benchmarks/CudfTpchBenchmark.h"
@@ -67,18 +68,6 @@ DEFINE_int32(
     "Segments per split, the unit of work handed to scan drivers. GPU scans "
     "batch segments across splits up to the cuDF batch-size targets.");
 
-DEFINE_bool(
-    encoded_cluster,
-    true,
-    "Sort lineitem by l_shipdate and orders by o_orderdate when loading.");
-
-DEFINE_bool(
-    encoded_load_row_groups,
-    false,
-    "Load each table one Parquet row group at a time, storing the encoded "
-    "data directly in its final memory, for tables larger than device memory. "
-    "Needs --encoded_cluster=false; sort the files beforehand to cluster.");
-
 DEFINE_string(
     encoded_size_report,
     "",
@@ -113,15 +102,15 @@ namespace encoded = facebook::velox::cudf_velox::connector::encoded;
 
 namespace {
 
-const std::vector<std::pair<std::string, std::string>> kTables = {
-    {"lineitem", "l_shipdate"},
-    {"orders", "o_orderdate"},
-    {"customer", ""},
-    {"part", ""},
-    {"partsupp", ""},
-    {"supplier", ""},
-    {"nation", ""},
-    {"region", ""},
+const std::vector<std::string> kTables = {
+    "lineitem",
+    "orders",
+    "customer",
+    "part",
+    "partsupp",
+    "supplier",
+    "nation",
+    "region",
 };
 
 std::vector<std::string> parquetFiles(const std::string& tableDir) {
@@ -213,29 +202,16 @@ class EncodedTpchBenchmark : public TpchBenchmark {
     auto& cache = encoded::EncodedColumnCache::instance();
     static rmm::mr::pinned_host_memory_resource pinnedHost;
     const bool hostStorage = !gpu || FLAGS_encoded_memory == "pinned_host";
-    VELOX_USER_CHECK(
-        !FLAGS_encoded_load_row_groups || !FLAGS_encoded_cluster,
-        "--encoded_load_row_groups needs --encoded_cluster=false");
-    for (const auto& [table, clusterKey] : kTables) {
+    for (const auto& table : kTables) {
       const auto start = std::chrono::steady_clock::now();
-      if (FLAGS_encoded_load_row_groups) {
-        cache.loadTableByRowGroups(
-            table,
-            parquetFiles(FLAGS_data_path + "/" + table),
-            FLAGS_encoded_segment_rows,
-            stream,
-            mr,
-            hostStorage ? rmm::device_async_resource_ref(pinnedHost) : mr,
-            hostStorage);
-      } else {
-        cache.loadTable(
-            table,
-            parquetFiles(FLAGS_data_path + "/" + table),
-            FLAGS_encoded_cluster ? clusterKey : "",
-            FLAGS_encoded_segment_rows,
-            stream,
-            mr);
-      }
+      cache.loadTable(
+          table,
+          parquetFiles(FLAGS_data_path + "/" + table),
+          FLAGS_encoded_segment_rows,
+          stream,
+          mr,
+          hostStorage ? rmm::device_async_resource_ref(pinnedHost) : mr,
+          hostStorage);
       const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::steady_clock::now() - start)
                           .count();
@@ -251,17 +227,6 @@ class EncodedTpchBenchmark : public TpchBenchmark {
                        loaded.numSegments,
                        bytes,
                        ms)
-                << std::endl;
-    }
-    if (gpu && FLAGS_encoded_memory == "pinned_host" &&
-        !FLAGS_encoded_load_row_groups) {
-      const auto start = std::chrono::steady_clock::now();
-      cache.moveTo(stream, pinnedHost);
-      std::cout << fmt::format(
-                       "Moved encoded tables to pinned host memory: {} ms",
-                       std::chrono::duration_cast<std::chrono::milliseconds>(
-                           std::chrono::steady_clock::now() - start)
-                           .count())
                 << std::endl;
     }
     if (!gpu) {

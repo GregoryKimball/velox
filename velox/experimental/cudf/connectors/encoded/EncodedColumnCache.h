@@ -103,10 +103,9 @@ struct EncodedTable {
   int64_t numRows{0};
   int32_t segmentRows{0};
   int32_t numSegments{0};
-  /// Column the rows were sorted by when loaded, or empty.
-  std::string clusterKey;
-  /// Set by EncodedColumnCache::moveTo(): the packed streams and kPlain value
-  /// columns are in host memory, and scans stage them with stageSegments().
+  /// Set by EncodedColumnCache::loadTable() with 'hostResident': the packed
+  /// streams and kPlain value columns are in host memory, and scans stage
+  /// them with stageSegments().
   /// Dictionaries and segment params stay in device memory, and
   /// EncodedColumn::hostSegmentParams holds a host copy of the params.
   bool hostResident{false};
@@ -150,26 +149,18 @@ class EncodedColumnCache {
  public:
   static EncodedColumnCache& instance();
 
-  /// Reads the Parquet file(s) of a table, sorts it by 'clusterKey' if
-  /// non-empty, and encodes it in segments of 'segmentRows' rows.
-  void loadTable(
-      const std::string& name,
-      const std::vector<std::string>& parquetFiles,
-      const std::string& clusterKey,
-      int32_t segmentRows,
-      cuda::stream_ref stream,
-      rmm::device_async_resource_ref mr);
-
-  /// Loads like loadTable() without a cluster key, but reads one row group at
-  /// a time, so tables larger than device memory load. String columns take
-  /// the dictionary codec on the same distinct-count thresholds; each row
-  /// group is read once, its strings coded against its own distinct values and
-  /// recoded to the table's dictionary at the end. The packed streams, those
-  /// interim codes and kPlain value columns are
+  /// Reads the Parquet file(s) of a table one row group at a time, in file
+  /// order, and encodes it in segments of 'segmentRows' rows, so tables larger
+  /// than device memory load; sort the files beforehand to cluster them.
+  /// Integer-like columns are bit-packed. String columns take the dictionary
+  /// codec when they have at most 65,536 distinct values and fewer than one
+  /// per 8 rows: each row group is coded against its own distinct values and
+  /// recoded to the table's dictionary at the end. Other columns are kPlain.
+  /// The packed streams, those interim codes and kPlain value columns are
   /// stored in memory from 'storageMr'. With 'hostResident' that is pinned
-  /// host memory, and the table is marked EncodedTable::hostResident as by
-  /// moveTo(). Dictionaries and segment params use 'mr'.
-  void loadTableByRowGroups(
+  /// host memory and the table is marked EncodedTable::hostResident.
+  /// Dictionaries and segment params use 'mr'.
+  void loadTable(
       const std::string& name,
       const std::vector<std::string>& parquetFiles,
       int32_t segmentRows,
@@ -186,12 +177,6 @@ class EncodedColumnCache {
   /// Copies every loaded table to host memory for CPU scans. With
   /// 'releaseDevice', frees the device copies afterwards.
   void copyToHost(cuda::stream_ref stream, bool releaseDevice);
-
-  /// Moves the packed streams and kPlain value columns of every loaded table
-  /// into pinned host memory from 'mr' and marks the tables hostResident.
-  /// Dictionaries and segment params stay in device memory. 'mr' must outlive
-  /// the cache contents.
-  void moveTo(cuda::stream_ref stream, rmm::device_async_resource_ref mr);
 
   /// CSV size report: rows, codec, device and host bytes per column.
   std::string sizeReport() const;

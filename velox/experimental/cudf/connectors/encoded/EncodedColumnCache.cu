@@ -19,11 +19,8 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
-#include <cudf/dictionary/dictionary_column_view.hpp>
-#include <cudf/dictionary/encode.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/null_mask.hpp>
-#include <cudf/reduction/distinct_count.hpp>
 #include <cudf/search.hpp>
 #include <cudf/sorting.hpp>
 #include <cudf/stream_compaction.hpp>
@@ -495,90 +492,6 @@ EncodedColumnCache& EncodedColumnCache::instance() {
   return cache;
 }
 
-void EncodedColumnCache::loadTable(
-    const std::string& name,
-    const std::vector<std::string>& parquetFiles,
-    const std::string& clusterKey,
-    int32_t segmentRows,
-    cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr) {
-  check(segmentRows > 0, "segmentRows must be positive");
-  auto options = cudf::io::parquet_reader_options::builder(
-                     cudf::io::source_info(parquetFiles))
-                     .build();
-  auto read = cudf::io::read_parquet(options, stream, mr);
-  std::vector<std::string> names;
-  for (const auto& info : read.metadata.schema_info) {
-    names.push_back(info.name);
-  }
-  auto columns = read.tbl->release();
-  for (auto& column : columns) {
-    check(column->null_count() == 0, "Encoded tables do not support nulls yet");
-    column = normalize(std::move(column), stream, mr);
-  }
-  auto loaded = std::make_unique<cudf::table>(std::move(columns));
-
-  if (!clusterKey.empty()) {
-    auto it = std::find(names.begin(), names.end(), clusterKey);
-    check(it != names.end(), "Cluster key " + clusterKey + " not in " + name);
-    const auto keyIndex = static_cast<cudf::size_type>(it - names.begin());
-    loaded = cudf::stable_sort_by_key(
-        loaded->view(),
-        loaded->view().select({keyIndex}),
-        {},
-        {},
-        stream,
-        mr);
-  }
-
-  auto table = std::make_unique<EncodedTable>();
-  table->name = name;
-  table->numRows = loaded->num_rows();
-  table->segmentRows = segmentRows;
-  table->numSegments =
-      static_cast<int32_t>((table->numRows + segmentRows - 1) / segmentRows);
-  table->clusterKey = clusterKey;
-
-  columns = loaded->release();
-  for (size_t i = 0; i < columns.size(); ++i) {
-    auto encoded = std::make_unique<EncodedColumn>(stream, mr);
-    encoded->name = names[i];
-    encoded->type = columns[i]->type();
-    const auto view = columns[i]->view();
-    if (isIntegerLike(encoded->type)) {
-      encoded->codec = Codec::kForBitpack;
-      encodeForBitpack(*encoded, view, segmentRows, stream, mr);
-    } else if (encoded->type.id() == cudf::type_id::STRING) {
-      const auto distinct = cudf::distinct_count(
-          view,
-          cudf::null_policy::INCLUDE,
-          cudf::nan_policy::NAN_IS_VALID,
-          stream);
-      if (distinct <= (1 << 16) && int64_t{distinct} * 8 < table->numRows) {
-        encoded->codec = Codec::kDictionary;
-        auto dictionary = cudf::dictionary::encode(
-            view, cudf::data_type{cudf::type_id::INT32}, stream, mr);
-        cudf::dictionary_column_view dictionaryView(dictionary->view());
-        encoded->values =
-            std::make_unique<cudf::column>(dictionaryView.keys(), stream, mr);
-        encodeForBitpack(
-            *encoded, dictionaryView.indices(), segmentRows, stream, mr);
-      } else {
-        encoded->codec = Codec::kPlain;
-        encoded->values = std::move(columns[i]);
-      }
-    } else {
-      encoded->codec = Codec::kPlain;
-      encoded->values = std::move(columns[i]);
-    }
-    columns[i].reset();
-    table->columnIndex.emplace(encoded->name, static_cast<int32_t>(i));
-    table->columns.push_back(std::move(encoded));
-  }
-  stream.sync();
-  tables_[name] = std::move(table);
-}
-
 namespace {
 
 constexpr cudf::size_type kMaxDictionaryKeys = 1 << 16;
@@ -749,7 +662,7 @@ void decodePieces(
 
 } // namespace
 
-void EncodedColumnCache::loadTableByRowGroups(
+void EncodedColumnCache::loadTable(
     const std::string& name,
     const std::vector<std::string>& parquetFiles,
     int32_t segmentRows,
@@ -1020,31 +933,6 @@ void EncodedColumnCache::copyToHost(cuda::stream_ref stream, bool releaseDevice)
   stream.sync();
 }
 
-void EncodedColumnCache::moveTo(
-    cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr) {
-  for (auto& [_, table] : tables_) {
-    for (auto& column : table->columns) {
-      column->hostSegmentParams.resize(column->segmentParams.size());
-      checkCuda(
-          cudaMemcpyAsync(
-              column->hostSegmentParams.data(),
-              column->segmentParams.data(),
-              column->segmentParams.size() * sizeof(SegmentParams),
-              cudaMemcpyDeviceToHost,
-              stream.get()),
-          "copy segment params to host");
-      column->packed = rmm::device_uvector<uint64_t>(column->packed, stream, mr);
-      if (column->values && column->codec == Codec::kPlain) {
-        column->values =
-            std::make_unique<cudf::column>(column->values->view(), stream, mr);
-      }
-      stream.sync();
-    }
-    table->hostResident = true;
-  }
-}
-
 namespace {
 
 template <typename T>
@@ -1250,7 +1138,6 @@ std::unique_ptr<EncodedTable> stageSegments(
   staged->numSegments = static_cast<int32_t>(segments.size());
   staged->numRows = int64_t{table.segmentRows} * (staged->numSegments - 1) +
       table.segmentSize(segments.back());
-  staged->clusterKey = table.clusterKey;
   Deferred deferred;
   for (const auto& name : columnNames) {
     if (staged->columnIndex.count(name)) {
