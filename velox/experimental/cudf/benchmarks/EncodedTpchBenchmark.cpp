@@ -16,7 +16,7 @@
 
 // Runs the TPC-H plans of TpchQueryBuilder with every table scan reading the
 // EncodedColumnCache instead of Parquet. The tables are loaded from
-// --data_path one row group at a time, in file order, and encoded on the GPU
+// --data_path a few row groups at a time, in file order, and encoded on the GPU
 // before any query runs; sort the files beforehand to cluster them. With
 // --encoded_device=gpu the plans run on cuDF and the tables are kept in device
 // memory, or with --encoded_memory=pinned_host in pinned host memory; with

@@ -149,12 +149,12 @@ class EncodedColumnCache {
  public:
   static EncodedColumnCache& instance();
 
-  /// Reads the Parquet file(s) of a table one row group at a time, in file
+  /// Reads the Parquet file(s) of a table a few row groups at a time, in file
   /// order, and encodes it in segments of 'segmentRows' rows, so tables larger
   /// than device memory load; sort the files beforehand to cluster them.
   /// Integer-like columns are bit-packed. String columns take the dictionary
   /// codec when they have at most 65,536 distinct values and fewer than one
-  /// per 8 rows: each row group is coded against its own distinct values and
+  /// per 8 rows: each piece read is coded against its own distinct values and
   /// recoded to the table's dictionary at the end. Other columns are kPlain.
   /// The packed streams, those interim codes and kPlain value columns are
   /// stored in memory from 'storageMr'. With 'hostResident' that is pinned

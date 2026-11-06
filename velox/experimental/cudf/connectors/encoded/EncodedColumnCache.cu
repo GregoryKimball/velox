@@ -496,27 +496,42 @@ namespace {
 
 constexpr cudf::size_type kMaxDictionaryKeys = 1 << 16;
 
-// Reads row groups of 'files' one at a time and calls 'consume' with each,
-// after normalize(), and whether it is the last.
+// Rows to read per read_parquet() call. Small row groups are read together,
+// as each call parses the file footer again.
+constexpr int64_t kReadRows = 1 << 22;
+
+// Reads 'files' in runs of consecutive row groups of at least kReadRows rows,
+// or one row group if it is larger, and calls 'consume' with each run after
+// normalize(), and whether it is the last.
 template <typename Consume>
 void forEachRowGroup(
     const std::vector<std::string>& files,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr,
     Consume consume) {
-  std::vector<std::pair<size_t, cudf::size_type>> rowGroups;
+  std::vector<std::pair<size_t, std::vector<cudf::size_type>>> runs;
   for (size_t f = 0; f < files.size(); ++f) {
     const auto metadata =
         cudf::io::read_parquet_metadata(cudf::io::source_info(files[f]));
+    const auto rowGroups = metadata.rowgroup_metadata();
+    // Runs do not span files.
+    int64_t rows = 0;
     for (cudf::size_type g = 0; g < metadata.num_rowgroups(); ++g) {
-      rowGroups.emplace_back(f, g);
+      if (rows == 0) {
+        runs.emplace_back(f, std::vector<cudf::size_type>{});
+      }
+      runs.back().second.push_back(g);
+      rows += rowGroups[g].at("num_rows");
+      if (rows >= kReadRows) {
+        rows = 0;
+      }
     }
   }
-  for (size_t i = 0; i < rowGroups.size(); ++i) {
-    const auto [file, group] = rowGroups[i];
+  for (size_t i = 0; i < runs.size(); ++i) {
+    const auto& [file, groups] = runs[i];
     auto options = cudf::io::parquet_reader_options::builder(
                        cudf::io::source_info(files[file]))
-                       .row_groups({{group}})
+                       .row_groups({groups})
                        .build();
     auto read = cudf::io::read_parquet(options, stream, mr);
     auto columns = read.tbl->release();
@@ -528,7 +543,7 @@ void forEachRowGroup(
     consume(
         std::make_unique<cudf::table>(std::move(columns)),
         read.metadata,
-        i + 1 == rowGroups.size());
+        i + 1 == runs.size());
   }
 }
 
