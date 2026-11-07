@@ -90,9 +90,6 @@ class CudfFilterProject : public CudfOperatorBase {
   std::vector<std::pair<column_index_t, std::unique_ptr<cudf::scalar>>>
       constantProjections_;
   CudfExpressionPtr filterEvaluator_;
-
-  std::vector<velox::exec::IdentityProjection> resultProjections_;
-  std::vector<velox::exec::IdentityProjection> identityProjections_;
 };
 
 /// True when 'projection' is a plan constant over a zero-column 'inputType'.
