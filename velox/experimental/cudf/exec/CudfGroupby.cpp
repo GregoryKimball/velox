@@ -1334,14 +1334,18 @@ std::unique_ptr<GroupbyAggregator> createGroupbyAggregator(
         *aggregate.countInputKind,
         aggregate.resultType,
         aggregate.maskIndex);
-  } else if (kind.rfind(prefix + "min", 0) == 0) {
+  } else if (
+      kind.rfind(prefix + "min", 0) == 0 ||
+      kind.rfind(prefix + "bool_and", 0) == 0) {
     return std::make_unique<GroupbyMinAggregator>(
         aggregate.companionStep,
         aggregate.inputIndex,
         aggregate.constant,
         aggregate.resultType,
         aggregate.maskIndex);
-  } else if (kind.rfind(prefix + "max", 0) == 0) {
+  } else if (
+      kind.rfind(prefix + "max", 0) == 0 ||
+      kind.rfind(prefix + "bool_or", 0) == 0) {
     return std::make_unique<GroupbyMaxAggregator>(
         aggregate.companionStep,
         aggregate.inputIndex,
@@ -1428,7 +1432,8 @@ std::unique_ptr<StreamingGroupbyAggregator> createStreamingGroupbyAggregator(
     return std::make_unique<StreamingGroupbySumAggregator>(
         inputIndex, resultType);
   }
-  if (aggregate.kind == prefix + "min") {
+  if (aggregate.kind == prefix + "min" ||
+      aggregate.kind == prefix + "bool_and") {
     if (!cudf::groupby::is_streaming_groupby_supported(
             cudf_velox::veloxToCudfDataType(inputType),
             cudf::aggregation::MIN)) {
@@ -1437,7 +1442,8 @@ std::unique_ptr<StreamingGroupbyAggregator> createStreamingGroupbyAggregator(
     return std::make_unique<StreamingGroupbyMinAggregator>(
         inputIndex, resultType);
   }
-  if (aggregate.kind == prefix + "max") {
+  if (aggregate.kind == prefix + "max" ||
+      aggregate.kind == prefix + "bool_or") {
     if (!cudf::groupby::is_streaming_groupby_supported(
             cudf_velox::veloxToCudfDataType(inputType),
             cudf::aggregation::MAX)) {
