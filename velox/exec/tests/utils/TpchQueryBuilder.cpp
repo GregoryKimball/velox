@@ -2379,6 +2379,48 @@ TpchPlan TpchQueryBuilder::getQ21Plan() const {
   core::PlanNodeId nationScanNodeId;
   const std::string receiptCommitFilter = "l_receiptdate > l_commitdate";
 
+  // Order keys of the late lineitems of SAUDI ARABIA suppliers: every order
+  // that can qualify. Semi joins on these keep the lineitem inputs of the
+  // EXISTS and NOT EXISTS joins to those orders, a few million rows instead of
+  // the whole table.
+  std::vector<core::PlanNodeId> keyLineitemScanNodeIds;
+  std::vector<core::PlanNodeId> keySupplierScanNodeIds;
+  std::vector<core::PlanNodeId> keyNationScanNodeIds;
+  auto candidateOrderKeys = [&](const std::string& name) {
+    auto nationKeys = PlanBuilder(planNodeIdGenerator, pool_.get())
+                          .setParseOptions(decimalParseOptions())
+                          .filtersAsNode(filtersAsNode_)
+                          .tableScan(
+                              kNation,
+                              nationRowType,
+                              nationFileColumns,
+                              {"n_name = 'SAUDI ARABIA'"})
+                          .captureScanNodeId(keyNationScanNodeIds.emplace_back())
+                          .planNode();
+    auto suppliers =
+        PlanBuilder(planNodeIdGenerator, pool_.get())
+            .setParseOptions(decimalParseOptions())
+            .filtersAsNode(filtersAsNode_)
+            .tableScan(kSupplier, supplierRowType, supplierFileColumns)
+            .captureScanNodeId(keySupplierScanNodeIds.emplace_back())
+            .hashJoin(
+                {"s_nationkey"}, {"n_nationkey"}, nationKeys, "", {"s_suppkey"})
+            .planNode();
+    return PlanBuilder(planNodeIdGenerator, pool_.get())
+        .setParseOptions(decimalParseOptions())
+        .filtersAsNode(filtersAsNode_)
+        .tableScan(
+            kLineitem,
+            lineitem1RowType,
+            lineitem1FileColumns,
+            {},
+            receiptCommitFilter)
+        .captureScanNodeId(keyLineitemScanNodeIds.emplace_back())
+        .hashJoin({"l_suppkey"}, {"s_suppkey"}, suppliers, "", {"l_orderkey"})
+        .project({fmt::format("l_orderkey as {}", name)})
+        .planNode();
+  };
+
   auto lineitem3 =
       PlanBuilder(planNodeIdGenerator, pool_.get())
 .setParseOptions(decimalParseOptions())
@@ -2391,6 +2433,13 @@ TpchPlan TpchQueryBuilder::getQ21Plan() const {
               receiptCommitFilter)
           .captureScanNodeId(lineitem3ScanNodeId)
           .project({"l_orderkey as l_orderkey_3", "l_suppkey as l_suppkey_3"})
+          .hashJoin(
+              {"l_orderkey_3"},
+              {"key_3"},
+              candidateOrderKeys("key_3"),
+              "",
+              {"l_orderkey_3", "l_suppkey_3"},
+              core::JoinType::kLeftSemiFilter)
           .planNode();
 
   auto nation = PlanBuilder(planNodeIdGenerator, pool_.get())
@@ -2465,6 +2514,13 @@ TpchPlan TpchQueryBuilder::getQ21Plan() const {
           .project({"l_orderkey as l_orderkey_2", "l_suppkey as l_suppkey_2"})
           .hashJoin(
               {"l_orderkey_2"},
+              {"key_2"},
+              candidateOrderKeys("key_2"),
+              "",
+              {"l_orderkey_2", "l_suppkey_2"},
+              core::JoinType::kLeftSemiFilter)
+          .hashJoin(
+              {"l_orderkey_2"},
               {"l_orderkey_1"},
               ordersJoinLineitem1,
               "l_suppkey_2 <> l_suppkey_1",
@@ -2493,6 +2549,15 @@ TpchPlan TpchQueryBuilder::getQ21Plan() const {
   context.dataFiles[lineitem3ScanNodeId] = getTableFilePaths(kLineitem);
   context.dataFiles[ordersScanNodeId] = getTableFilePaths(kOrders);
   context.dataFiles[nationScanNodeId] = getTableFilePaths(kNation);
+  for (const auto& id : keyLineitemScanNodeIds) {
+    context.dataFiles[id] = getTableFilePaths(kLineitem);
+  }
+  for (const auto& id : keySupplierScanNodeIds) {
+    context.dataFiles[id] = getTableFilePaths(kSupplier);
+  }
+  for (const auto& id : keyNationScanNodeIds) {
+    context.dataFiles[id] = getTableFilePaths(kNation);
+  }
   context.dataFileFormat = format_;
   return context;
 }
