@@ -64,7 +64,7 @@ ColumnOrView JitExpression::eval(
       }
     } else {
       return cudf::compute_column_jit(
-          astInputTableView, expr_.cudfTree_.back(), stream, mr);
+          astInputTableView, expr_.cudfTree_.back(), {}, stream, mr);
     }
   }();
   if (finalize) {
