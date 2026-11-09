@@ -44,6 +44,29 @@ Generate TPC-H parquet data using the [velox-testing](https://github.com/rapidsa
 ./velox_cudf_tpch_benchmark --data_path=/path/to/tpch/sf100 --data_format=parquet
 ```
 
+### Encoded Column Cache
+
+`--encoded` loads the tables into the in-memory encoded column cache and scans
+them from there instead of Parquet (`--encoded_memory=pinned_host` keeps them in
+pinned host memory). The cache encodes rows in file order, in segments of
+`--encoded_segment_rows` rows, and prunes segments by min/max, so sort the files
+beforehand: `prepare_tpch_encoded.py` writes decimal TPC-H with lineitem sorted
+by `l_shipdate` and orders by `o_orderdate`. The same files give the same cache.
+
+```bash
+pip install tpchgen-cli duckdb pyarrow
+python3 prepare_tpch_encoded.py --scale-factor 100 --out /path/to/tpch_sf100
+
+echo "cudf.batch_size_min_threshold=16777216" > cudf.properties
+TPCH_Q11_FRACTION=0.0000010000 ./velox_cudf_tpch_benchmark \
+  --data_path=/path/to/tpch_sf100 --data_format=parquet --num_drivers=4 \
+  --encoded --encoded_memory=pinned_host --cudf_properties=cudf.properties \
+  --num_repeats=4 --run_queries=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22
+```
+
+`--run_queries` runs the queries in one process, so the tables load once.
+`TPCH_Q11_FRACTION` is `0.0001 / SF`.
+
 ---
 
 ## TPC-DS Benchmark
