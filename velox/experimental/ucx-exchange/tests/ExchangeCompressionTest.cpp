@@ -96,7 +96,7 @@ class ExchangeCompressionTest : public testing::Test {
     auto plan = std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
         task_->planFragment().planNode);
     return std::make_unique<UcxPartitionedOutput>(
-        0, driver_.get(), plan, manager_);
+        0, driver_.get(), plan, /*eagerFlush=*/false, manager_);
   }
 
   std::vector<Packet> produce(
