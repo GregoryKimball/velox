@@ -108,6 +108,12 @@ velox_add_cudf_test(
 )
 
 velox_add_cudf_test(
+  NAME velox_cudf_hive_partition_function_test
+  SOURCES Main.cpp CudfHivePartitionFunctionTest.cpp
+  LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_vector_fuzzer velox_hive_connector
+)
+
+velox_add_cudf_test(
   NAME velox_cudf_gpu_capabilities_test
   SOURCES Main.cpp GpuCapabilitiesTest.cpp
   LIBS velox_cudf_exec Folly::folly gmock
