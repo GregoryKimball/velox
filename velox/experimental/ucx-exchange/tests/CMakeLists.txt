@@ -16,6 +16,7 @@ add_executable(
   ucx_exchange_test
   ExchangeCompressionWireTest.cpp
   ExchangeCompressionTest.cpp
+  ExchangeStoreTest.cpp
   UcxOutputQueueManagerTest.cpp
   UcxPartitionedOutputTest.cpp
   UcxExchangeTest.cpp

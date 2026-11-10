@@ -30,6 +30,7 @@ set(
   IntraNodeTransferRegistry.cpp
   ExchangeCompressionWire.cpp
   ExchangeCompression.cpp
+  ExchangeStore.cpp
 )
 
 # Generate a header containing the module basenames (without .cpp extension)
