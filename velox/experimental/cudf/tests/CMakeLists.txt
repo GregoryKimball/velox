@@ -107,6 +107,19 @@ velox_add_cudf_test(
   LIBS velox_cudf_exec Folly::folly
 )
 
+if(VELOX_ENABLE_UCX_EXCHANGE)
+  velox_add_cudf_test(
+    NAME velox_cudf_exchange_store_table_test
+    SOURCES Main.cpp ExchangeStoreTableTest.cpp
+    LIBS
+      ${CUDF_TEST_DEFAULT_LIBS}
+      velox_cudf_exec_test_lib
+      velox_cudf_hive_connector
+      velox_hive_connector
+      velox_ucx_exchange
+  )
+endif()
+
 velox_add_cudf_test(
   NAME velox_cudf_hive_partition_function_test
   SOURCES Main.cpp CudfHivePartitionFunctionTest.cpp

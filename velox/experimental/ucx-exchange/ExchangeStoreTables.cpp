@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
+#include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
@@ -142,6 +143,18 @@ class ExchangeStoreWriterFactory : public dwio::common::WriterFactory {
   const ExchangeCompression compression_;
 };
 
+// Returns the path of the file a Hive split reads, whichever Hive connector
+// made it.
+const std::string& filePath(const connector::ConnectorSplit& split) {
+  if (auto cudfSplit = dynamic_cast<
+          const cudf_velox::connector::hive::CudfHiveConnectorSplit*>(&split)) {
+    return cudfSplit->filePath;
+  }
+  auto hiveSplit = dynamic_cast<const HiveConnectorSplit*>(&split);
+  VELOX_CHECK_NOT_NULL(hiveSplit, "Not a Hive split: {}", split.toString());
+  return hiveSplit->filePath;
+}
+
 // Returns, for each split of a temporary table, the payloads the writer kept
 // for its file, with the scan's columns.
 class ExchangeStoreDataSource : public connector::DataSource {
@@ -177,9 +190,7 @@ class ExchangeStoreDataSource : public connector::DataSource {
 
   void addSplit(std::shared_ptr<connector::ConnectorSplit> split) override {
     VELOX_CHECK_EQ(next_, payloads_.size(), "The previous split is not done");
-    auto hiveSplit = std::dynamic_pointer_cast<HiveConnectorSplit>(split);
-    VELOX_CHECK_NOT_NULL(hiveSplit);
-    const auto [table, file] = storeKey(hiveSplit->filePath);
+    const auto [table, file] = storeKey(filePath(*split));
     stream_ = cudf_velox::cudfGlobalStreamPool().get_stream();
     payloads_ = ExchangeStore::instance().take(
         table, file, stream_, cudf_velox::get_output_mr());
@@ -201,6 +212,20 @@ class ExchangeStoreDataSource : public connector::DataSource {
     payloads_.clear();
     next_ = 0;
     return nullptr;
+  }
+
+  // Takes over a source that the scan created to preload the next split. Its
+  // addSplit() has already taken the split's payloads from the store and
+  // copied the host tier's ones to the device.
+  void setFromDataSource(std::unique_ptr<DataSource> source) override {
+    auto* preloaded = dynamic_cast<ExchangeStoreDataSource*>(source.get());
+    VELOX_CHECK_NOT_NULL(preloaded);
+    VELOX_CHECK_EQ(next_, payloads_.size(), "The previous split is not done");
+    stream_ = preloaded->stream_;
+    payloads_ = std::move(preloaded->payloads_);
+    next_ = preloaded->next_;
+    completedRows_ += preloaded->completedRows_;
+    completedBytes_ += preloaded->completedBytes_;
   }
 
   void addDynamicFilter(
