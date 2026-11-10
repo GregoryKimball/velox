@@ -22,6 +22,7 @@
 #include "velox/common/testutil/TempDirectoryPath.h"
 #include "velox/connectors/hive/HiveConnectorSplit.h"
 #include "velox/connectors/hive/HivePartitionFunction.h"
+#include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/exec/tests/utils/QueryAssertions.h"
@@ -114,10 +115,16 @@ TEST_P(ExchangeStoreTableTest, readsEachBucketFromItsFile) {
                                  {},
                                  kCudfHiveConnectorId)
                              .planNode();
-  AssertQueryBuilder(writePlan).copyResults(pool());
+  std::shared_ptr<facebook::velox::exec::Task> writeTask;
+  AssertQueryBuilder(writePlan).copyResults(pool(), writeTask);
+  // The TableWriter kept its GPU input and the sink bucketed it on the GPU.
+  const auto writeStats = facebook::velox::exec::toPlanStats(
+      writeTask->taskStats());
+  const auto& tableWriteStats = writeStats.at(writePlan->id()).customStats;
+  ASSERT_EQ(tableWriteStats.count("exchangeStoreGpuBatches"), 1);
+  EXPECT_GT(tableWriteStats.at("exchangeStoreGpuBatches").sum, 0);
   auto& store = ucx_exchange::ExchangeStore::instance();
-  // Each file's slices of the three batches are packed as one payload.
-  EXPECT_EQ(store.stats().payloads, kNumBuckets);
+  EXPECT_GE(store.stats().payloads, kNumBuckets);
   if (GetParam() == 0) {
     EXPECT_EQ(store.stats().deviceBytes, 0);
     EXPECT_GT(store.stats().hostBytes, 0);

@@ -90,6 +90,24 @@ class TableWriter : public Operator {
   static constexpr std::string_view kWriteCompressionTime{
       "writeCompressionWallNanos"};
 
+ protected:
+  /// Same as above, with the operator type of a subclass that replaces a
+  /// TableWriter, whose memory pool name must differ from the original's.
+  TableWriter(
+      int32_t operatorId,
+      DriverCtx* driverCtx,
+      const core::TableWriteNodePtr& tableWriteNode,
+      std::string_view operatorTypeName);
+
+  /// Returns the columns of 'input' that the data sink takes, in its order.
+  /// A subclass that receives another kind of vector maps it itself.
+  virtual RowVectorPtr mapInput(const RowVectorPtr& input) const;
+
+  /// The position in the input of each column the data sink takes.
+  const std::vector<column_index_t>& inputMapping() const {
+    return inputMapping_;
+  }
+
  private:
   // The memory reclaimer customized for connector which interface with the
   // memory arbitrator to reclaim memory from the file writers created within

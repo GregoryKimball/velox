@@ -26,12 +26,23 @@ TableWriter::TableWriter(
     int32_t operatorId,
     DriverCtx* driverCtx,
     const core::TableWriteNodePtr& tableWriteNode)
+    : TableWriter(
+          operatorId,
+          driverCtx,
+          tableWriteNode,
+          OperatorType::kTableWrite) {}
+
+TableWriter::TableWriter(
+    int32_t operatorId,
+    DriverCtx* driverCtx,
+    const core::TableWriteNodePtr& tableWriteNode,
+    std::string_view operatorTypeName)
     : Operator(
           driverCtx,
           tableWriteNode->outputType(),
           operatorId,
           tableWriteNode->id(),
-          OperatorType::kTableWrite,
+          operatorTypeName,
           tableWriteNode->canSpill(driverCtx->queryConfig())
               ? driverCtx->makeSpillConfig(
                     operatorId,
@@ -185,27 +196,29 @@ void TableWriter::addInput(RowVectorPtr input) {
 
   checkNotNullConstraints(input);
 
-  std::vector<VectorPtr> mappedChildren;
-  mappedChildren.reserve(inputMapping_.size());
-  for (const auto i : inputMapping_) {
-    mappedChildren.emplace_back(input->childAt(i));
-  }
-
-  const auto mappedInput = std::make_shared<RowVector>(
-      input->pool(),
-      mappedInputType_,
-      input->nulls(),
-      input->size(),
-      mappedChildren,
-      input->getNullCount());
-
-  dataSink_->appendData(mappedInput);
+  dataSink_->appendData(mapInput(input));
   numWrittenRows_ += input->size();
   updateStats(dataSink_->stats());
 
   if (statsCollector_ != nullptr) {
     statsCollector_->addInput(input);
   }
+}
+
+RowVectorPtr TableWriter::mapInput(const RowVectorPtr& input) const {
+  std::vector<VectorPtr> mappedChildren;
+  mappedChildren.reserve(inputMapping_.size());
+  for (const auto i : inputMapping_) {
+    mappedChildren.emplace_back(input->childAt(i));
+  }
+
+  return std::make_shared<RowVector>(
+      input->pool(),
+      mappedInputType_,
+      input->nulls(),
+      input->size(),
+      mappedChildren,
+      input->getNullCount());
 }
 
 void TableWriter::noMoreInput() {

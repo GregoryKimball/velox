@@ -19,7 +19,9 @@
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
+#include "velox/experimental/cudf/exec/CudfHivePartitionFunction.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 #include "velox/experimental/ucx-exchange/ExchangeStore.h"
@@ -30,9 +32,12 @@
 #include "velox/dwio/common/FileSink.h"
 #include "velox/dwio/common/Writer.h"
 #include "velox/dwio/common/WriterFactory.h"
+#include "velox/common/base/RuntimeMetrics.h"
 #include "velox/exec/Task.h"
+#include "velox/exec/TableWriter.h"
 
 #include <cudf/concatenate.hpp>
+#include <cudf/partitioning.hpp>
 
 #include <cstring>
 #include <numeric>
@@ -85,6 +90,16 @@ class ExchangeStoreWriter : public dwio::common::Writer {
   }
 
   void flush() override {}
+
+  // Adds a payload that the sink packed on the GPU.
+  void addPayload(
+      PackedExchangePayload payload,
+      vector_size_t numRows,
+      cuda::stream_ref stream) {
+    checkRunning();
+    ExchangeStore::instance().add(
+        table_, file_, std::move(payload), numRows, stream);
+  }
 
   bool finish() override {
     return true;
@@ -176,6 +191,224 @@ class ExchangeStoreWriterFactory : public dwio::common::WriterFactory {
 
  private:
   const ExchangeCompression compression_;
+};
+
+// Runtime stat of the TableWriter: batches bucketed and packed on the GPU.
+constexpr const char* kGpuBatches{"exchangeStoreGpuBatches"};
+
+// A HiveDataSink whose files are kept in the exchange store. GPU input is
+// bucketed, split and packed on the GPU, one cuDF call per step for all
+// buckets, and each bucket's payload goes to the writer of the bucket's file.
+// CPU input takes HiveDataSink's path.
+class ExchangeStoreDataSink : public connector::hive::HiveDataSink {
+ public:
+  ExchangeStoreDataSink(
+      RowTypePtr inputType,
+      std::shared_ptr<const connector::hive::HiveInsertTableHandle>
+          insertTableHandle,
+      const connector::ConnectorQueryCtx* connectorQueryCtx,
+      connector::CommitStrategy commitStrategy,
+      const std::shared_ptr<const connector::hive::HiveConfig>& hiveConfig,
+      ExchangeCompression compression)
+      : HiveDataSink(
+            inputType,
+            insertTableHandle,
+            connectorQueryCtx,
+            commitStrategy,
+            hiveConfig,
+            std::make_shared<ExchangeStoreWriterFactory>(
+                insertTableHandle->storageFormat(), compression)),
+        inputType_(inputType),
+        pool_(connectorQueryCtx->memoryPool()),
+        compression_(compression),
+        gpuBucketFunction_(makeGpuBucketFunction(inputType, *insertTableHandle)) {}
+
+  void appendData(RowVectorPtr input) override {
+    auto gpuInput = std::dynamic_pointer_cast<cudf_velox::CudfVector>(input);
+    if (gpuInput == nullptr) {
+      HiveDataSink::appendData(std::move(input));
+      return;
+    }
+    if (!gpuBucketFunction_.has_value()) {
+      // The bucket function has no GPU version: bucket on the CPU.
+      HiveDataSink::appendData(cudf_velox::with_arrow::toVeloxColumn(
+          gpuInput->getTableView(),
+          pool_,
+          inputType_,
+          "",
+          gpuInput->stream(),
+          cudf_velox::get_temp_mr()));
+      return;
+    }
+    checkRunning();
+    if (input->size() == 0) {
+      return;
+    }
+    const auto stream = gpuInput->stream();
+    const auto table = gpuInput->getTableView();
+    const auto buckets =
+        gpuBucketFunction_->partitions(table, stream, cudf_velox::get_temp_mr());
+    auto [partitioned, offsets] = cudf::partition(
+        table, buckets->view(), bucketCount_, stream, cudf_velox::get_temp_mr());
+    VELOX_CHECK_EQ(offsets.size(), static_cast<size_t>(bucketCount_) + 1);
+    const std::vector<cudf::size_type> splits(offsets.begin() + 1, offsets.end() - 1);
+    auto payloads = splitExchangePayloads(
+        partitioned->view(),
+        splits,
+        compression_,
+        stream,
+        cudf_velox::get_temp_mr(),
+        cudf_velox::get_output_mr());
+    VELOX_CHECK_EQ(payloads.size(), static_cast<size_t>(bucketCount_));
+    stream.sync();
+    addThreadLocalRuntimeStat(kGpuBatches, RuntimeCounter(1));
+
+    for (int32_t bucket = 0; bucket < bucketCount_; ++bucket) {
+      const auto numRows = offsets[bucket + 1] - offsets[bucket];
+      if (numRows == 0) {
+        continue;
+      }
+      const auto index = ensureWriter(
+          connector::hive::WriterId{std::nullopt, static_cast<uint32_t>(bucket)});
+      auto* writer = dynamic_cast<ExchangeStoreWriter*>(writers_[index].get());
+      VELOX_CHECK_NOT_NULL(writer);
+      const auto bytes = payloads[bucket].logicalDataSize;
+      writer->addPayload(std::move(payloads[bucket]), numRows, stream);
+      auto& info = writerInfo_[index];
+      info->numWrittenRows += numRows;
+      info->currentFileWrittenRows += numRows;
+      info->inputSizeInBytes += bytes;
+    }
+  }
+
+ private:
+  // Returns the GPU version of the table's bucket function, or nothing when
+  // there is none: Presto's native bucket function, partition columns, or a
+  // key type the GPU cannot hash.
+  static std::optional<cudf_velox::CudfHivePartitionFunction>
+  makeGpuBucketFunction(
+      const RowTypePtr& inputType,
+      const connector::hive::HiveInsertTableHandle& insertTableHandle) {
+    const auto& bucketProperty = insertTableHandle.bucketProperty();
+    if (bucketProperty == nullptr ||
+        bucketProperty->kind() !=
+            connector::hive::HiveBucketProperty::Kind::kHiveCompatible ||
+        !insertTableHandle.partitionChannels().empty()) {
+      return std::nullopt;
+    }
+    std::vector<cudf::size_type> keyColumns;
+    for (const auto& name : bucketProperty->bucketedBy()) {
+      const auto channel = inputType->getChildIdx(name);
+      if (!cudf_velox::CudfHivePartitionFunction::supports(
+              cudf_velox::veloxToCudfDataType(inputType->childAt(channel)))) {
+        return std::nullopt;
+      }
+      keyColumns.push_back(static_cast<cudf::size_type>(channel));
+    }
+    return cudf_velox::CudfHivePartitionFunction(
+        bucketProperty->bucketCount(), {}, std::move(keyColumns));
+  }
+
+  const RowTypePtr inputType_;
+  memory::MemoryPool* const pool_;
+  const ExchangeCompression compression_;
+  const std::optional<cudf_velox::CudfHivePartitionFunction> gpuBucketFunction_;
+};
+
+// The TableWriter of a temporary table on the GPU: it hands GPU batches to the
+// exchange store's sink without copying them to the CPU.
+class ExchangeStoreTableWriter : public exec::TableWriter {
+ public:
+  ExchangeStoreTableWriter(
+      int32_t operatorId,
+      exec::DriverCtx* driverCtx,
+      const core::TableWriteNodePtr& tableWriteNode)
+      : exec::TableWriter(
+            operatorId,
+            driverCtx,
+            tableWriteNode,
+            "ExchangeStoreTableWrite") {}
+
+ protected:
+  RowVectorPtr mapInput(const RowVectorPtr& input) const override {
+    auto gpuInput = std::dynamic_pointer_cast<cudf_velox::CudfVector>(input);
+    if (gpuInput == nullptr) {
+      return exec::TableWriter::mapInput(input);
+    }
+    const auto& mapping = inputMapping();
+    std::vector<cudf::size_type> columns(mapping.begin(), mapping.end());
+    std::vector<cudf::size_type> allColumns(gpuInput->getTableView().num_columns());
+    std::iota(allColumns.begin(), allColumns.end(), 0);
+    if (columns == allColumns) {
+      return input;
+    }
+    auto selected = std::make_unique<cudf::table>(
+        gpuInput->getTableView().select(columns),
+        gpuInput->stream(),
+        cudf_velox::get_output_mr());
+    std::vector<std::string> names;
+    std::vector<TypePtr> types;
+    const auto& inputType = asRowType(input->type());
+    for (const auto column : mapping) {
+      names.push_back(inputType->nameOf(column));
+      types.push_back(inputType->childAt(column));
+    }
+    return std::make_shared<cudf_velox::CudfVector>(
+        input->pool(),
+        ROW(std::move(names), std::move(types)),
+        input->size(),
+        std::move(selected),
+        gpuInput->stream());
+  }
+};
+
+// Puts ExchangeStoreTableWriter in place of the TableWriter of a temporary
+// table, so that its input stays on the GPU.
+class ExchangeStoreTableWriteAdapter : public cudf_velox::OperatorAdapter {
+ public:
+  ExchangeStoreTableWriteAdapter() : OperatorAdapter("ExchangeStoreTableWrite") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->is<exec::TableWriter>();
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    auto tableWrite =
+        std::dynamic_pointer_cast<const core::TableWriteNode>(planNode);
+    if (tableWrite == nullptr) {
+      return false;
+    }
+    auto insertTableHandle =
+        std::dynamic_pointer_cast<const connector::hive::HiveInsertTableHandle>(
+            tableWrite->insertTableHandle()->connectorInsertTableHandle());
+    return insertTableHandle != nullptr &&
+        cudf_velox::connector::hive::isTemporaryTable(
+               insertTableHandle->locationHandle()->targetPath());
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return false;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(std::make_unique<ExchangeStoreTableWriter>(
+        operatorId,
+        ctx,
+        std::dynamic_pointer_cast<const core::TableWriteNode>(planNode)));
+    return result;
+  }
 };
 
 // Returns the path of the file a Hive split reads, whichever Hive connector
@@ -334,15 +567,13 @@ class ExchangeStoreTables : public cudf_velox::connector::hive::TemporaryTableSt
       connector::CommitStrategy commitStrategy,
       const std::shared_ptr<const connector::hive::HiveConfig>& hiveConfig)
       override {
-    auto writerFactory = std::make_shared<ExchangeStoreWriterFactory>(
-        insertTableHandle->storageFormat(), compression_);
-    return std::make_unique<connector::hive::HiveDataSink>(
+    return std::make_unique<ExchangeStoreDataSink>(
         std::move(inputType),
         std::move(insertTableHandle),
         connectorQueryCtx,
         commitStrategy,
         hiveConfig,
-        std::move(writerFactory));
+        compression_);
   }
 
   std::unique_ptr<connector::DataSource> createDataSource(
@@ -407,6 +638,10 @@ std::pair<std::string, std::string> storeKey(std::string_view path) {
 
 void registerExchangeStoreTables(uint64_t deviceBytes) {
   ExchangeStore::instance().setDeviceCapacity(deviceBytes);
+  // unregisterCudf() clears the adapters, so this is added on every
+  // registration.
+  cudf_velox::OperatorAdapterRegistry::getInstance().registerAdapterFront(
+      std::make_unique<ExchangeStoreTableWriteAdapter>());
   if (taskListener() == nullptr) {
     taskListener() = std::make_shared<ExchangeStoreTaskListener>();
     exec::registerTaskListener(taskListener());
