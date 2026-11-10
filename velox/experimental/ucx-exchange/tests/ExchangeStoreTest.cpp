@@ -307,6 +307,39 @@ TEST_F(ExchangeStoreTest, dropQueryFreesOnlyThatQuerysTables) {
       testing::SizeIs(1));
 }
 
+TEST_F(ExchangeStoreTest, demotesDeviceTierToHostAndStaysSmaller) {
+  const auto input = makeInput();
+  const auto type = asRowType(input->type());
+  auto payloads = pack(input, {300, 700}, compressions().back());
+  const std::vector<std::size_t> bytes{
+      bytesOf(payloads[0]), bytesOf(payloads[1]), bytesOf(payloads[2])};
+  ExchangeStore store;
+  store.setDeviceCapacity(kUnlimited);
+  store.add("table", "0", std::move(payloads[0]), 300, stream_);
+  store.add("table", "1", std::move(payloads[1]), 400, stream_);
+  ASSERT_EQ(store.stats().deviceBytes, bytes[0] + bytes[1]);
+
+  // A one-byte request moves one payload.
+  const auto moved = store.demote(1);
+  EXPECT_THAT(moved, testing::AnyOf(bytes[0], bytes[1]));
+  EXPECT_EQ(store.stats().hostBytes, moved);
+  EXPECT_EQ(store.stats().deviceBytes, bytes[0] + bytes[1] - moved);
+
+  // The device tier stays at its smaller size: the next payload goes to host.
+  store.add("table", "2", std::move(payloads[2]), 300, stream_);
+  EXPECT_EQ(store.stats().hostBytes, moved + bytes[2]);
+
+  const std::vector<vector_size_t> offsets{0, 300, 700, kNumRows};
+  for (int file = 0; file < 3; ++file) {
+    const auto rows = takeRows(store, "table", std::to_string(file), type);
+    ASSERT_EQ(rows.size(), 1);
+    velox::test::assertEqualVectors(
+        expectedRows(input, offsets[file], offsets[file + 1] - offsets[file]),
+        rows[0]);
+  }
+  EXPECT_EQ(store.demote(1), 0);
+}
+
 TEST_F(ExchangeStoreTest, failsWhenHostTierIsFull) {
   const auto input = makeInput();
   auto payloads = pack(input, {500}, ExchangeCompression::kNone);

@@ -40,6 +40,7 @@
 #include <cudf/partitioning.hpp>
 
 #include <cstring>
+#include <mutex>
 #include <numeric>
 
 namespace facebook::velox::ucx_exchange {
@@ -646,6 +647,13 @@ void registerExchangeStoreTables(uint64_t deviceBytes) {
     taskListener() = std::make_shared<ExchangeStoreTaskListener>();
     exec::registerTaskListener(taskListener());
   }
+  // Releasers cannot be removed, so this one is registered once per process.
+  static std::once_flag releaserRegistered;
+  std::call_once(releaserRegistered, [] {
+    cudf_velox::registerDeviceMemoryReleaser([](std::size_t bytes) {
+      return ExchangeStore::instance().demote(bytes) > 0;
+    });
+  });
   cudf_velox::connector::hive::registerTemporaryTableStorage(
       std::make_shared<ExchangeStoreTables>(parseExchangeCompression(
           cudf_velox::CudfConfig::getInstance().exchangeCompression)));

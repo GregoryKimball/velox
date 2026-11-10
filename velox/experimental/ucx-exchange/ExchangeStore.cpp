@@ -17,6 +17,8 @@
 
 #include "velox/common/base/Exceptions.h"
 
+#include <glog/logging.h>
+
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/pinned_memory.hpp>
 #include <rmm/aligned.hpp>
@@ -196,6 +198,48 @@ void ExchangeStore::dropQuery(std::string_view queryId) {
     }
   }
   // 'dropped' frees both tiers' memory outside the lock.
+}
+
+std::size_t ExchangeStore::demote(std::size_t bytes) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::size_t moved = 0;
+  for (auto& [_, files] : tables_) {
+    for (auto& [__, payloads] : files) {
+      for (auto& payload : payloads) {
+        if (moved >= bytes) {
+          break;
+        }
+        if (payload.host != nullptr || payload.bytes == 0 ||
+            payload.bytes > hostCapacity_ - hostBytes_) {
+          continue;
+        }
+        // The payload's device data is complete (see add()).
+        payload.host = std::make_unique<HostBuffer>(payload.bytes);
+        CUDF_CUDA_TRY(cudaMemcpy(
+            payload.host->data(),
+            payload.device->data(),
+            payload.bytes,
+            cudaMemcpyDeviceToHost));
+        payload.device.reset();
+        deviceBytes_ -= payload.bytes;
+        hostBytes_ += payload.bytes;
+        moved += payload.bytes;
+      }
+    }
+  }
+  if (moved > 0) {
+    // Stay at the smaller device tier, so that the next payloads do not take
+    // the memory back.
+    deviceCapacity_ = deviceBytes_;
+    // The frees are ordered on the payloads' streams. Wait for them, so that
+    // an allocation on any stream can reuse the memory.
+    CUDF_CUDA_TRY(cudaDeviceSynchronize());
+    LOG(WARNING) << "Exchange store: moved " << moved
+                 << " bytes to host memory for a failed " << bytes
+                 << "-byte device allocation; device tier now " << deviceBytes_
+                 << " bytes";
+  }
+  return moved;
 }
 
 ExchangeStore::Stats ExchangeStore::stats() const {

@@ -81,6 +81,12 @@ class ExchangeStore {
   /// Frees the payloads of every table whose name contains 'queryId'.
   void dropQuery(std::string_view queryId);
 
+  /// Moves device-tier payloads to the host tier until at least 'bytes' are
+  /// moved or none is left, and lowers the device tier's capacity to what it
+  /// then holds. Returns the bytes moved. Called when a device allocation
+  /// fails (see releaseDeviceMemory() in GpuResources.h).
+  std::size_t demote(std::size_t bytes);
+
   struct Stats {
     /// Payload bytes in each tier.
     uint64_t deviceBytes{0};
