@@ -19,15 +19,50 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 
 #include "velox/connectors/hive/HiveConnector.h"
+#include "velox/connectors/hive/HiveDataSink.h"
 
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/types.hpp>
 #include <cudf/types.hpp>
 
+#include <memory>
+#include <string_view>
+
 namespace facebook::velox::cudf_velox::connector::hive {
 
 using namespace facebook::velox::connector;
 using namespace facebook::velox::config;
+
+/// Writes and reads Presto's temporary tables, the bucketed tables that hold a
+/// materialized exchange, somewhere other than files.
+class TemporaryTableStorage {
+ public:
+  virtual ~TemporaryTableStorage() = default;
+
+  virtual std::unique_ptr<DataSink> createDataSink(
+      RowTypePtr inputType,
+      std::shared_ptr<const ::facebook::velox::connector::hive::
+                          HiveInsertTableHandle> insertTableHandle,
+      ConnectorQueryCtx* connectorQueryCtx,
+      CommitStrategy commitStrategy,
+      const std::shared_ptr<const ::facebook::velox::connector::hive::
+                                HiveConfig>& hiveConfig) = 0;
+
+  virtual std::unique_ptr<DataSource> createDataSource(
+      const RowTypePtr& outputType,
+      const ConnectorTableHandlePtr& tableHandle,
+      const ColumnHandleMap& columnHandles,
+      ConnectorQueryCtx* connectorQueryCtx) = 0;
+};
+
+/// Routes the temporary tables of every CudfHiveConnector to 'storage', or
+/// back to files when 'storage' is null.
+void registerTemporaryTableStorage(
+    std::shared_ptr<TemporaryTableStorage> storage);
+
+/// Returns whether 'name', a table name or a path, is a Presto temporary
+/// table or one of its files.
+bool isTemporaryTable(std::string_view name);
 
 class CudfHiveConnector final
     : public ::facebook::velox::connector::hive::HiveConnector {
@@ -51,7 +86,13 @@ class CudfHiveConnector final
     return true;
   }
 
-  // TODO (dm): Re-add data sink
+  /// Writes temporary tables to the registered TemporaryTableStorage, and
+  /// everything else as HiveConnector does.
+  std::unique_ptr<DataSink> createDataSink(
+      RowTypePtr inputType,
+      ConnectorInsertTableHandlePtr connectorInsertTableHandle,
+      ConnectorQueryCtx* connectorQueryCtx,
+      CommitStrategy commitStrategy) override;
 
  protected:
   // TODO (dm): rename parquetconfig

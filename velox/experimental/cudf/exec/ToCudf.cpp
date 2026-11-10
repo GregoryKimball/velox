@@ -31,6 +31,7 @@
 #include "velox/experimental/cudf/expression/JitExpression.h"
 #ifdef VELOX_ENABLE_UCX_EXCHANGE
 #include "velox/experimental/ucx-exchange/ExchangeCompression.h"
+#include "velox/experimental/ucx-exchange/ExchangeStoreTables.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeRegistration.h"
 #endif
 
@@ -429,6 +430,10 @@ void registerCudf() {
   if (CudfConfig::getInstance().exchange) {
     ucx_exchange::registerUcxTransports();
   }
+  if (CudfConfig::getInstance().exchangeStore) {
+    ucx_exchange::registerExchangeStoreTables(
+        CudfConfig::getInstance().exchangeStoreDeviceBytes);
+  }
 #endif
 
   isCudfRegistered = true;
@@ -439,6 +444,7 @@ void unregisterCudf() {
   // Unconditionally unregister the UCX transports, whether or not
   // CudfConfig::exchange was set when registerCudf() ran.
   ucx_exchange::unregisterUcxTransports();
+  ucx_exchange::unregisterExchangeStoreTables();
 #endif
   // Reset the any_resource copies before the adaptors they were copied from,
   // so that the wrapped upstream resources are released here.
@@ -586,6 +592,18 @@ void CudfConfig::initialize(
         "UCX exchange maximum queued bytes must be a non-negative integer: {}",
         value);
     exchangeMaxQueuedBytes = maxBytes.value();
+  }
+  if (config.find(kExchangeStore) != config.end()) {
+    exchangeStore = folly::to<bool>(config[kExchangeStore]);
+  }
+  if (config.find(kExchangeStoreDeviceBytes) != config.end()) {
+    const auto& value = config[kExchangeStoreDeviceBytes];
+    const auto bytes = folly::tryTo<int64_t>(value);
+    VELOX_USER_CHECK(
+        bytes.hasValue() && bytes.value() >= 0,
+        "Exchange store device bytes must be a non-negative integer: {}",
+        value);
+    exchangeStoreDeviceBytes = bytes.value();
   }
   if (config.find(kCudfKvikioCacheCopyThreads) != config.end()) {
     kvikioCacheCopyThreads =

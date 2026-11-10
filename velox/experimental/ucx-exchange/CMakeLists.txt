@@ -31,6 +31,7 @@ set(
   ExchangeCompressionWire.cpp
   ExchangeCompression.cpp
   ExchangeStore.cpp
+  ExchangeStoreTables.cpp
 )
 
 # Generate a header containing the module basenames (without .cpp extension)

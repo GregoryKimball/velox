@@ -22,6 +22,8 @@
 
 #include "velox/connectors/hive/HiveDataSource.h"
 
+#include <mutex>
+
 namespace facebook::velox::cudf_velox::connector::hive {
 
 using namespace facebook::velox::connector;
@@ -35,11 +37,67 @@ CudfHiveConnector::CudfHiveConnector(
   VLOG(1) << "cuDF Hive connector created";
 }
 
+namespace {
+
+std::mutex temporaryTableStorageMutex;
+std::shared_ptr<TemporaryTableStorage> temporaryTableStorageInstance;
+
+std::shared_ptr<TemporaryTableStorage> temporaryTableStorage() {
+  std::lock_guard<std::mutex> lock(temporaryTableStorageMutex);
+  return temporaryTableStorageInstance;
+}
+
+} // namespace
+
+void registerTemporaryTableStorage(
+    std::shared_ptr<TemporaryTableStorage> storage) {
+  std::lock_guard<std::mutex> lock(temporaryTableStorageMutex);
+  temporaryTableStorageInstance = std::move(storage);
+}
+
+bool isTemporaryTable(std::string_view name) {
+  // The prefix of every temporary table name, which is also the name of its
+  // directory (HiveMetadata.createTemporaryTable in Presto).
+  return name.find("__presto_temporary_table_") != std::string_view::npos;
+}
+
+std::unique_ptr<DataSink> CudfHiveConnector::createDataSink(
+    RowTypePtr inputType,
+    ConnectorInsertTableHandlePtr connectorInsertTableHandle,
+    ConnectorQueryCtx* connectorQueryCtx,
+    CommitStrategy commitStrategy) {
+  if (auto storage = temporaryTableStorage()) {
+    auto insertTableHandle = std::dynamic_pointer_cast<
+        const ::facebook::velox::connector::hive::HiveInsertTableHandle>(
+        connectorInsertTableHandle);
+    if (insertTableHandle != nullptr &&
+        isTemporaryTable(insertTableHandle->locationHandle()->targetPath())) {
+      return storage->createDataSink(
+          std::move(inputType),
+          std::move(insertTableHandle),
+          connectorQueryCtx,
+          commitStrategy,
+          hiveConfig_);
+    }
+  }
+  return HiveConnector::createDataSink(
+      std::move(inputType),
+      std::move(connectorInsertTableHandle),
+      connectorQueryCtx,
+      commitStrategy);
+}
+
 std::unique_ptr<DataSource> CudfHiveConnector::createDataSource(
     const RowTypePtr& outputType,
     const ConnectorTableHandlePtr& tableHandle,
     const ColumnHandleMap& columnHandles,
     ConnectorQueryCtx* connectorQueryCtx) {
+  if (auto storage = temporaryTableStorage();
+      storage != nullptr && isTemporaryTable(tableHandle->name())) {
+    return storage->createDataSource(
+        outputType, tableHandle, columnHandles, connectorQueryCtx);
+  }
+
   // If it's parquet then return CudfHiveDataSource
   // If it's not parquet then return HiveDataSource
   // TODO (dm): Make this ^^^ happen
@@ -65,8 +123,6 @@ std::unique_ptr<DataSource> CudfHiveConnector::createDataSource(
       connectorQueryCtx,
       hiveConfig_);
 }
-
-// TODO (dm): Re-add data sink
 
 std::shared_ptr<Connector> CudfHiveConnectorFactory::newConnector(
     const std::string& id,

@@ -419,12 +419,15 @@ class HiveDataSink : public FileDataSink {
   /// @param commitStrategy Strategy for committing written data (kNoCommit or
   /// kTaskCommit).
   /// @param hiveConfig Hive connector configuration.
+  /// 'writerFactory' writes the files, in place of the factory registered for
+  /// the table's storage format when not null.
   HiveDataSink(
       RowTypePtr inputType,
       std::shared_ptr<const HiveInsertTableHandle> insertTableHandle,
       const ConnectorQueryCtx* connectorQueryCtx,
       CommitStrategy commitStrategy,
-      const std::shared_ptr<const HiveConfig>& hiveConfig);
+      const std::shared_ptr<const HiveConfig>& hiveConfig,
+      std::shared_ptr<dwio::common::WriterFactory> writerFactory = nullptr);
 
   /// Constructor with explicit bucketing and partitioning parameters.
   ///
@@ -461,7 +464,8 @@ class HiveDataSink : public FileDataSink {
       std::unique_ptr<core::PartitionFunction> bucketFunction,
       const std::vector<column_index_t>& partitionChannels,
       const std::vector<column_index_t>& dataChannels,
-      std::unique_ptr<PartitionIdGenerator> partitionIdGenerator);
+      std::unique_ptr<PartitionIdGenerator> partitionIdGenerator,
+      std::shared_ptr<dwio::common::WriterFactory> writerFactory = nullptr);
 
   bool canReclaim() const;
 

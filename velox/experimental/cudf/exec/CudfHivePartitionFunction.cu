@@ -19,6 +19,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/strings/string_view.cuh>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/device_uvector.hpp>
 
@@ -156,7 +157,8 @@ std::unique_ptr<cudf::column> CudfHivePartitionFunction::partitions(
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const {
   const auto numRows = input.num_rows();
-  rmm::device_uvector<uint32_t> hashes(numRows, stream);
+  rmm::device_uvector<uint32_t> hashes(
+      numRows, stream, cudf::get_current_device_resource_ref());
   for (size_t i = 0; i < keyColumns_.size(); ++i) {
     const auto& column = input.column(keyColumns_[i]);
     CUDF_EXPECTS(
@@ -171,7 +173,10 @@ std::unique_ptr<cudf::column> CudfHivePartitionFunction::partitions(
 
   std::optional<rmm::device_uvector<int32_t>> bucketToPartition;
   if (!bucketToPartition_.empty()) {
-    bucketToPartition.emplace(bucketToPartition_.size(), stream);
+    bucketToPartition.emplace(
+        bucketToPartition_.size(),
+        stream,
+        cudf::get_current_device_resource_ref());
     CUDF_CUDA_TRY(cudaMemcpyAsync(
         bucketToPartition->data(),
         bucketToPartition_.data(),

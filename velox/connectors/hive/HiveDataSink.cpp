@@ -399,7 +399,8 @@ HiveDataSink::HiveDataSink(
     std::shared_ptr<const HiveInsertTableHandle> insertTableHandle,
     const ConnectorQueryCtx* connectorQueryCtx,
     CommitStrategy commitStrategy,
-    const std::shared_ptr<const HiveConfig>& hiveConfig)
+    const std::shared_ptr<const HiveConfig>& hiveConfig,
+    std::shared_ptr<dwio::common::WriterFactory> writerFactory)
     : HiveDataSink(
           inputType,
           insertTableHandle,
@@ -418,7 +419,8 @@ HiveDataSink::HiveDataSink(
               inputType,
               insertTableHandle,
               hiveConfig,
-              connectorQueryCtx)) {}
+              connectorQueryCtx),
+          std::move(writerFactory)) {}
 
 HiveDataSink::HiveDataSink(
     RowTypePtr inputType,
@@ -430,7 +432,8 @@ HiveDataSink::HiveDataSink(
     std::unique_ptr<core::PartitionFunction> bucketFunction,
     const std::vector<column_index_t>& partitionChannels,
     const std::vector<column_index_t>& dataChannels,
-    std::unique_ptr<PartitionIdGenerator> partitionIdGenerator)
+    std::unique_ptr<PartitionIdGenerator> partitionIdGenerator,
+    std::shared_ptr<dwio::common::WriterFactory> writerFactory)
     : FileDataSink(
           std::move(inputType),
           connectorQueryCtx,
@@ -443,7 +446,10 @@ HiveDataSink::HiveDataSink(
           static_cast<int32_t>(bucketCount),
           std::move(bucketFunction),
           std::move(partitionIdGenerator),
-          dwio::common::getWriterFactory(insertTableHandle->storageFormat()),
+          writerFactory != nullptr
+              ? std::move(writerFactory)
+              : dwio::common::getWriterFactory(
+                    insertTableHandle->storageFormat()),
           hiveConfig->maxTargetFileSizeBytes(
               insertTableHandle->storageFormat(),
               connectorQueryCtx->sessionProperties()),

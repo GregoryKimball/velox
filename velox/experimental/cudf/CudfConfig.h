@@ -79,6 +79,9 @@ struct CudfConfig {
       "cudf.partitioned_output_batch_rows"};
   static constexpr const char* kUcxExchangeMaxQueuedBytes{
       "cudf.exchange_max_queued_bytes"};
+  static constexpr const char* kExchangeStore{"cudf.exchange_store"};
+  static constexpr const char* kExchangeStoreDeviceBytes{
+      "cudf.exchange_store_device_bytes"};
   static constexpr const char* kCudfKvikioCacheCopyThreads{
       "cudf.kvikio_cache_copy_threads"};
   /// Query configuration key for selecting UCX exchange compression.
@@ -145,6 +148,15 @@ struct CudfConfig {
   /// queue drains to half of it. Applies in addition to the bound on queued
   /// tables (UcxExchangeSource::kBackpressureHighWaterMark). Zero disables it.
   int64_t exchangeMaxQueuedBytes{0};
+
+  /// Keeps Presto's temporary tables, which hold materialized exchanges, in
+  /// the exchange store in device and pinned host memory instead of files.
+  /// Needs the UCX exchange build.
+  bool exchangeStore{false};
+
+  /// Bytes of temporary table data the exchange store keeps in device memory;
+  /// the rest goes to pinned host memory.
+  int64_t exchangeStoreDeviceBytes{0};
 
   /// Threads that copy KvikIO data from the async data cache to the GPU. One
   /// pool for the whole process, created by the first cached GPU read.

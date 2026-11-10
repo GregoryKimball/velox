@@ -34,7 +34,7 @@
 
 namespace facebook::velox::ucx_exchange {
 
-/// Holds exchange data that a later stage reads back by bucket, in place of
+/// Holds exchange data that a later stage reads back file by file, in place of
 /// the files of a temporary table. Payloads stay in the exchange's packed and
 /// compressed format (see splitExchangePayloads()). A payload is kept in device
 /// memory while the device tier is below its capacity and is moved to pinned
@@ -53,29 +53,29 @@ class ExchangeStore {
   /// limit.
   void setHostCapacity(uint64_t bytes);
 
-  /// Adds 'payload', which holds 'numRows' rows, to 'bucket' of 'table'. The
+  /// Adds 'payload', which holds 'numRows' rows, to 'file' of 'table'. The
   /// payload's device data must be complete. A payload that goes to the host
   /// tier is copied on 'stream', which is synchronized before its device
   /// memory is freed.
   void add(
       std::string_view table,
-      int32_t bucket,
+      std::string_view file,
       PackedExchangePayload payload,
       vector_size_t numRows,
       cuda::stream_ref stream);
 
-  /// Removes the payloads of 'bucket' of 'table' and returns them restored on
+  /// Removes the payloads of 'file' of 'table' and returns them restored on
   /// the device, in the order in which they were added. Payloads in the host
   /// tier are copied to device memory from 'mr' on 'stream'. Fused FOR lanes
   /// payloads are returned before joinExchangeLanes(). Returns nothing for a
-  /// bucket without payloads.
+  /// file without payloads.
   std::vector<std::unique_ptr<PackedTableWithStream>> take(
       std::string_view table,
-      int32_t bucket,
+      std::string_view file,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr);
 
-  /// Frees the payloads of every bucket of 'table' that was not taken.
+  /// Frees the payloads of every file of 'table' that was not taken.
   void drop(std::string_view table);
 
   struct Stats {
@@ -116,14 +116,14 @@ class ExchangeStore {
     vector_size_t numRows{0};
   };
 
-  using Buckets = folly::F14FastMap<int32_t, std::vector<StoredPayload>>;
+  using Files = folly::F14FastMap<std::string, std::vector<StoredPayload>>;
 
   // Subtracts the bytes and count of 'payloads' from the totals. Called with
   // 'mutex_' held.
   void forget(const std::vector<StoredPayload>& payloads);
 
   mutable std::mutex mutex_;
-  folly::F14FastMap<std::string, Buckets> tables_;
+  folly::F14FastMap<std::string, Files> tables_;
   uint64_t deviceCapacity_{0};
   uint64_t hostCapacity_{std::numeric_limits<uint64_t>::max()};
   // Bytes in each tier, including payloads being added.

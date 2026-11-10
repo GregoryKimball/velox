@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/experimental/ucx-exchange/ExchangeStore.h"
+#include "velox/experimental/ucx-exchange/ExchangeStoreTables.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -137,15 +138,15 @@ class ExchangeStoreTest : public testing::Test,
     return payload.packed->gpu_data ? payload.packed->gpu_data->size() : 0;
   }
 
-  // Takes 'bucket' of 'table' from 'store' and converts each payload to a
-  // Velox vector of 'type'.
+  // Takes 'file' of 'table' from 'store' and converts each payload to a Velox
+  // vector of 'type'.
   std::vector<RowVectorPtr> takeRows(
       ExchangeStore& store,
       std::string_view table,
-      int32_t bucket,
+      std::string_view file,
       const RowTypePtr& type) {
     std::vector<RowVectorPtr> rows;
-    for (auto& payload : store.take(table, bucket, stream_, memoryResource())) {
+    for (auto& payload : store.take(table, file, stream_, memoryResource())) {
       joinExchangeLanes(*payload, memoryResource());
       const auto view = payload->table != nullptr
           ? payload->table->view()
@@ -193,7 +194,7 @@ TEST_F(ExchangeStoreTest, roundTripsEveryTpchColumnTypeInEitherTier) {
         totalBytes += bytesOf(payloads[bucket]);
         store.add(
             "table",
-            bucket,
+            std::to_string(bucket),
             std::move(payloads[bucket]),
             offsets[bucket + 1] - offsets[bucket],
             stream_);
@@ -203,7 +204,7 @@ TEST_F(ExchangeStoreTest, roundTripsEveryTpchColumnTypeInEitherTier) {
       EXPECT_EQ(store.stats().payloads, 3);
 
       for (int32_t bucket = 0; bucket < 3; ++bucket) {
-        const auto rows = takeRows(store, "table", bucket, type);
+        const auto rows = takeRows(store, "table", std::to_string(bucket), type);
         ASSERT_EQ(rows.size(), 1);
         velox::test::assertEqualVectors(
             expectedRows(
@@ -224,7 +225,7 @@ TEST_F(ExchangeStoreTest, overflowsToHostWhenDeviceTierIsFull) {
   const std::vector<std::size_t> bytes{
       bytesOf(payloads[0]), bytesOf(payloads[1]), bytesOf(payloads[2])};
 
-  // Room for the first payload only. All three go to one bucket, so the bucket
+  // Room for the first payload only. All three go to one file, so the file
   // spans both tiers and must still come back in order.
   ExchangeStore store;
   store.setDeviceCapacity(bytes[0]);
@@ -232,7 +233,7 @@ TEST_F(ExchangeStoreTest, overflowsToHostWhenDeviceTierIsFull) {
   for (int part = 0; part < 3; ++part) {
     store.add(
         "table",
-        0,
+        "file",
         std::move(payloads[part]),
         offsets[part + 1] - offsets[part],
         stream_);
@@ -240,7 +241,7 @@ TEST_F(ExchangeStoreTest, overflowsToHostWhenDeviceTierIsFull) {
   EXPECT_EQ(store.stats().deviceBytes, bytes[0]);
   EXPECT_EQ(store.stats().hostBytes, bytes[1] + bytes[2]);
 
-  const auto rows = takeRows(store, "table", 0, type);
+  const auto rows = takeRows(store, "table", "file", type);
   ASSERT_EQ(rows.size(), 3);
   for (int part = 0; part < 3; ++part) {
     velox::test::assertEqualVectors(
@@ -251,7 +252,7 @@ TEST_F(ExchangeStoreTest, overflowsToHostWhenDeviceTierIsFull) {
   EXPECT_EQ(store.stats().hostBytes, 0);
 }
 
-TEST_F(ExchangeStoreTest, dropFreesEveryBucketOfOneTableInBothTiers) {
+TEST_F(ExchangeStoreTest, dropFreesEveryFileOfOneTableInBothTiers) {
   const auto input = makeInput();
   const auto type = asRowType(input->type());
   auto dropped = pack(input, {300, 700}, compressions().back());
@@ -261,22 +262,28 @@ TEST_F(ExchangeStoreTest, dropFreesEveryBucketOfOneTableInBothTiers) {
   ExchangeStore store;
   store.setDeviceCapacity(bytesOf(dropped[0]));
   for (int32_t bucket = 0; bucket < 3; ++bucket) {
-    store.add("dropped", bucket, std::move(dropped[bucket]), 1, stream_);
+    store.add(
+        "dropped",
+        std::to_string(bucket),
+        std::move(dropped[bucket]),
+        1,
+        stream_);
   }
   ASSERT_GT(store.stats().hostBytes, 0);
-  store.add("kept", 0, std::move(kept[0]), kNumRows, stream_);
+  store.add("kept", "0", std::move(kept[0]), kNumRows, stream_);
 
   store.drop("dropped");
   EXPECT_EQ(store.stats().deviceBytes + store.stats().hostBytes, keptBytes);
   EXPECT_EQ(store.stats().payloads, 1);
   EXPECT_THAT(
-      store.take("dropped", 0, stream_, memoryResource()), testing::IsEmpty());
+      store.take("dropped", "0", stream_, memoryResource()),
+      testing::IsEmpty());
 
-  const auto rows = takeRows(store, "kept", 0, type);
+  const auto rows = takeRows(store, "kept", "0", type);
   ASSERT_EQ(rows.size(), 1);
   velox::test::assertEqualVectors(expectedRows(input, 0, kNumRows), rows[0]);
   EXPECT_THAT(
-      store.take("kept", 0, stream_, memoryResource()), testing::IsEmpty());
+      store.take("kept", "0", stream_, memoryResource()), testing::IsEmpty());
 }
 
 TEST_F(ExchangeStoreTest, failsWhenHostTierIsFull) {
@@ -287,14 +294,33 @@ TEST_F(ExchangeStoreTest, failsWhenHostTierIsFull) {
   ExchangeStore store;
   store.setDeviceCapacity(0);
   store.setHostCapacity(firstBytes);
-  store.add("table", 0, std::move(payloads[0]), 500, stream_);
+  store.add("table", "0", std::move(payloads[0]), 500, stream_);
   VELOX_ASSERT_THROW(
-      store.add("table", 1, std::move(payloads[1]), 500, stream_),
+      store.add("table", "1", std::move(payloads[1]), 500, stream_),
       "The exchange store's host tier is full");
   EXPECT_EQ(store.stats().hostBytes, firstBytes);
   EXPECT_EQ(store.stats().payloads, 1);
   store.drop("table");
   EXPECT_EQ(store.stats().hostBytes, 0);
+}
+
+TEST(ExchangeStoreTablesTest, keysFilesByTableDirectoryAndFileName) {
+  const std::pair<std::string, std::string> expected{
+      "__presto_temporary_table_PARQUET_q_1", "000003_0_q"};
+  // The writer's path and a split's path, which carries a scheme.
+  EXPECT_EQ(
+      storeKey("/data/hive/__presto_temporary_table_PARQUET_q_1/000003_0_q"),
+      expected);
+  EXPECT_EQ(
+      storeKey(
+          "file:/data/hive/__presto_temporary_table_PARQUET_q_1/000003_0_q"),
+      expected);
+  EXPECT_EQ(
+      storeKey("__presto_temporary_table_PARQUET_q_1/000003_0_q"), expected);
+  VELOX_ASSERT_THROW(storeKey("000003_0_q"), "Not a path to a temporary table");
+  VELOX_ASSERT_THROW(
+      storeKey("/data/__presto_temporary_table_PARQUET_q_1/"),
+      "Not a path to a temporary table");
 }
 
 } // namespace

@@ -50,7 +50,7 @@ void ExchangeStore::setHostCapacity(uint64_t bytes) {
 
 void ExchangeStore::add(
     std::string_view table,
-    int32_t bucket,
+    std::string_view file,
     PackedExchangePayload payload,
     vector_size_t numRows,
     cuda::stream_ref stream) {
@@ -94,30 +94,30 @@ void ExchangeStore::add(
   }
 
   std::lock_guard<std::mutex> lock(mutex_);
-  tables_[std::string{table}][bucket].push_back(std::move(stored));
+  tables_[std::string{table}][std::string{file}].push_back(std::move(stored));
   ++payloads_;
 }
 
 std::vector<std::unique_ptr<PackedTableWithStream>> ExchangeStore::take(
     std::string_view table,
-    int32_t bucket,
+    std::string_view file,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   std::vector<StoredPayload> payloads;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto buckets = tables_.find(table);
-    if (buckets == tables_.end()) {
+    auto files = tables_.find(table);
+    if (files == tables_.end()) {
       return {};
     }
-    auto it = buckets->second.find(bucket);
-    if (it == buckets->second.end()) {
+    auto it = files->second.find(file);
+    if (it == files->second.end()) {
       return {};
     }
     payloads = std::move(it->second);
-    buckets->second.erase(it);
-    if (buckets->second.empty()) {
-      tables_.erase(buckets);
+    files->second.erase(it);
+    if (files->second.empty()) {
+      tables_.erase(files);
     }
     forget(payloads);
   }
@@ -163,7 +163,7 @@ std::vector<std::unique_ptr<PackedTableWithStream>> ExchangeStore::take(
 }
 
 void ExchangeStore::drop(std::string_view table) {
-  Buckets dropped;
+  Files dropped;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = tables_.find(table);
