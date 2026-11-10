@@ -286,6 +286,27 @@ TEST_F(ExchangeStoreTest, dropFreesEveryFileOfOneTableInBothTiers) {
       store.take("kept", "0", stream_, memoryResource()), testing::IsEmpty());
 }
 
+TEST_F(ExchangeStoreTest, dropQueryFreesOnlyThatQuerysTables) {
+  const auto input = makeInput();
+  auto payloads = pack(input, {300, 700}, compressions().back());
+  ExchangeStore store;
+  store.setDeviceCapacity(bytesOf(payloads[0]));
+  store.add("__presto_temporary_table_ORC_q1_a", "0", std::move(payloads[0]), 300, stream_);
+  store.add("__presto_temporary_table_ORC_q1_b", "0", std::move(payloads[1]), 400, stream_);
+  const auto keptBytes = bytesOf(payloads[2]);
+  store.add("__presto_temporary_table_ORC_q2_a", "0", std::move(payloads[2]), 300, stream_);
+
+  store.dropQuery("q1");
+  EXPECT_EQ(store.stats().payloads, 1);
+  EXPECT_EQ(store.stats().deviceBytes + store.stats().hostBytes, keptBytes);
+  EXPECT_THAT(
+      store.take("__presto_temporary_table_ORC_q1_a", "0", stream_, memoryResource()),
+      testing::IsEmpty());
+  EXPECT_THAT(
+      store.take("__presto_temporary_table_ORC_q2_a", "0", stream_, memoryResource()),
+      testing::SizeIs(1));
+}
+
 TEST_F(ExchangeStoreTest, failsWhenHostTierIsFull) {
   const auto input = makeInput();
   auto payloads = pack(input, {500}, ExchangeCompression::kNone);

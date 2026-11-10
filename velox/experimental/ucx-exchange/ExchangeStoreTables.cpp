@@ -30,6 +30,9 @@
 #include "velox/dwio/common/FileSink.h"
 #include "velox/dwio/common/Writer.h"
 #include "velox/dwio/common/WriterFactory.h"
+#include "velox/exec/Task.h"
+
+#include <cudf/concatenate.hpp>
 
 #include <cstring>
 #include <numeric>
@@ -44,6 +47,11 @@ using connector::hive::HiveTableHandle;
 // The content of every placeholder file. A file the writer leaves empty is not
 // reported to the coordinator (FileDataSink::finalizeWriterFile()).
 constexpr std::string_view kPlaceholder{"velox exchange store\n"};
+
+// Rows a writer collects from the CPU before packing them as one payload. The
+// TableWriter hands each file a slice of every batch, which is a small part of
+// the batch when the table has many buckets.
+constexpr vector_size_t kPayloadRows{1'000'000};
 
 // Packs what a temporary table writer receives into the exchange store under
 // the key of its file. The file itself only gets the placeholder.
@@ -69,13 +77,11 @@ class ExchangeStoreWriter : public dwio::common::Writer {
       add(gpuData->getTableView(), data->size(), gpuData->stream());
       return;
     }
-    const auto stream = cudf_velox::cudfGlobalStreamPool().get_stream();
-    auto table = cudf_velox::with_arrow::toCudfTable(
-        std::dynamic_pointer_cast<RowVector>(data),
-        pool_.get(),
-        stream,
-        cudf_velox::get_temp_mr());
-    add(table->view(), data->size(), stream);
+    pending_.push_back(std::dynamic_pointer_cast<RowVector>(data));
+    pendingRows_ += data->size();
+    if (pendingRows_ >= kPayloadRows) {
+      addPending();
+    }
   }
 
   void flush() override {}
@@ -85,6 +91,7 @@ class ExchangeStoreWriter : public dwio::common::Writer {
   }
 
   std::unique_ptr<dwio::common::FileMetadata> close() override {
+    addPending();
     dwio::common::DataBuffer<char> placeholder(*pool_, kPlaceholder.size());
     std::memcpy(placeholder.data(), kPlaceholder.data(), kPlaceholder.size());
     sink_->write(std::move(placeholder));
@@ -95,12 +102,37 @@ class ExchangeStoreWriter : public dwio::common::Writer {
 
   void abort() override {
     // The query fails, so no file of the table will be read.
+    pending_.clear();
     ExchangeStore::instance().drop(table_);
     sink_->close();
     setState(State::kAborted);
   }
 
  private:
+  // Uploads the collected CPU rows and adds them as one payload.
+  void addPending() {
+    if (pending_.empty()) {
+      return;
+    }
+    const auto stream = cudf_velox::cudfGlobalStreamPool().get_stream();
+    std::vector<std::unique_ptr<cudf::table>> tables;
+    std::vector<cudf::table_view> views;
+    for (const auto& rows : pending_) {
+      tables.push_back(cudf_velox::with_arrow::toCudfTable(
+          rows, pool_.get(), stream, cudf_velox::get_temp_mr()));
+      views.push_back(tables.back()->view());
+    }
+    if (views.size() == 1) {
+      add(views[0], pendingRows_, stream);
+    } else {
+      auto table =
+          cudf::concatenate(views, stream, cudf_velox::get_temp_mr());
+      add(table->view(), pendingRows_, stream);
+    }
+    pending_.clear();
+    pendingRows_ = 0;
+  }
+
   void add(cudf::table_view table, vector_size_t numRows, cuda::stream_ref stream) {
     auto payload = packExchangePayload(
         table,
@@ -118,6 +150,9 @@ class ExchangeStoreWriter : public dwio::common::Writer {
   const ExchangeCompression compression_;
   std::string table_;
   std::string file_;
+  // CPU rows not packed yet.
+  std::vector<RowVectorPtr> pending_;
+  vector_size_t pendingRows_{0};
 };
 
 class ExchangeStoreWriterFactory : public dwio::common::WriterFactory {
@@ -323,6 +358,34 @@ class ExchangeStoreTables : public cudf_velox::connector::hive::TemporaryTableSt
   const ExchangeCompression compression_;
 };
 
+// Drops the data of a query whose task did not finish, so that a failed or
+// cancelled query does not leave its temporary tables in the store. A query that
+// finishes reads every file, which takes its data out of the store.
+class ExchangeStoreTaskListener : public exec::TaskListener {
+ public:
+  void onTaskCompletion(
+      const std::string& /*taskUuid*/,
+      const std::string& taskId,
+      exec::TaskState state,
+      std::exception_ptr /*error*/,
+      exec::TaskStats /*stats*/) override {
+    if (state == exec::TaskState::kFinished) {
+      return;
+    }
+    // A Presto task id starts with the query id, which every temporary table
+    // name of the query contains.
+    const auto queryId = std::string_view{taskId}.substr(0, taskId.find('.'));
+    if (!queryId.empty()) {
+      ExchangeStore::instance().dropQuery(queryId);
+    }
+  }
+};
+
+std::shared_ptr<ExchangeStoreTaskListener>& taskListener() {
+  static std::shared_ptr<ExchangeStoreTaskListener> listener;
+  return listener;
+}
+
 } // namespace
 
 std::pair<std::string, std::string> storeKey(std::string_view path) {
@@ -344,6 +407,10 @@ std::pair<std::string, std::string> storeKey(std::string_view path) {
 
 void registerExchangeStoreTables(uint64_t deviceBytes) {
   ExchangeStore::instance().setDeviceCapacity(deviceBytes);
+  if (taskListener() == nullptr) {
+    taskListener() = std::make_shared<ExchangeStoreTaskListener>();
+    exec::registerTaskListener(taskListener());
+  }
   cudf_velox::connector::hive::registerTemporaryTableStorage(
       std::make_shared<ExchangeStoreTables>(parseExchangeCompression(
           cudf_velox::CudfConfig::getInstance().exchangeCompression)));
@@ -351,6 +418,10 @@ void registerExchangeStoreTables(uint64_t deviceBytes) {
 
 void unregisterExchangeStoreTables() {
   cudf_velox::connector::hive::registerTemporaryTableStorage(nullptr);
+  if (taskListener() != nullptr) {
+    exec::unregisterTaskListener(taskListener());
+    taskListener() = nullptr;
+  }
 }
 
 } // namespace facebook::velox::ucx_exchange

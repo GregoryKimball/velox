@@ -78,6 +78,9 @@ class ExchangeStore {
   /// Frees the payloads of every file of 'table' that was not taken.
   void drop(std::string_view table);
 
+  /// Frees the payloads of every table whose name contains 'queryId'.
+  void dropQuery(std::string_view queryId);
+
   struct Stats {
     /// Payload bytes in each tier.
     uint64_t deviceBytes{0};

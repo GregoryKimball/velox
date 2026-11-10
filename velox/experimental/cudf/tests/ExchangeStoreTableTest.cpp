@@ -116,7 +116,8 @@ TEST_P(ExchangeStoreTableTest, readsEachBucketFromItsFile) {
                              .planNode();
   AssertQueryBuilder(writePlan).copyResults(pool());
   auto& store = ucx_exchange::ExchangeStore::instance();
-  EXPECT_GT(store.stats().payloads, 0);
+  // Each file's slices of the three batches are packed as one payload.
+  EXPECT_EQ(store.stats().payloads, kNumBuckets);
   if (GetParam() == 0) {
     EXPECT_EQ(store.stats().deviceBytes, 0);
     EXPECT_GT(store.stats().hostBytes, 0);

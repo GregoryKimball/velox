@@ -179,6 +179,25 @@ void ExchangeStore::drop(std::string_view table) {
   // 'dropped' frees both tiers' memory outside the lock.
 }
 
+void ExchangeStore::dropQuery(std::string_view queryId) {
+  std::vector<Files> dropped;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = tables_.begin(); it != tables_.end();) {
+      if (it->first.find(queryId) == std::string::npos) {
+        ++it;
+        continue;
+      }
+      for (const auto& [_, payloads] : it->second) {
+        forget(payloads);
+      }
+      dropped.push_back(std::move(it->second));
+      it = tables_.erase(it);
+    }
+  }
+  // 'dropped' frees both tiers' memory outside the lock.
+}
+
 ExchangeStore::Stats ExchangeStore::stats() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return Stats{
