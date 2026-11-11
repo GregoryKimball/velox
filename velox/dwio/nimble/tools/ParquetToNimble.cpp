@@ -44,6 +44,10 @@ DEFINE_uint64(
     stripe_raw_size_mb,
     256,
     "Raw (decoded) bytes buffered before a stripe is written");
+DEFINE_string(
+    compression,
+    "Zstd",
+    "Compression of encoded streams: Uncompressed, Zstd or Lz4");
 DEFINE_uint32(zstd_level, 3, "Zstd compression level");
 DEFINE_uint64(
     max_chunk_raw_kb,
@@ -113,8 +117,18 @@ uint64_t convertFile(const FileTask& task, memory::MemoryPool& rootPool) {
 
   facebook::nimble::WriterOptions writerOptions;
   writerOptions.compressionOptions.compressionType =
-      facebook::nimble::CompressionType::Zstd;
+      facebook::nimble::toCompressionType(FLAGS_compression);
   writerOptions.compressionOptions.zstdCompressionLevel = FLAGS_zstd_level;
+  // The default encoding selection policy carries its own compression
+  // options, so it is rebuilt with these.
+  writerOptions.encodingSelectionPolicyCreator =
+      [factory = facebook::nimble::ManualEncodingSelectionPolicyFactory{
+           facebook::nimble::ManualEncodingSelectionPolicyFactory::
+               defaultEncodingReadFactors(),
+           writerOptions.compressionOptions}](
+          facebook::nimble::DataType dataType) {
+        return factory.createPolicy(dataType);
+      };
   if (FLAGS_max_chunk_raw_kb > 0) {
     writerOptions.eagerChunking = true;
     writerOptions.maxStreamChunkRawSize = FLAGS_max_chunk_raw_kb << 10;
