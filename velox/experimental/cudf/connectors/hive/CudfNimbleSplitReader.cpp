@@ -53,8 +53,11 @@ void CudfNimbleSplitReader::prepareSplitInternal(
   VELOX_CHECK_NOT_NULL(fileHandle.get());
   readFile_ = fileHandle->file;
 
+  facebook::nimble::TabletReader::Options tabletOptions;
+  tabletOptions.ioOptions.emplace(connectorQueryCtx_->memoryPool())
+      .setMetadataIoStats(std::make_shared<velox::io::IoStatistics>());
   tablet_ = facebook::nimble::TabletReader::create(
-      readFile_, connectorQueryCtx_->memoryPool(), {});
+      readFile_, connectorQueryCtx_->memoryPool(), tabletOptions);
   compactRowCount_ = tablet_->properties().compactRowCountEncoding();
 
   auto schemaSection = tablet_->loadOptionalSection(
