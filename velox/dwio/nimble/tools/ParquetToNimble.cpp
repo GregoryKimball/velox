@@ -123,9 +123,14 @@ uint64_t convertFile(const FileTask& task, memory::MemoryPool& rootPool) {
     writerOptions.minStreamChunkRawSize = FLAGS_min_chunk_raw_kb << 10;
   }
   const uint64_t stripeRawSize = FLAGS_stripe_raw_size_mb << 20;
+  // stripeRawSize counts only data not yet encoded, which chunking drains, so
+  // the chunks already encoded in the stripe count toward the cut as well.
   writerOptions.flushPolicyFactory = [stripeRawSize]() {
-    return std::make_unique<facebook::nimble::StripeRawSizeFlushPolicy>(
-        stripeRawSize);
+    return std::make_unique<facebook::nimble::LambdaFlushPolicy>(
+        [stripeRawSize](const facebook::nimble::StripeProgress& progress) {
+          return progress.stripeRawSize + progress.stripeEncodedLogicalSize >=
+              stripeRawSize;
+        });
   };
 
   fs::create_directories(task.output.parent_path());
