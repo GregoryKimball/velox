@@ -897,7 +897,8 @@ void decompressPayloads(
           results.data(), count},
       maxSize,
       totalSize,
-      stream);
+      stream,
+      cudf::memory_resources{mr, mr});
   std::vector<cudf::io::detail::codec_exec_result> hostResults(count);
   checkCuda(cudaMemcpyAsync(
       hostResults.data(),
