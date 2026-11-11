@@ -889,9 +889,12 @@ void decompressPayloads(
   cudf::io::detail::decompress(
       codec == Codec::kZstd ? cudf::io::compression_type::ZSTD
                             : cudf::io::compression_type::LZ4,
-      deviceInputs,
-      deviceOutputs,
-      results,
+      cudf::device_span<cudf::device_span<uint8_t const> const>{
+          deviceInputs.data(), count},
+      cudf::device_span<cudf::device_span<uint8_t> const>{
+          deviceOutputs.data(), count},
+      cudf::device_span<cudf::io::detail::codec_exec_result>{
+          results.data(), count},
       maxSize,
       totalSize,
       stream);
