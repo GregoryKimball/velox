@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/tests/utils/CudfHiveConnectorTestBase.h"
 #include "velox/experimental/ucx-exchange/ExchangeStore.h"
 #include "velox/experimental/ucx-exchange/ExchangeStoreTables.h"
@@ -137,7 +138,10 @@ TEST_P(ExchangeStoreTableTest, readsEachBucketFromItsFile) {
                                  kCudfHiveConnectorId)
                              .planNode();
   std::shared_ptr<facebook::velox::exec::Task> writeTask;
-  AssertQueryBuilder(writePlan).copyResults(pool(), writeTask);
+  // Batches reach the writer as they are, so that it collects them.
+  AssertQueryBuilder(writePlan)
+      .config(CudfFromVelox::kGpuBatchSizeRows, std::to_string(kBatchRows))
+      .copyResults(pool(), writeTask);
   // The TableWriter kept its GPU input and the sink bucketed it on the GPU.
   const auto writeStats = facebook::velox::exec::toPlanStats(
       writeTask->taskStats());
@@ -148,7 +152,11 @@ TEST_P(ExchangeStoreTableTest, readsEachBucketFromItsFile) {
   // columns: per batch, the key as differences and the name, quantity and
   // total as dictionaries.
   EXPECT_GT(tableWriteStats.at("exchangeStoreLogicalBytes").sum, 0);
+  // The writer collected the GPU batches it got and packed them together.
+  EXPECT_EQ(
+      tableWriteStats.at("exchangeStoreGpuInputBatches").sum, input.size());
   const auto numBatches = tableWriteStats.at("exchangeStoreGpuBatches").sum;
+  EXPECT_EQ(numBatches, 1);
   EXPECT_EQ(tableWriteStats.at("exchangeStoreDeltaColumns").sum, numBatches);
   EXPECT_EQ(
       tableWriteStats.at("exchangeStoreDictionaryColumns").sum, 3 * numBatches);

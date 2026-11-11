@@ -88,9 +88,10 @@ constexpr const char* kReadDeviceBytes{"exchangeStoreReadDeviceBytes"};
 constexpr const char* kReadHostBytes{"exchangeStoreReadHostBytes"};
 constexpr const char* kReadCopyNanos{"exchangeStoreReadCopyNanos"};
 
-// Rows a writer collects from the CPU before packing them as one payload. The
-// TableWriter hands each file a slice of every batch, which is a small part of
-// the batch when the table has many buckets.
+// Rows a writer collects before packing them. The TableWriter hands each file
+// a slice of every batch, which is a small part of the batch when the table
+// has many buckets, and the encodings need many rows per bucket: a dictionary
+// at least 8 rows per key, differences runs of nearby keys.
 constexpr vector_size_t kPayloadRows{1'000'000};
 
 // Returns the bytes of 'column' uncompressed: its values or characters, null
@@ -477,13 +478,16 @@ class ExchangeStoreWriterFactory : public dwio::common::WriterFactory {
   const ExchangeCompression compression_;
 };
 
-// Runtime stat of the TableWriter: batches bucketed and packed on the GPU.
+// Runtime stats of the TableWriter: the GPU batches it received, and the
+// batches it bucketed and packed on the GPU after collecting them.
+constexpr const char* kGpuInputBatches{"exchangeStoreGpuInputBatches"};
 constexpr const char* kGpuBatches{"exchangeStoreGpuBatches"};
 
 // A HiveDataSink whose files are kept in the exchange store. GPU input is
-// bucketed, split and packed on the GPU, one cuDF call per step for all
-// buckets, and each bucket's payload goes to the writer of the bucket's file.
-// CPU input takes HiveDataSink's path.
+// collected up to kPayloadRows rows, then bucketed, encoded, split and packed
+// on the GPU, one cuDF call per step for all buckets, and each bucket's
+// payload goes to the writer of the bucket's file. CPU input takes
+// HiveDataSink's path.
 class ExchangeStoreDataSink : public connector::hive::HiveDataSink {
  public:
   ExchangeStoreDataSink(
@@ -528,8 +532,55 @@ class ExchangeStoreDataSink : public connector::hive::HiveDataSink {
     if (input->size() == 0) {
       return;
     }
-    const auto stream = gpuInput->stream();
-    const auto table = gpuInput->getTableView();
+    addThreadLocalRuntimeStat(kGpuInputBatches, RuntimeCounter(1));
+    pending_.push_back(std::move(gpuInput));
+    pendingRows_ += input->size();
+    if (pendingRows_ >= kPayloadRows) {
+      storePending();
+    }
+  }
+
+  bool finish() override {
+    if (!pending_.empty()) {
+      storePending();
+    }
+    return HiveDataSink::finish();
+  }
+
+  void abort() override {
+    pending_.clear();
+    pendingRows_ = 0;
+    HiveDataSink::abort();
+  }
+
+ private:
+  // Stores the collected GPU batches as one batch.
+  void storePending() {
+    const auto stream = pending_.back()->stream();
+    std::unique_ptr<cudf::table> concatenated;
+    cudf::table_view table;
+    if (pending_.size() == 1) {
+      table = pending_[0]->getTableView();
+    } else {
+      // Each batch was produced on its own stream.
+      std::vector<cudf::table_view> views;
+      for (const auto& batch : pending_) {
+        batch->stream().sync();
+        views.push_back(batch->getTableView());
+      }
+      concatenated =
+          cudf::concatenate(views, stream, cudf_velox::get_temp_mr());
+      table = concatenated->view();
+    }
+    store(table, stream);
+    // store() synchronizes 'stream' after its last read of the batches.
+    pending_.clear();
+    pendingRows_ = 0;
+  }
+
+  // Buckets, encodes and packs 'table' and hands each bucket's payload to the
+  // writer of the bucket's file.
+  void store(cudf::table_view table, cuda::stream_ref stream) {
     const auto buckets =
         gpuBucketFunction_->partitions(table, stream, cudf_velox::get_temp_mr());
     auto [partitioned, offsets] =
@@ -581,7 +632,6 @@ class ExchangeStoreDataSink : public connector::hive::HiveDataSink {
     }
   }
 
- private:
   // Returns the GPU version of the table's bucket function, or nothing when
   // there is none: Presto's native bucket function, partition columns, or a
   // key type the GPU cannot hash.
@@ -613,6 +663,9 @@ class ExchangeStoreDataSink : public connector::hive::HiveDataSink {
   memory::MemoryPool* const pool_;
   const ExchangeCompression compression_;
   const std::optional<cudf_velox::CudfHivePartitionFunction> gpuBucketFunction_;
+  // GPU batches not stored yet.
+  std::vector<std::shared_ptr<cudf_velox::CudfVector>> pending_;
+  vector_size_t pendingRows_{0};
 };
 
 // The TableWriter of a temporary table on the GPU: it hands GPU batches to the
