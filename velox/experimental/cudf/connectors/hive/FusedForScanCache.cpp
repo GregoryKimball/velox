@@ -16,20 +16,14 @@
 
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/FusedForScanCache.h"
+#include "velox/experimental/cudf/connectors/hive/FusedForColumnEncoding.h"
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 
 #include <glog/logging.h>
 
-#include <cudf/aggregation.hpp>
-#include <cudf/binaryop.hpp>
-#include <cudf/copying.hpp>
-#include <cudf/dictionary/dictionary_column_view.hpp>
-#include <cudf/dictionary/encode.hpp>
-#include <cudf/reduction.hpp>
-#include <cudf/scalar/scalar.hpp>
-#include <cudf/table/table.hpp>
+#include <cudf/contiguous_split.hpp>
 #include <cudf/table/table_view.hpp>
 
 #include <rmm/device_buffer.hpp>
@@ -48,11 +42,6 @@ namespace {
 constexpr std::size_t kBlockBytes = std::size_t{1} << 30;
 constexpr std::size_t kAlignment = 256;
 
-// A column can be cached as dictionary indices when it has at most this many
-// distinct values and at most one per this many rows.
-constexpr cudf::size_type kMaxDictionaryKeys = 1 << 16;
-constexpr cudf::size_type kMinRowsPerKey = 8;
-
 std::size_t alignUp(std::size_t bytes) {
   return (bytes + kAlignment - 1) / kAlignment * kAlignment;
 }
@@ -66,72 +55,6 @@ void* allocatePinnedBlock(std::size_t bytes) {
       bytes,
       cudaGetErrorString(status));
   return ptr;
-}
-
-cudf::detail::fused_for_packed_columns pack(
-    cudf::column_view column,
-    cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr) {
-  cudf::detail::fused_for_options options;
-  options.layout = cudf::detail::fused_for_layout::bitpacked;
-  return cudf::detail::pack_fused_for(
-      cudf::table_view{{column}}, stream, mr, options);
-}
-
-std::size_t payloadBytes(const cudf::detail::fused_for_packed_columns& packed) {
-  return packed.wire_data->size() + packed.metadata->size();
-}
-
-// Returns 'column' dictionary encoded when it has few enough distinct values
-// to be cached as dictionary indices, otherwise null.
-std::unique_ptr<cudf::column> encodeDictionary(
-    cudf::column_view column,
-    cuda::stream_ref stream,
-    rmm::device_async_resource_ref tempMr) {
-  if (column.nullable() || column.type().id() == cudf::type_id::BOOL8) {
-    return nullptr;
-  }
-  auto dictionary = cudf::dictionary::encode(
-      column,
-      cudf::data_type{cudf::type_id::INT32},
-      stream,
-      cudf::memory_resources{tempMr, tempMr});
-  const auto numKeys =
-      cudf::dictionary_column_view(dictionary->view()).keys_size();
-  if (numKeys > kMaxDictionaryKeys || numKeys * kMinRowsPerKey > column.size()) {
-    return nullptr;
-  }
-  return dictionary;
-}
-
-// Returns the differences between consecutive values of 'column', starting
-// with its first value, when it is a non-null BIGINT column without negative
-// values (keys such as l_orderkey), otherwise null. The difference of two
-// non-negative BIGINTs fits in BIGINT, so an inclusive prefix sum restores the
-// values exactly. Rows need not be sorted: keys stored roughly in key order
-// (SF3K lineitem files) still differ by much less than their range.
-std::unique_ptr<cudf::column> encodeDeltas(
-    cudf::column_view column,
-    cuda::stream_ref stream,
-    rmm::device_async_resource_ref tempMr) {
-  if (column.nullable() || column.is_empty() ||
-      column.type().id() != cudf::type_id::INT64) {
-    return nullptr;
-  }
-  const auto minimum = cudf::minmax(column, stream, tempMr).first;
-  if (static_cast<const cudf::numeric_scalar<int64_t>&>(*minimum).value(
-          stream) < 0) {
-    return nullptr;
-  }
-  const cudf::numeric_scalar<int64_t> zero(0, true, stream, tempMr);
-  const auto previous = cudf::shift(column, 1, zero, stream, tempMr);
-  return cudf::binary_operation(
-      column,
-      previous->view(),
-      cudf::binary_operator::SUB,
-      column.type(),
-      stream,
-      tempMr);
 }
 
 } // namespace
@@ -214,49 +137,21 @@ bool FusedForScanCache::insert(
     return false;
   }
 
-  std::optional<cudf::detail::fused_for_packed_columns> keys;
-  cudf::detail::fused_for_packed_columns values;
-  bool deltas = false;
-  const auto dictionary = encodeDictionary(column, stream, tempMr);
-  if (column.type().id() == cudf::type_id::STRING) {
-    if (dictionary == nullptr) {
-      std::unique_lock lock(mutex_);
-      uncacheable_.insert(std::move(entryKey));
-      return false;
-    }
-    const cudf::dictionary_column_view view(dictionary->view());
-    values = pack(view.indices(), stream, tempMr);
-    keys = pack(view.keys(), stream, tempMr);
-  } else {
-    values = pack(column, stream, tempMr);
-    if (dictionary != nullptr) {
-      // Few distinct values spread over a wide range (e.g. decimal quantities)
-      // take fewer bits as dictionary indices. Gathering the keys on read
-      // costs a pass over the column, so the dictionary must save at least a
-      // quarter of the bytes.
-      const cudf::dictionary_column_view view(dictionary->view());
-      auto indices = pack(view.indices(), stream, tempMr);
-      auto dictionaryKeys = pack(view.keys(), stream, tempMr);
-      if (4 * (payloadBytes(indices) + payloadBytes(dictionaryKeys)) <=
-          3 * payloadBytes(values)) {
-        values = std::move(indices);
-        keys = std::move(dictionaryKeys);
-      }
-    }
-    if (!keys.has_value()) {
-      // Keys stored near key order take a few bits per row as differences
-      // between consecutive values where the values themselves take tens.
-      // Restoring them costs a prefix sum on read, so the differences must
-      // also save at least a quarter of the bytes.
-      if (const auto differences = encodeDeltas(column, stream, tempMr)) {
-        auto packedDifferences = pack(differences->view(), stream, tempMr);
-        if (4 * payloadBytes(packedDifferences) <= 3 * payloadBytes(values)) {
-          values = std::move(packedDifferences);
-          deltas = true;
-        }
-      }
-    }
+  auto encodedColumn = encodeForFusedFor(column, {}, stream, tempMr);
+  if (!encodedColumn.packedValues.has_value()) {
+    // A string column with many distinct values: fused FOR would not compress
+    // it.
+    std::unique_lock lock(mutex_);
+    uncacheable_.insert(std::move(entryKey));
+    return false;
   }
+  auto& values = *encodedColumn.packedValues;
+  auto& keys = encodedColumn.packedKeys;
+  const bool deltas = encodedColumn.encoding == FusedForEncoding::kDeltas;
+  const auto payloadBytes =
+      [](const cudf::detail::fused_for_packed_columns& packed) {
+        return packed.wire_data->size() + packed.metadata->size();
+      };
   const auto bytes =
       payloadBytes(values) + (keys.has_value() ? payloadBytes(*keys) : 0);
 
@@ -367,13 +262,14 @@ FusedForScanCache::DecodedColumn FusedForScanCache::decode(
 
   auto [values, valuesView] = decodePayload(entry->values, stream, tempMr);
   if (entry->deltas) {
-    auto column = cudf::scan(
+    auto column = decodeFusedForEncoding(
+        FusedForEncoding::kDeltas,
         valuesView,
-        *cudf::make_sum_aggregation<cudf::scan_aggregation>(),
-        cudf::scan_type::INCLUSIVE,
-        cudf::null_policy::EXCLUDE,
+        std::nullopt,
+        0,
         stream,
-        mr);
+        mr,
+        tempMr);
     const auto view = column->view();
     return DecodedColumn{{}, std::move(column), view};
   }
@@ -381,13 +277,8 @@ FusedForScanCache::DecodedColumn FusedForScanCache::decode(
     return DecodedColumn{std::move(values), nullptr, valuesView};
   }
   const auto [keys, keysView] = decodePayload(*entry->keys, stream, tempMr);
-  auto gathered = cudf::gather(
-      cudf::table_view{{keysView}},
-      valuesView,
-      cudf::out_of_bounds_policy::DONT_CHECK,
-      stream,
-      cudf::memory_resources{mr, tempMr});
-  auto column = std::move(gathered->release().front());
+  auto column = decodeFusedForEncoding(
+      FusedForEncoding::kDictionary, valuesView, keysView, 0, stream, mr, tempMr);
   const auto view = column->view();
   return DecodedColumn{{}, std::move(column), view};
 }

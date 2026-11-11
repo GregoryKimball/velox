@@ -24,6 +24,7 @@ add_library(
   CudfHiveTableHandle.cpp
   CudfSplitReader.cpp
   CudfSplitReaderByteFetch.cpp
+  FusedForColumnEncoding.cpp
   FusedForScanCache.cpp
 )
 

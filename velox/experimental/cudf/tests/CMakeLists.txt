@@ -121,6 +121,12 @@ if(VELOX_ENABLE_UCX_EXCHANGE)
 endif()
 
 velox_add_cudf_test(
+  NAME velox_cudf_fused_for_column_encoding_test
+  SOURCES Main.cpp FusedForColumnEncodingTest.cpp
+  LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_cudf_hive_connector
+)
+
+velox_add_cudf_test(
   NAME velox_cudf_hive_partition_function_test
   SOURCES Main.cpp CudfHivePartitionFunctionTest.cpp
   LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_vector_fuzzer velox_hive_connector
