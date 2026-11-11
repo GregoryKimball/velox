@@ -34,6 +34,17 @@ ninja velox_tpch_benchmark velox_tpcds_benchmark
 
 Generate TPC-H parquet data using the [velox-testing](https://github.com/rapidsai/velox-testing) data generation tool (see [Data Generation](#data-generation) below), or the standard `dbgen` tool and convert decimal columns to float.
 
+`velox_cudf_tpch_benchmark` reads decimal TPC-H data instead: DECIMAL(15, 2)
+amounts and DATE dates, as `tpchgen-cli` and DuckDB write them
+(`prepare_tpch_encoded.py` below).
+
+### Plans
+
+`velox_cudf_tpch_benchmark` runs the plans of `CudfTpchQueryBuilder`, which use
+one fixed set of query parameters, listed in `CudfTpchQueryBuilder.h`, and
+several rewrites of the SQL described there. `--scale_factor` gives the scale
+factor of the data, which sets Q11's FRACTION, `0.0001 / SF`.
+
 ### Run
 
 ```bash
@@ -41,8 +52,13 @@ Generate TPC-H parquet data using the [velox-testing](https://github.com/rapidsa
 ./velox_tpch_benchmark --data_path=/path/to/tpch/sf100 --data_format=parquet
 
 # GPU (CuDF) - all queries
-./velox_cudf_tpch_benchmark --data_path=/path/to/tpch/sf100 --data_format=parquet
+./velox_cudf_tpch_benchmark --data_path=/path/to/tpch/sf100 --data_format=parquet \
+  --scale_factor=100
 ```
+
+Without `--run_query_verbose` or `--run_queries`, `velox_cudf_tpch_benchmark`
+runs each query `--num_repeats` times and prints the wall time of each run.
+`--results_json_dir` writes each query's result rows to `<dir>/q<N>.json`.
 
 ### Encoded Column Cache
 
@@ -58,14 +74,14 @@ pip install tpchgen-cli duckdb pyarrow
 python3 prepare_tpch_encoded.py --scale-factor 100 --out /path/to/tpch_sf100
 
 echo "cudf.batch_size_min_threshold=16777216" > cudf.properties
-TPCH_Q11_FRACTION=0.0000010000 ./velox_cudf_tpch_benchmark \
-  --data_path=/path/to/tpch_sf100 --data_format=parquet --num_drivers=4 \
+./velox_cudf_tpch_benchmark \
+  --data_path=/path/to/tpch_sf100 --data_format=parquet --scale_factor=100 \
+  --num_drivers=4 \
   --encoded --encoded_memory=pinned_host --cudf_properties=cudf.properties \
   --num_repeats=4 --run_queries=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22
 ```
 
 `--run_queries` runs the queries in one process, so the tables load once.
-`TPCH_Q11_FRACTION` is `0.0001 / SF`.
 
 ---
 

@@ -14,6 +14,16 @@
 
 # --- TPC-H benchmarks ---
 
+add_library(velox_cudf_tpch_query_builder CudfTpchQueryBuilder.cpp)
+
+target_link_libraries(
+  velox_cudf_tpch_query_builder
+  velox_dwio_common
+  velox_exec_test_lib
+  velox_file
+  velox_tpch_gen
+)
+
 add_executable(velox_cudf_tpch_benchmark CudfTpchBenchmark.cpp)
 
 target_link_libraries(
@@ -21,8 +31,13 @@ target_link_libraries(
   velox_cudf_encoded_connector
   velox_cudf_exec
   velox_cudf_exec_test_lib
+  velox_cudf_tpch_query_builder
   velox_tpch_benchmark_lib
 )
+
+if(VELOX_BUILD_TESTING)
+  add_subdirectory(tests)
+endif()
 
 # --- TPC-DS benchmarks ---
 
