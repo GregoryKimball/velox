@@ -507,9 +507,21 @@ class ExchangeStoreDataSource : public connector::DataSource {
     next_ = 0;
   }
 
+  // Returns the split's payloads concatenated into batches of at least
+  // CudfConfig::batchSizeMinThreshold rows where the payloads allow. A writer
+  // splits every batch it gets across all buckets, so a file holds many small
+  // payloads, and each batch costs the operators downstream a fixed overhead.
   std::optional<RowVectorPtr> next(uint64_t /*size*/, ContinueFuture& /*future*/)
       override {
-    while (next_ < payloads_.size()) {
+    const auto targetRows = static_cast<vector_size_t>(
+        cudf_velox::CudfConfig::getInstance().batchSizeMinThreshold);
+    std::vector<std::unique_ptr<PackedTableWithStream>> batch;
+    vector_size_t batchRows = 0;
+    while (next_ < payloads_.size() &&
+           (batch.empty() || batchRows < targetRows) &&
+           (batch.empty() ||
+            static_cast<int64_t>(batchRows) + payloads_[next_]->numRows <=
+                std::numeric_limits<cudf::size_type>::max())) {
       auto data = std::move(payloads_[next_++]);
       joinExchangeLanes(*data, cudf_velox::get_output_mr());
       if (data->numRows == 0) {
@@ -517,7 +529,14 @@ class ExchangeStoreDataSource : public connector::DataSource {
       }
       completedRows_ += data->numRows;
       completedBytes_ += data->gpuDataSize();
-      return toOutput(std::move(data));
+      batchRows += data->numRows;
+      batch.push_back(std::move(data));
+    }
+    if (batch.size() == 1) {
+      return toOutput(std::move(batch[0]));
+    }
+    if (!batch.empty()) {
+      return concatenate(batch, batchRows);
     }
     payloads_.clear();
     next_ = 0;
@@ -590,6 +609,29 @@ class ExchangeStoreDataSource : public connector::DataSource {
         view.select(columns_), data->stream, cudf_velox::get_output_mr());
     return std::make_shared<cudf_velox::CudfVector>(
         pool_, outputType_, numRows, std::move(selected), data->stream);
+  }
+
+  // Concatenates the scan's columns of 'batch' into one CudfVector.
+  RowVectorPtr concatenate(
+      const std::vector<std::unique_ptr<PackedTableWithStream>>& batch,
+      vector_size_t numRows) {
+    std::vector<cudf::table_view> views;
+    views.reserve(batch.size());
+    for (const auto& data : batch) {
+      const auto view = data->tableView();
+      VELOX_CHECK_EQ(
+          view.num_columns(),
+          dataColumns_->size(),
+          "A stored payload does not have the temporary table's columns");
+      views.push_back(view.select(columns_));
+    }
+    // A scan without columns, such as count(*), needs only the row count.
+    // The payloads were restored on 'stream_' (see addSplit()).
+    auto table = columns_.empty()
+        ? std::make_unique<cudf::table>()
+        : cudf::concatenate(views, stream_, cudf_velox::get_output_mr());
+    return std::make_shared<cudf_velox::CudfVector>(
+        pool_, outputType_, numRows, std::move(table), stream_);
   }
 
   const RowTypePtr outputType_;
