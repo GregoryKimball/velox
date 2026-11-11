@@ -82,6 +82,8 @@ struct CudfConfig {
   static constexpr const char* kExchangeStore{"cudf.exchange_store"};
   static constexpr const char* kExchangeStoreDeviceBytes{
       "cudf.exchange_store_device_bytes"};
+  static constexpr const char* kExchangeStoreHostBytes{
+      "cudf.exchange_store_host_bytes"};
   static constexpr const char* kCudfKvikioCacheCopyThreads{
       "cudf.kvikio_cache_copy_threads"};
   /// Query configuration key for selecting UCX exchange compression.
@@ -157,6 +159,10 @@ struct CudfConfig {
   /// Bytes of temporary table data the exchange store keeps in device memory;
   /// the rest goes to pinned host memory.
   int64_t exchangeStoreDeviceBytes{0};
+
+  /// Bytes of temporary table data the exchange store keeps in pinned host
+  /// memory; a query that needs more fails. 0 means no limit.
+  int64_t exchangeStoreHostBytes{0};
 
   /// Threads that copy KvikIO data from the async data cache to the GPU. One
   /// pool for the whole process, created by the first cached GPU read.

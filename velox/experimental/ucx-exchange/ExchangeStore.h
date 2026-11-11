@@ -39,9 +39,13 @@ namespace facebook::velox::ucx_exchange {
 /// compressed format (see splitExchangePayloads()). A payload is kept in device
 /// memory while the device tier is below its capacity and is moved to pinned
 /// host memory otherwise. Nothing is written to disk: adding a payload that
-/// fits in neither tier fails.
+/// fits in neither tier fails. The host tier has a pinned memory pool of its
+/// own, which grows in large blocks.
 class ExchangeStore {
  public:
+  ExchangeStore();
+  ~ExchangeStore();
+
   /// The process-wide store.
   static ExchangeStore& instance();
 
@@ -107,10 +111,13 @@ class ExchangeStore {
   Stats stats() const;
 
  private:
-  // Pinned host memory from cuDF's pinned memory resource.
+  // The host tier's pinned memory pool.
+  struct HostPool;
+
+  // Pinned host memory from the host tier's pool.
   class HostBuffer {
    public:
-    explicit HostBuffer(std::size_t bytes);
+    HostBuffer(HostPool& pool, std::size_t bytes);
     ~HostBuffer();
     HostBuffer(const HostBuffer&) = delete;
     HostBuffer& operator=(const HostBuffer&) = delete;
@@ -120,9 +127,14 @@ class ExchangeStore {
     }
 
    private:
+    HostPool& pool_;
     void* data_;
     const std::size_t bytes_;
   };
+
+  // Returns the host tier's pool, creating it on first use. Called with
+  // 'mutex_' held.
+  HostPool& hostPool();
 
   // A payload's metadata, which names its codec, and its data in exactly one
   // of the tiers.
@@ -141,6 +153,8 @@ class ExchangeStore {
   void forget(const std::vector<StoredPayload>& payloads);
 
   mutable std::mutex mutex_;
+  // Declared before 'tables_' so that it outlives the host buffers.
+  std::unique_ptr<HostPool> hostPool_;
   folly::F14FastMap<std::string, Files> tables_;
   uint64_t deviceCapacity_{0};
   uint64_t hostCapacity_{std::numeric_limits<uint64_t>::max()};

@@ -22,19 +22,50 @@
 #include <chrono>
 
 #include <cudf/utilities/error.hpp>
-#include <cudf/utilities/pinned_memory.hpp>
 #include <rmm/aligned.hpp>
+#include <rmm/mr/pinned_host_memory_resource.hpp>
+#include <rmm/mr/pool_memory_resource.hpp>
 
 namespace facebook::velox::ucx_exchange {
 
-ExchangeStore::HostBuffer::HostBuffer(std::size_t bytes)
-    : data_(cudf::get_pinned_memory_resource().allocate_sync(
-          bytes, rmm::CUDA_ALLOCATION_ALIGNMENT)),
+namespace {
+// The host pool's first block. The pool grows by at least its current size.
+constexpr std::size_t kInitialHostPoolBytes{std::size_t{1} << 30};
+
+// Host buffers are allocated and freed on one stream, so the pool reuses them
+// without waiting; copies into and out of them are synchronized separately.
+cuda::stream_ref hostPoolStream() {
+  return cuda::stream_ref{cudaStream_t{cudaStreamDefault}};
+}
+} // namespace
+
+struct ExchangeStore::HostPool {
+  HostPool() : pool(upstream, kInitialHostPoolBytes) {}
+
+  rmm::mr::pinned_host_memory_resource upstream;
+  rmm::mr::pool_memory_resource pool;
+};
+
+ExchangeStore::HostBuffer::HostBuffer(HostPool& pool, std::size_t bytes)
+    : pool_(pool),
+      data_(pool.pool.allocate(
+          hostPoolStream(), bytes, rmm::CUDA_ALLOCATION_ALIGNMENT)),
       bytes_(bytes) {}
 
 ExchangeStore::HostBuffer::~HostBuffer() {
-  cudf::get_pinned_memory_resource().deallocate_sync(
-      data_, bytes_, rmm::CUDA_ALLOCATION_ALIGNMENT);
+  pool_.pool.deallocate(
+      hostPoolStream(), data_, bytes_, rmm::CUDA_ALLOCATION_ALIGNMENT);
+}
+
+ExchangeStore::ExchangeStore() = default;
+
+ExchangeStore::~ExchangeStore() = default;
+
+ExchangeStore::HostPool& ExchangeStore::hostPool() {
+  if (hostPool_ == nullptr) {
+    hostPool_ = std::make_unique<HostPool>();
+  }
+  return *hostPool_;
 }
 
 ExchangeStore& ExchangeStore::instance() {
@@ -69,10 +100,12 @@ bool ExchangeStore::add(
   // A payload without data, such as one with no columns, takes no memory and
   // stays in the device tier.
   bool toHost;
+  HostPool* pool = nullptr;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     toHost = stored.bytes > 0 && deviceBytes_ + stored.bytes > deviceCapacity_;
     if (toHost) {
+      pool = &hostPool();
       VELOX_CHECK_LE(
           stored.bytes,
           hostCapacity_ - hostBytes_,
@@ -86,7 +119,7 @@ bool ExchangeStore::add(
   }
 
   if (toHost) {
-    stored.host = std::make_unique<HostBuffer>(stored.bytes);
+    stored.host = std::make_unique<HostBuffer>(*pool, stored.bytes);
     CUDF_CUDA_TRY(cudaMemcpyAsync(
         stored.host->data(),
         stored.device->data(),
@@ -228,7 +261,7 @@ std::size_t ExchangeStore::demote(std::size_t bytes) {
           continue;
         }
         // The payload's device data is complete (see add()).
-        payload.host = std::make_unique<HostBuffer>(payload.bytes);
+        payload.host = std::make_unique<HostBuffer>(hostPool(), payload.bytes);
         CUDF_CUDA_TRY(cudaMemcpy(
             payload.host->data(),
             payload.device->data(),

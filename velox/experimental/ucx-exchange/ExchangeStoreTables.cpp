@@ -41,6 +41,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <numeric>
 
@@ -688,8 +689,10 @@ std::pair<std::string, std::string> storeKey(std::string_view path) {
   };
 }
 
-void registerExchangeStoreTables(uint64_t deviceBytes) {
+void registerExchangeStoreTables(uint64_t deviceBytes, uint64_t hostBytes) {
   ExchangeStore::instance().setDeviceCapacity(deviceBytes);
+  ExchangeStore::instance().setHostCapacity(
+      hostBytes == 0 ? std::numeric_limits<uint64_t>::max() : hostBytes);
   // unregisterCudf() clears the adapters, so this is added on every
   // registration.
   cudf_velox::OperatorAdapterRegistry::getInstance().registerAdapterFront(

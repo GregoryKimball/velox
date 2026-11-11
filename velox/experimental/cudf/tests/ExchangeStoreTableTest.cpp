@@ -54,7 +54,7 @@ class ExchangeStoreTableTest : public CudfHiveConnectorTestBase,
     CudfHiveConnectorTestBase::SetUp();
     // The TableWriter has no GPU operator and runs on the CPU, as in Presto.
     CudfConfig::getInstance().allowCpuFallback = true;
-    ucx_exchange::registerExchangeStoreTables(GetParam());
+    ucx_exchange::registerExchangeStoreTables(GetParam(), 0);
   }
 
   void TearDown() override {

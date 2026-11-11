@@ -432,7 +432,8 @@ void registerCudf() {
   }
   if (CudfConfig::getInstance().exchangeStore) {
     ucx_exchange::registerExchangeStoreTables(
-        CudfConfig::getInstance().exchangeStoreDeviceBytes);
+        CudfConfig::getInstance().exchangeStoreDeviceBytes,
+        CudfConfig::getInstance().exchangeStoreHostBytes);
   }
 #endif
 
@@ -604,6 +605,15 @@ void CudfConfig::initialize(
         "Exchange store device bytes must be a non-negative integer: {}",
         value);
     exchangeStoreDeviceBytes = bytes.value();
+  }
+  if (config.find(kExchangeStoreHostBytes) != config.end()) {
+    const auto& value = config[kExchangeStoreHostBytes];
+    const auto bytes = folly::tryTo<int64_t>(value);
+    VELOX_USER_CHECK(
+        bytes.hasValue() && bytes.value() >= 0,
+        "Exchange store host bytes must be a non-negative integer: {}",
+        value);
+    exchangeStoreHostBytes = bytes.value();
   }
   if (config.find(kCudfKvikioCacheCopyThreads) != config.end()) {
     kvikioCacheCopyThreads =

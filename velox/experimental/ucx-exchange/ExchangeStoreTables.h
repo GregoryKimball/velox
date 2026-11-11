@@ -24,10 +24,11 @@ namespace facebook::velox::ucx_exchange {
 
 /// Keeps Presto's temporary tables, which hold materialized exchanges, in
 /// ExchangeStore::instance() instead of files, with a device tier of
-/// 'deviceBytes'. Each file of a temporary table becomes a small placeholder
-/// file, so that the coordinator lists and commits the table as usual, and the
-/// data of the file is kept in the store under storeKey() of its path.
-void registerExchangeStoreTables(uint64_t deviceBytes);
+/// 'deviceBytes' and a host tier of 'hostBytes' (0 for no limit). Each file of
+/// a temporary table becomes a small placeholder file, so that the coordinator
+/// lists and commits the table as usual, and the data of the file is kept in
+/// the store under storeKey() of its path.
+void registerExchangeStoreTables(uint64_t deviceBytes, uint64_t hostBytes);
 
 /// Returns temporary tables to files.
 void unregisterExchangeStoreTables();
