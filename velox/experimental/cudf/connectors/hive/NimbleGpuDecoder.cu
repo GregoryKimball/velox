@@ -940,18 +940,22 @@ NimbleGpuDecoder::~NimbleGpuDecoder() {
 }
 
 std::vector<std::unique_ptr<cudf::column>> NimbleGpuDecoder::decode(
-    std::span<const std::span<const uint8_t>> streams,
+    std::span<const NimbleStripeStreams> stripes,
     std::span<const cudf::data_type> types,
-    cudf::size_type numRows,
     bool compactRowCount,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
-  NIMBLE_GPU_CHECK(streams.size() == types.size(), "one type per stream");
+  for (const auto& stripe : stripes) {
+    NIMBLE_GPU_CHECK(
+        stripe.streams.size() == types.size(), "one type per stream");
+  }
   StripeDecode walk{compactRowCount, stream, mr};
   {
     nvtx3::scoped_range range{"NimbleGpuDecoder::plan"};
-    for (size_t i = 0; i < streams.size(); ++i) {
-      walk.decodeStream(streams[i], types[i], numRows);
+    for (const auto& stripe : stripes) {
+      for (size_t i = 0; i < types.size(); ++i) {
+        walk.decodeStream(stripe.streams[i], types[i], stripe.numRows);
+      }
     }
   }
 
@@ -1012,12 +1016,27 @@ std::vector<std::unique_ptr<cudf::column>> NimbleGpuDecoder::decode(
       payloads, Codec::kLz4, stagingData, outputData, outputOffsets, stream, mr);
 
   std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.reserve(streams.size());
+  columns.reserve(types.size());
   walk.collecting = false;
   {
     nvtx3::scoped_range range{"NimbleGpuDecoder::decode"};
-    for (size_t i = 0; i < streams.size(); ++i) {
-      columns.push_back(walk.decodeStream(streams[i], types[i], numRows));
+    for (size_t i = 0; i < types.size(); ++i) {
+      std::vector<std::unique_ptr<cudf::column>> parts;
+      parts.reserve(stripes.size());
+      for (const auto& stripe : stripes) {
+        parts.push_back(
+            walk.decodeStream(stripe.streams[i], types[i], stripe.numRows));
+      }
+      if (parts.size() == 1) {
+        columns.push_back(std::move(parts[0]));
+        continue;
+      }
+      std::vector<cudf::column_view> views;
+      views.reserve(parts.size());
+      for (const auto& part : parts) {
+        views.push_back(part->view());
+      }
+      columns.push_back(cudf::concatenate(views, stream, mr));
     }
   }
   checkCuda(cudaGetLastError());
