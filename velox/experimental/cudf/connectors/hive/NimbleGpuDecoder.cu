@@ -886,6 +886,17 @@ void decompressPayloads(
       count * sizeof(outputs[0]),
       cudaMemcpyHostToDevice,
       stream.get()));
+  // Entries that enter as SKIPPED are left untouched by the codec.
+  std::vector<cudf::io::detail::codec_exec_result> hostResults(
+      count,
+      cudf::io::detail::codec_exec_result{
+          0, cudf::io::detail::codec_status::FAILURE});
+  checkCuda(cudaMemcpyAsync(
+      results.data(),
+      hostResults.data(),
+      count * sizeof(hostResults[0]),
+      cudaMemcpyHostToDevice,
+      stream.get()));
   cudf::io::detail::decompress(
       codec == Codec::kZstd ? cudf::io::compression_type::ZSTD
                             : cudf::io::compression_type::LZ4,
@@ -899,7 +910,6 @@ void decompressPayloads(
       totalSize,
       stream,
       cudf::memory_resources{mr, mr});
-  std::vector<cudf::io::detail::codec_exec_result> hostResults(count);
   checkCuda(cudaMemcpyAsync(
       hostResults.data(),
       results.data(),
