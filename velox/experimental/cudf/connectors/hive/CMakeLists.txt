@@ -36,7 +36,10 @@ if(VELOX_ENABLE_ABFS)
 endif()
 
 if(VELOX_ENABLE_NIMBLE)
-  target_sources(velox_cudf_hive_connector PRIVATE CudfNimbleSplitReader.cpp)
+  target_sources(
+    velox_cudf_hive_connector
+    PRIVATE CudfNimbleSplitReader.cpp NimbleGpuDecoder.cu
+  )
   target_compile_definitions(velox_cudf_hive_connector PRIVATE VELOX_ENABLE_NIMBLE)
   target_link_libraries(velox_cudf_hive_connector PRIVATE nimble_velox_reader_factory)
 endif()
