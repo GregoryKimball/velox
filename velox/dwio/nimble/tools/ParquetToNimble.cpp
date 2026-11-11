@@ -45,6 +45,16 @@ DEFINE_uint64(
     256,
     "Raw (decoded) bytes buffered before a stripe is written");
 DEFINE_uint32(zstd_level, 3, "Zstd compression level");
+DEFINE_uint64(
+    max_chunk_raw_kb,
+    0,
+    "Cap on the raw size of a stream chunk, enforced eagerly; 0 keeps the "
+    "writer default. Small chunks give GPU decompression more frames per "
+    "stripe");
+DEFINE_uint64(
+    min_chunk_raw_kb,
+    0,
+    "Raw size below which a stream is not chunked; 0 keeps the writer default");
 DEFINE_uint64(read_batch_rows, 1 << 16, "Rows per Parquet read batch");
 DEFINE_int32(threads, 8, "Files converted in parallel");
 
@@ -105,6 +115,13 @@ uint64_t convertFile(const FileTask& task, memory::MemoryPool& rootPool) {
   writerOptions.compressionOptions.compressionType =
       facebook::nimble::CompressionType::Zstd;
   writerOptions.compressionOptions.zstdCompressionLevel = FLAGS_zstd_level;
+  if (FLAGS_max_chunk_raw_kb > 0) {
+    writerOptions.eagerChunking = true;
+    writerOptions.maxStreamChunkRawSize = FLAGS_max_chunk_raw_kb << 10;
+  }
+  if (FLAGS_min_chunk_raw_kb > 0) {
+    writerOptions.minStreamChunkRawSize = FLAGS_min_chunk_raw_kb << 10;
+  }
   const uint64_t stripeRawSize = FLAGS_stripe_raw_size_mb << 20;
   writerOptions.flushPolicyFactory = [stripeRawSize]() {
     return std::make_unique<facebook::nimble::StripeRawSizeFlushPolicy>(
