@@ -94,11 +94,13 @@ void CudfNimbleSplitReader::prepareSplitInternal(
 
   dwio::common::RowReaderOptions rowReaderOptions;
   rowReaderOptions.setScanSpec(scanSpec_);
-  rowReaderOptions.setRequestedType(ROW(
+  auto requestedType = ROW(
       std::vector<std::string>(readColumnNames_),
-      std::vector<TypePtr>(readColumnTypes_)));
+      std::vector<TypePtr>(readColumnTypes_));
+  rowReaderOptions.setRequestedType(requestedType);
   rowReaderOptions.range(split_->start, split_->length);
   rowReader_ = reader_->createRowReader(rowReaderOptions);
+  batch_ = BaseVector::create(requestedType, 0, pool);
 }
 
 std::optional<CudfSplitReader::TableChunk>
