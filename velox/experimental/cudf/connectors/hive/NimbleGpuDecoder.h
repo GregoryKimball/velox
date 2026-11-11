@@ -30,13 +30,20 @@
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
-/// Decodes the scalar streams of one Nimble stripe on the GPU.
+/// The scalar streams of one Nimble stripe, one per output column.
+struct NimbleStripeStreams {
+  std::vector<std::span<const uint8_t>> streams;
+  cudf::size_type numRows;
+};
+
+/// Decodes the scalar streams of a batch of Nimble stripes on the GPU.
 ///
 /// Encoding headers are not compressed, so the host walks each stream's
 /// chunks and encoding trees directly from the file bytes. Only the leaf
 /// payloads go to the device: they are staged into one pinned buffer, copied
 /// in one transfer, decompressed in one batch per codec, and then decoded by
-/// CUDA kernels and cuDF primitives.
+/// CUDA kernels and cuDF primitives. Batching stripes gives the decompressor
+/// more frames to spread across the GPU.
 ///
 /// Supported encodings: Trivial, FixedBitWidth, Constant, Varint, Dictionary,
 /// RLE, MainlyConstant, Nullable and SparseBool, with Zstd or LZ4 payloads.
@@ -49,13 +56,12 @@ class NimbleGpuDecoder {
   NimbleGpuDecoder(const NimbleGpuDecoder&) = delete;
   NimbleGpuDecoder& operator=(const NimbleGpuDecoder&) = delete;
 
-  /// Decodes streams[i] into a column of types[i] with numRows rows. An empty
-  /// stream decodes to an all-null column. `compactRowCount` is the file's
-  /// compactRowCountEncoding property.
+  /// Decodes column i of every stripe as types[i] and concatenates the stripes
+  /// in order. An empty stream decodes to all nulls. `compactRowCount` is the
+  /// file's compactRowCountEncoding property.
   std::vector<std::unique_ptr<cudf::column>> decode(
-      std::span<const std::span<const uint8_t>> streams,
+      std::span<const NimbleStripeStreams> stripes,
       std::span<const cudf::data_type> types,
-      cudf::size_type numRows,
       bool compactRowCount,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr);

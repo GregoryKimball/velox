@@ -103,42 +103,62 @@ CudfNimbleSplitReader::readNextChunk() {
   if (nextStripe_ >= stripes_.size()) {
     return std::nullopt;
   }
-  const auto stripe = stripes_[nextStripe_++];
-  const auto numRows =
-      static_cast<cudf::size_type>(tablet_->stripeRowCount(stripe));
   if (noColumnsToRead_) {
+    const auto stripe = stripes_[nextStripe_++];
     return TableChunk{
         std::make_unique<cudf::table>(
             std::vector<std::unique_ptr<cudf::column>>{}),
-        numRows};
+        static_cast<cudf::size_type>(tablet_->stripeRowCount(stripe))};
   }
 
-  std::vector<std::vector<uint8_t>> streamBytes(streamIds_.size());
+  // Stripes are batched up to a stored-byte budget so that one decode sees
+  // many compressed frames.
+  constexpr size_t kBatchBytes = size_t{128} << 20;
+  constexpr int64_t kBatchRows = int64_t{1} << 28;
+  std::vector<std::vector<uint8_t>> streamBytes;
+  std::vector<NimbleStripeStreams> batch;
   {
     nvtx3::scoped_range range{"CudfNimbleSplitReader::read"};
-    const auto stripeId = tablet_->stripeIdentifier(stripe);
-    const auto stripeOffset = tablet_->stripeOffset(stripe);
-    for (size_t i = 0; i < streamIds_.size(); ++i) {
-      const auto location = tablet_->streamLocation(stripeId, streamIds_[i]);
-      if (location.size == 0) {
-        continue;
+    size_t batchBytes = 0;
+    int64_t batchRows = 0;
+    while (nextStripe_ < stripes_.size() && batchBytes < kBatchBytes) {
+      const auto stripe = stripes_[nextStripe_];
+      const auto numRows = static_cast<int64_t>(tablet_->stripeRowCount(stripe));
+      if (!batch.empty() && batchRows + numRows > kBatchRows) {
+        break;
       }
-      streamBytes[i].resize(location.size);
-      readFile_->pread(
-          stripeOffset + location.offset, location.size, streamBytes[i].data());
-      if (ioStatistics_) {
-        ioStatistics_->incRawBytesRead(location.size);
+      ++nextStripe_;
+      const auto stripeId = tablet_->stripeIdentifier(stripe);
+      const auto stripeOffset = tablet_->stripeOffset(stripe);
+      auto& entry = batch.emplace_back();
+      entry.numRows = static_cast<cudf::size_type>(numRows);
+      for (size_t i = 0; i < streamIds_.size(); ++i) {
+        const auto location = tablet_->streamLocation(stripeId, streamIds_[i]);
+        auto& bytes = streamBytes.emplace_back(location.size);
+        if (location.size > 0) {
+          readFile_->pread(
+              stripeOffset + location.offset, location.size, bytes.data());
+          if (ioStatistics_) {
+            ioStatistics_->incRawBytesRead(location.size);
+          }
+        }
+        batchBytes += location.size;
       }
+      batchRows += numRows;
     }
   }
-  std::vector<std::span<const uint8_t>> streams(
-      streamBytes.begin(), streamBytes.end());
+  // streamBytes is complete, so the spans into it are stable.
+  size_t next = 0;
+  for (auto& entry : batch) {
+    for (size_t i = 0; i < streamIds_.size(); ++i) {
+      entry.streams.emplace_back(streamBytes[next++]);
+    }
+  }
 
   const auto* filter = subfieldFilterAst();
   auto columns = decoder_.decode(
-      streams,
+      batch,
       cudfTypes_,
-      numRows,
       compactRowCount_,
       stream_,
       filter != nullptr ? get_temp_mr() : get_output_mr());
