@@ -118,7 +118,7 @@ uint64_t convertFile(const FileTask& task, memory::MemoryPool& rootPool) {
       rowType, std::move(writeFile), rootPool, std::move(writerOptions));
 
   uint64_t numRows{0};
-  VectorPtr batch;
+  VectorPtr batch = BaseVector::create(rowType, 0, leafPool.get());
   while (rowReader->next(FLAGS_read_batch_rows, batch) > 0) {
     auto rowVector = std::dynamic_pointer_cast<RowVector>(batch);
     for (auto& child : rowVector->children()) {
