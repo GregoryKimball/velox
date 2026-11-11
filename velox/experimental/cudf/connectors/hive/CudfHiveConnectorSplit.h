@@ -38,8 +38,7 @@ struct CudfHiveConnectorSplit
   const std::string filePath;
   const uint64_t start;
   const uint64_t length;
-  const facebook::velox::dwio::common::FileFormat fileFormat{
-      facebook::velox::dwio::common::FileFormat::PARQUET};
+  const facebook::velox::dwio::common::FileFormat fileFormat;
   const std::unique_ptr<cudf::io::source_info> cudfSourceInfo;
 
   /// These represent columns like $file_size, $file_modified_time that are
@@ -67,7 +66,9 @@ struct CudfHiveConnectorSplit
       const std::unordered_map<std::string, std::string>& _infoColumns = {},
       const std::unordered_map<std::string, std::optional<std::string>>&
           _partitionKeys = {},
-      std::optional<FileProperties> _properties = std::nullopt);
+      std::optional<FileProperties> _properties = std::nullopt,
+      facebook::velox::dwio::common::FileFormat _fileFormat =
+          facebook::velox::dwio::common::FileFormat::PARQUET);
 
   std::string toString() const override;
   std::string getFileName() const;
@@ -132,6 +133,12 @@ class CudfHiveConnectorSplitBuilder {
     return *this;
   }
 
+  CudfHiveConnectorSplitBuilder& fileFormat(
+      facebook::velox::dwio::common::FileFormat fileFormat) {
+    fileFormat_ = fileFormat;
+    return *this;
+  }
+
   std::shared_ptr<CudfHiveConnectorSplit> build() const {
     return std::make_shared<CudfHiveConnectorSplit>(
         connectorId_,
@@ -141,7 +148,8 @@ class CudfHiveConnectorSplitBuilder {
         splitWeight_,
         infoColumns_,
         partitionKeys_,
-        fileProperties_);
+        fileProperties_,
+        fileFormat_);
   }
 
  private:
@@ -154,6 +162,8 @@ class CudfHiveConnectorSplitBuilder {
   std::unordered_map<std::string, std::optional<std::string>> partitionKeys_ =
       {};
   std::optional<FileProperties> fileProperties_;
+  facebook::velox::dwio::common::FileFormat fileFormat_{
+      facebook::velox::dwio::common::FileFormat::PARQUET};
 };
 
 } // namespace facebook::velox::cudf_velox::connector::hive

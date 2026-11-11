@@ -74,11 +74,13 @@ CudfHiveConnectorSplit::CudfHiveConnectorSplit(
     const std::unordered_map<std::string, std::string>& _infoColumns,
     const std::unordered_map<std::string, std::optional<std::string>>&
         _partitionKeys,
-    std::optional<FileProperties> _properties)
+    std::optional<FileProperties> _properties,
+    dwio::common::FileFormat _fileFormat)
     : facebook::velox::connector::ConnectorSplit(connectorId, _splitWeight),
       filePath(stripFilePrefix(_filePath)),
       start(_start),
       length(_length),
+      fileFormat(_fileFormat),
       cudfSourceInfo(std::make_unique<cudf::io::source_info>(filePath)),
       infoColumns(_infoColumns),
       partitionKeys(_partitionKeys),
@@ -111,6 +113,11 @@ std::shared_ptr<CudfHiveConnectorSplit> CudfHiveConnectorSplit::create(
     properties = FileProperties::create(propertiesObj);
   }
 
+  const auto& fileFormatObj = obj.getDefault("fileFormat", nullptr);
+  const auto fileFormat = fileFormatObj == nullptr
+      ? dwio::common::FileFormat::PARQUET
+      : dwio::common::toFileFormat(fileFormatObj.asString());
+
   return std::make_shared<CudfHiveConnectorSplit>(
       connectorId,
       filePath,
@@ -119,7 +126,8 @@ std::shared_ptr<CudfHiveConnectorSplit> CudfHiveConnectorSplit::create(
       splitWeight,
       infoColumns,
       partitionKeys,
-      std::move(properties));
+      std::move(properties),
+      fileFormat);
 }
 
 folly::dynamic CudfHiveConnectorSplit::serialize() const {
@@ -129,6 +137,8 @@ folly::dynamic CudfHiveConnectorSplit::serialize() const {
   obj["start"] = start;
   obj["length"] = length;
   obj["splitWeight"] = splitWeight;
+  obj["fileFormat"] =
+      std::string(dwio::common::FileFormatName::toName(fileFormat));
 
   folly::dynamic infoColumnsObj = folly::dynamic::object;
   for (const auto& [key, value] : infoColumns) {
