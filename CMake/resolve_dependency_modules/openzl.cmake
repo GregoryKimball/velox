@@ -58,11 +58,16 @@ set(OPENZL_INSTALL OFF)
 # errors. The patch makes OpenZL honor an externally provided standard, so this
 # build inherits Velox's C++20 and scripts/setup-common.sh can install a
 # matching copy. The tarball is not a git repository, hence the `git init`.
+# OpenZL also vendors zstd and adds it unconditionally, which collides with the
+# zstd targets cuDF brings in when both are enabled; the second patch skips the
+# vendored copy when those targets already exist.
 FetchContent_Declare(
   openzl
   URL ${VELOX_OPENZL_SOURCE_URL}
   URL_HASH ${VELOX_OPENZL_BUILD_SHA256_CHECKSUM}
-  PATCH_COMMAND git init -q && git apply ${CMAKE_CURRENT_LIST_DIR}/openzl/openzl-cxx-standard.patch
+  PATCH_COMMAND
+    git init -q && git apply ${CMAKE_CURRENT_LIST_DIR}/openzl/openzl-cxx-standard.patch
+    && git apply ${CMAKE_CURRENT_LIST_DIR}/openzl/openzl-existing-zstd.patch
   OVERRIDE_FIND_PACKAGE
   SYSTEM
   EXCLUDE_FROM_ALL
