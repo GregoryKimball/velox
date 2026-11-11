@@ -87,8 +87,8 @@ class CudfSplitReader : public NvtxHelper {
 
   /// Reads and returns the Parquet file metadatas, cached until prepareSplit()
   /// hands them to the cuDF reader. Returns no metadata when the split is
-  /// empty.
-  const std::vector<cudf::io::parquet::FileMetaData>& fileMetaDatas();
+  /// empty or its file is not Parquet.
+  virtual const std::vector<cudf::io::parquet::FileMetaData>& fileMetaDatas();
 
   /// Sets the split-specific pushdown filter. The expression must remain alive
   /// while the split is being read.
