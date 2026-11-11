@@ -911,7 +911,13 @@ void decompressPayloads(
     NIMBLE_GPU_CHECK(
         hostResults[i].status == cudf::io::detail::codec_status::SUCCESS &&
             hostResults[i].bytes_written == expected[i],
-        "decompression failed for payload " + std::to_string(i));
+        "decompression failed for payload " + std::to_string(i) + " of " +
+            std::to_string(count) + ": status " +
+            std::to_string(static_cast<int>(hostResults[i].status)) +
+            ", wrote " + std::to_string(hostResults[i].bytes_written) +
+            " of " + std::to_string(expected[i]) + " bytes from " +
+            std::to_string(inputs[i].size()) + " compressed, max " +
+            std::to_string(maxSize) + ", total " + std::to_string(totalSize));
   }
 }
 
