@@ -56,8 +56,8 @@ class ExchangeStore {
   /// Adds 'payload', which holds 'numRows' rows, to 'file' of 'table'. The
   /// payload's device data must be complete. A payload that goes to the host
   /// tier is copied on 'stream', which is synchronized before its device
-  /// memory is freed.
-  void add(
+  /// memory is freed. Returns whether the payload went to the host tier.
+  bool add(
       std::string_view table,
       std::string_view file,
       PackedExchangePayload payload,
@@ -68,12 +68,21 @@ class ExchangeStore {
   /// the device, in the order in which they were added. Payloads in the host
   /// tier are copied to device memory from 'mr' on 'stream'. Fused FOR lanes
   /// payloads are returned before joinExchangeLanes(). Returns nothing for a
-  /// file without payloads.
+  /// file without payloads. Adds what it took from each tier to 'stats' when
+  /// given.
+  struct TakeStats {
+    uint64_t deviceBytes{0};
+    uint64_t hostBytes{0};
+    /// Time spent copying host-tier payloads to the device.
+    uint64_t copyNanos{0};
+  };
+
   std::vector<std::unique_ptr<PackedTableWithStream>> take(
       std::string_view table,
       std::string_view file,
       cuda::stream_ref stream,
-      rmm::device_async_resource_ref mr);
+      rmm::device_async_resource_ref mr,
+      TakeStats* stats = nullptr);
 
   /// Frees the payloads of every file of 'table' that was not taken.
   void drop(std::string_view table);

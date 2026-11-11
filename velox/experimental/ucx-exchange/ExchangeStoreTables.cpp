@@ -39,6 +39,7 @@
 #include <cudf/concatenate.hpp>
 #include <cudf/partitioning.hpp>
 
+#include <chrono>
 #include <cstring>
 #include <mutex>
 #include <numeric>
@@ -53,6 +54,20 @@ using connector::hive::HiveTableHandle;
 // The content of every placeholder file. A file the writer leaves empty is not
 // reported to the coordinator (FileDataSink::finalizeWriterFile()).
 constexpr std::string_view kPlaceholder{"velox exchange store\n"};
+
+// Runtime stats of the TableWriter: the bytes it packed (uncompressed size),
+// the bytes it stored in each tier (compressed), and the time adding them took
+// (copies to the host tier included).
+constexpr const char* kLogicalBytes{"exchangeStoreLogicalBytes"};
+constexpr const char* kDeviceBytes{"exchangeStoreDeviceBytes"};
+constexpr const char* kHostBytes{"exchangeStoreHostBytes"};
+constexpr const char* kStoreAddNanos{"exchangeStoreAddNanos"};
+
+// Runtime stats of a temporary table scan: the stored bytes it read from each
+// tier and the time spent copying host-tier payloads to the device.
+constexpr const char* kReadDeviceBytes{"exchangeStoreReadDeviceBytes"};
+constexpr const char* kReadHostBytes{"exchangeStoreReadHostBytes"};
+constexpr const char* kReadCopyNanos{"exchangeStoreReadCopyNanos"};
 
 // Rows a writer collects from the CPU before packing them as one payload. The
 // TableWriter hands each file a slice of every batch, which is a small part of
@@ -98,8 +113,7 @@ class ExchangeStoreWriter : public dwio::common::Writer {
       vector_size_t numRows,
       cuda::stream_ref stream) {
     checkRunning();
-    ExchangeStore::instance().add(
-        table_, file_, std::move(payload), numRows, stream);
+    store(std::move(payload), numRows, stream);
   }
 
   bool finish() override {
@@ -157,8 +171,34 @@ class ExchangeStoreWriter : public dwio::common::Writer {
         cudf_velox::get_temp_mr(),
         cudf_velox::get_output_mr());
     stream.sync();
-    ExchangeStore::instance().add(
+    store(std::move(payload), numRows, stream);
+  }
+
+  // Adds a payload to the store and reports its sizes and tier as runtime
+  // stats of the TableWriter.
+  void store(
+      PackedExchangePayload payload,
+      vector_size_t numRows,
+      cuda::stream_ref stream) {
+    const auto logicalBytes = payload.logicalDataSize;
+    const auto storedBytes =
+        payload.packed->gpu_data ? payload.packed->gpu_data->size() : 0;
+    const auto start = std::chrono::steady_clock::now();
+    const bool toHost = ExchangeStore::instance().add(
         table_, file_, std::move(payload), numRows, stream);
+    addThreadLocalRuntimeStat(
+        kStoreAddNanos,
+        RuntimeCounter(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start)
+                .count(),
+            RuntimeCounter::Unit::kNanos));
+    addThreadLocalRuntimeStat(
+        kLogicalBytes,
+        RuntimeCounter(logicalBytes, RuntimeCounter::Unit::kBytes));
+    addThreadLocalRuntimeStat(
+        toHost ? kHostBytes : kDeviceBytes,
+        RuntimeCounter(storedBytes, RuntimeCounter::Unit::kBytes));
   }
 
   const std::unique_ptr<dwio::common::FileSink> sink_;
@@ -462,7 +502,7 @@ class ExchangeStoreDataSource : public connector::DataSource {
     const auto [table, file] = storeKey(filePath(*split));
     stream_ = cudf_velox::cudfGlobalStreamPool().get_stream();
     payloads_ = ExchangeStore::instance().take(
-        table, file, stream_, cudf_velox::get_output_mr());
+        table, file, stream_, cudf_velox::get_output_mr(), &takeStats_);
     next_ = 0;
   }
 
@@ -495,6 +535,9 @@ class ExchangeStoreDataSource : public connector::DataSource {
     next_ = preloaded->next_;
     completedRows_ += preloaded->completedRows_;
     completedBytes_ += preloaded->completedBytes_;
+    takeStats_.deviceBytes += preloaded->takeStats_.deviceBytes;
+    takeStats_.hostBytes += preloaded->takeStats_.hostBytes;
+    takeStats_.copyNanos += preloaded->takeStats_.copyNanos;
   }
 
   void addDynamicFilter(
@@ -512,7 +555,14 @@ class ExchangeStoreDataSource : public connector::DataSource {
   }
 
   std::unordered_map<std::string, RuntimeMetric> getRuntimeStats() override {
-    return {};
+    return {
+        {kReadDeviceBytes,
+         RuntimeMetric(takeStats_.deviceBytes, RuntimeCounter::Unit::kBytes)},
+        {kReadHostBytes,
+         RuntimeMetric(takeStats_.hostBytes, RuntimeCounter::Unit::kBytes)},
+        {kReadCopyNanos,
+         RuntimeMetric(takeStats_.copyNanos, RuntimeCounter::Unit::kNanos)},
+    };
   }
 
  private:
@@ -553,6 +603,7 @@ class ExchangeStoreDataSource : public connector::DataSource {
   size_t next_{0};
   uint64_t completedRows_{0};
   uint64_t completedBytes_{0};
+  ExchangeStore::TakeStats takeStats_;
 };
 
 class ExchangeStoreTables : public cudf_velox::connector::hive::TemporaryTableStorage {

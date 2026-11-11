@@ -19,6 +19,8 @@
 
 #include <glog/logging.h>
 
+#include <chrono>
+
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/pinned_memory.hpp>
 #include <rmm/aligned.hpp>
@@ -50,7 +52,7 @@ void ExchangeStore::setHostCapacity(uint64_t bytes) {
   hostCapacity_ = bytes;
 }
 
-void ExchangeStore::add(
+bool ExchangeStore::add(
     std::string_view table,
     std::string_view file,
     PackedExchangePayload payload,
@@ -98,13 +100,15 @@ void ExchangeStore::add(
   std::lock_guard<std::mutex> lock(mutex_);
   tables_[std::string{table}][std::string{file}].push_back(std::move(stored));
   ++payloads_;
+  return toHost;
 }
 
 std::vector<std::unique_ptr<PackedTableWithStream>> ExchangeStore::take(
     std::string_view table,
     std::string_view file,
     cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr) {
+    rmm::device_async_resource_ref mr,
+    TakeStats* stats) {
   std::vector<StoredPayload> payloads;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -126,8 +130,13 @@ std::vector<std::unique_ptr<PackedTableWithStream>> ExchangeStore::take(
 
   // Copies the host tier's payloads up, then frees their host memory once the
   // copies are done.
+  const auto copyStart = std::chrono::steady_clock::now();
   bool copied = false;
   for (auto& payload : payloads) {
+    if (stats != nullptr) {
+      (payload.host != nullptr ? stats->hostBytes : stats->deviceBytes) +=
+          payload.bytes;
+    }
     if (payload.host == nullptr) {
       continue;
     }
@@ -143,6 +152,11 @@ std::vector<std::unique_ptr<PackedTableWithStream>> ExchangeStore::take(
   }
   if (copied) {
     stream.sync();
+    if (stats != nullptr) {
+      stats->copyNanos += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - copyStart)
+                              .count();
+    }
   }
 
   std::vector<std::unique_ptr<PackedTableWithStream>> result;

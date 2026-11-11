@@ -123,6 +123,18 @@ TEST_P(ExchangeStoreTableTest, readsEachBucketFromItsFile) {
   const auto& tableWriteStats = writeStats.at(writePlan->id()).customStats;
   ASSERT_EQ(tableWriteStats.count("exchangeStoreGpuBatches"), 1);
   EXPECT_GT(tableWriteStats.at("exchangeStoreGpuBatches").sum, 0);
+  // The writer reports what it stored in which tier.
+  EXPECT_GT(tableWriteStats.at("exchangeStoreLogicalBytes").sum, 0);
+  const auto storedIn = [&](const char* name) {
+    return tableWriteStats.count(name) ? tableWriteStats.at(name).sum : 0;
+  };
+  if (GetParam() == 0) {
+    EXPECT_EQ(storedIn("exchangeStoreDeviceBytes"), 0);
+    EXPECT_GT(storedIn("exchangeStoreHostBytes"), 0);
+  } else {
+    EXPECT_GT(storedIn("exchangeStoreDeviceBytes"), 0);
+    EXPECT_EQ(storedIn("exchangeStoreHostBytes"), 0);
+  }
   auto& store = ucx_exchange::ExchangeStore::instance();
   EXPECT_GE(store.stats().payloads, kNumBuckets);
   if (GetParam() == 0) {
@@ -148,10 +160,27 @@ TEST_P(ExchangeStoreTableTest, readsEachBucketFromItsFile) {
                      .fileFormat(dwio::common::FileFormat::PARQUET)
                      .tableBucketNumber(bucket)
                      .build();
-    const auto rows = AssertQueryBuilder(scanPlan(tableType, tableType))
-                          .split(split)
-                          .copyResults(pool());
+    std::shared_ptr<facebook::velox::exec::Task> scanTask;
+    const auto scan = scanPlan(tableType, tableType);
+    const auto rows =
+        AssertQueryBuilder(scan).split(split).copyResults(pool(), scanTask);
     ASSERT_GT(rows->size(), 0);
+    // The scan reports what it read from which tier when it closes.
+    ASSERT_TRUE(facebook::velox::exec::test::waitForTaskCompletion(
+        scanTask.get(), 10'000'000));
+    const auto scanPlanStats =
+        facebook::velox::exec::toPlanStats(scanTask->taskStats());
+    const auto& scanStats = scanPlanStats.at(scan->id()).customStats;
+    const auto readFrom = [&](const char* name) {
+      return scanStats.count(name) ? scanStats.at(name).sum : 0;
+    };
+    EXPECT_GT(
+        readFrom("exchangeStoreReadDeviceBytes") +
+            readFrom("exchangeStoreReadHostBytes"),
+        0);
+    if (GetParam() == 0) {
+      EXPECT_EQ(readFrom("exchangeStoreReadDeviceBytes"), 0);
+    }
     // Every row of the file belongs to the file's bucket.
     std::vector<uint32_t> buckets;
     bucketFunction.partition(*rows, buckets);

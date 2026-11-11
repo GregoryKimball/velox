@@ -144,9 +144,11 @@ class ExchangeStoreTest : public testing::Test,
       ExchangeStore& store,
       std::string_view table,
       std::string_view file,
-      const RowTypePtr& type) {
+      const RowTypePtr& type,
+      ExchangeStore::TakeStats* stats = nullptr) {
     std::vector<RowVectorPtr> rows;
-    for (auto& payload : store.take(table, file, stream_, memoryResource())) {
+    for (auto& payload :
+         store.take(table, file, stream_, memoryResource(), stats)) {
       joinExchangeLanes(*payload, memoryResource());
       const auto view = payload->table != nullptr
           ? payload->table->view()
@@ -230,19 +232,25 @@ TEST_F(ExchangeStoreTest, overflowsToHostWhenDeviceTierIsFull) {
   ExchangeStore store;
   store.setDeviceCapacity(bytes[0]);
   const std::vector<vector_size_t> offsets{0, 300, 700, kNumRows};
+  std::vector<bool> toHost;
   for (int part = 0; part < 3; ++part) {
-    store.add(
+    toHost.push_back(store.add(
         "table",
         "file",
         std::move(payloads[part]),
         offsets[part + 1] - offsets[part],
-        stream_);
+        stream_));
   }
+  EXPECT_THAT(toHost, testing::ElementsAre(false, true, true));
   EXPECT_EQ(store.stats().deviceBytes, bytes[0]);
   EXPECT_EQ(store.stats().hostBytes, bytes[1] + bytes[2]);
 
-  const auto rows = takeRows(store, "table", "file", type);
+  ExchangeStore::TakeStats takeStats;
+  const auto rows = takeRows(store, "table", "file", type, &takeStats);
   ASSERT_EQ(rows.size(), 3);
+  EXPECT_EQ(takeStats.deviceBytes, bytes[0]);
+  EXPECT_EQ(takeStats.hostBytes, bytes[1] + bytes[2]);
+  EXPECT_GT(takeStats.copyNanos, 0);
   for (int part = 0; part < 3; ++part) {
     velox::test::assertEqualVectors(
         expectedRows(input, offsets[part], offsets[part + 1] - offsets[part]),
