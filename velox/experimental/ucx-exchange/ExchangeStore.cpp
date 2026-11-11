@@ -83,12 +83,11 @@ void ExchangeStore::setHostCapacity(uint64_t bytes) {
   hostCapacity_ = bytes;
 }
 
-bool ExchangeStore::add(
-    std::string_view table,
-    std::string_view file,
-    PackedExchangePayload payload,
-    vector_size_t numRows,
-    cuda::stream_ref stream) {
+namespace {
+
+// Wraps the packed data of 'payload' for storing.
+template <typename StoredPayload>
+StoredPayload toStored(PackedExchangePayload payload, vector_size_t numRows) {
   VELOX_CHECK_NOT_NULL(payload.packed);
   StoredPayload stored;
   stored.metadata = std::move(payload.packed->metadata);
@@ -96,7 +95,12 @@ bool ExchangeStore::add(
   stored.numRows = numRows;
   VELOX_CHECK_NOT_NULL(stored.metadata);
   stored.bytes = stored.device ? stored.device->size() : 0;
+  return stored;
+}
 
+} // namespace
+
+bool ExchangeStore::place(StoredPayload& stored, cuda::stream_ref stream) {
   // A payload without data, such as one with no columns, takes no memory and
   // stays in the device tier.
   bool toHost;
@@ -129,61 +133,130 @@ bool ExchangeStore::add(
     stream.sync();
     stored.device.reset();
   }
+  return toHost;
+}
 
+bool ExchangeStore::add(
+    std::string_view table,
+    std::string_view file,
+    PackedExchangePayload payload,
+    vector_size_t numRows,
+    PayloadEncoding encoding,
+    cuda::stream_ref stream) {
+  auto stored = toStored<StoredPayload>(std::move(payload), numRows);
+  stored.encoding = std::move(encoding);
+  const bool toHost = place(stored, stream);
   std::lock_guard<std::mutex> lock(mutex_);
-  tables_[std::string{table}][std::string{file}].push_back(std::move(stored));
+  tables_[std::string{table}].files[std::string{file}].push_back(
+      std::move(stored));
   ++payloads_;
   return toHost;
 }
 
-std::vector<std::unique_ptr<PackedTableWithStream>> ExchangeStore::take(
+uint64_t ExchangeStore::addKeys(
+    std::string_view table,
+    PackedExchangePayload keys,
+    vector_size_t numKeys,
+    uint32_t numReferences,
+    cuda::stream_ref stream) {
+  VELOX_CHECK_GT(numReferences, 0, "Keys must be shared by a payload");
+  auto stored = toStored<StoredPayload>(std::move(keys), numKeys);
+  place(stored, stream);
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto id = nextKeysId_++;
+  tables_[std::string{table}].keys.emplace(
+      id,
+      StoredKeys{
+          std::make_shared<const StoredPayload>(std::move(stored)),
+          numReferences});
+  ++payloads_;
+  return id;
+}
+
+std::vector<ExchangeStore::TakenPayload> ExchangeStore::take(
     std::string_view table,
     std::string_view file,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr,
     TakeStats* stats) {
   std::vector<StoredPayload> payloads;
+  // The keys each payload refers to, in its column order.
+  std::vector<std::vector<std::shared_ptr<const StoredPayload>>> payloadKeys;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto files = tables_.find(table);
-    if (files == tables_.end()) {
+    auto tableIt = tables_.find(table);
+    if (tableIt == tables_.end()) {
       return {};
     }
-    auto it = files->second.find(file);
-    if (it == files->second.end()) {
+    auto& files = tableIt->second.files;
+    auto it = files.find(file);
+    if (it == files.end()) {
       return {};
     }
     payloads = std::move(it->second);
-    files->second.erase(it);
-    if (files->second.empty()) {
-      tables_.erase(files);
-    }
+    files.erase(it);
     forget(payloads);
+    auto& tableKeys = tableIt->second.keys;
+    for (const auto& payload : payloads) {
+      auto& keys = payloadKeys.emplace_back();
+      for (const auto id : payload.encoding.keys) {
+        auto keysIt = tableKeys.find(id);
+        VELOX_CHECK(
+            keysIt != tableKeys.end(),
+            "Keys of a stored payload are missing: {} {}",
+            table,
+            id);
+        keys.push_back(keysIt->second.payload);
+        if (--keysIt->second.numReferences == 0) {
+          forget(*keysIt->second.payload);
+          tableKeys.erase(keysIt);
+        }
+      }
+    }
+    if (files.empty()) {
+      forget(tableIt->second);
+      tables_.erase(tableIt);
+    }
   }
 
-  // Copies the host tier's payloads up, then frees their host memory once the
-  // copies are done.
+  // Copies the host tier's payloads up, and every payload's keys, then frees
+  // the host memory once the copies are done.
   const auto copyStart = std::chrono::steady_clock::now();
   bool copied = false;
-  for (auto& payload : payloads) {
+  const auto copyToDevice = [&](const StoredPayload& payload) {
     if (stats != nullptr) {
       (payload.host != nullptr ? stats->hostBytes : stats->deviceBytes) +=
           payload.bytes;
     }
-    if (payload.host == nullptr) {
-      continue;
+    auto device = std::make_unique<rmm::device_buffer>(payload.bytes, stream, mr);
+    if (payload.bytes > 0) {
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          device->data(),
+          payload.host != nullptr ? payload.host->data()
+                                  : payload.device->data(),
+          payload.bytes,
+          payload.host != nullptr ? cudaMemcpyHostToDevice
+                                  : cudaMemcpyDeviceToDevice,
+          stream.get()));
+      copied = true;
     }
-    payload.device =
-        std::make_unique<rmm::device_buffer>(payload.bytes, stream, mr);
-    CUDF_CUDA_TRY(cudaMemcpyAsync(
-        payload.device->data(),
-        payload.host->data(),
-        payload.bytes,
-        cudaMemcpyHostToDevice,
-        stream.get()));
-    copied = true;
+    return device;
+  };
+  std::vector<std::vector<std::unique_ptr<rmm::device_buffer>>> keyBuffers;
+  for (size_t i = 0; i < payloads.size(); ++i) {
+    auto& payload = payloads[i];
+    if (payload.host != nullptr) {
+      payload.device = copyToDevice(payload);
+    } else if (stats != nullptr) {
+      stats->deviceBytes += payload.bytes;
+    }
+    auto& buffers = keyBuffers.emplace_back();
+    for (const auto& keys : payloadKeys[i]) {
+      buffers.push_back(copyToDevice(*keys));
+    }
   }
   if (copied) {
+    // Another take() may free the keys once this one lets go of them.
     stream.sync();
     if (stats != nullptr) {
       stats->copyNanos += std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -192,9 +265,10 @@ std::vector<std::unique_ptr<PackedTableWithStream>> ExchangeStore::take(
     }
   }
 
-  std::vector<std::unique_ptr<PackedTableWithStream>> result;
+  std::vector<TakenPayload> result;
   result.reserve(payloads.size());
-  for (auto& payload : payloads) {
+  for (size_t i = 0; i < payloads.size(); ++i) {
+    auto& payload = payloads[i];
     payload.host.reset();
     if (payload.device == nullptr) {
       payload.device = std::make_unique<rmm::device_buffer>(0, stream, mr);
@@ -202,17 +276,28 @@ std::vector<std::unique_ptr<PackedTableWithStream>> ExchangeStore::take(
     // A device-tier payload was allocated on the producer's stream. Free it on
     // 'stream' so the release is ordered after the decode reads it.
     payload.device->set_stream(stream);
-    result.push_back(restoreExchangePayload(
+    TakenPayload taken;
+    taken.data = restoreExchangePayload(
         std::move(payload.metadata),
         std::move(payload.device),
         stream,
-        payload.numRows));
+        payload.numRows);
+    taken.encoding = std::move(payload.encoding);
+    for (size_t k = 0; k < payloadKeys[i].size(); ++k) {
+      const auto& keys = *payloadKeys[i][k];
+      taken.keys.push_back(restoreExchangePayload(
+          std::make_unique<std::vector<uint8_t>>(*keys.metadata),
+          std::move(keyBuffers[i][k]),
+          stream,
+          keys.numRows));
+    }
+    result.push_back(std::move(taken));
   }
   return result;
 }
 
 void ExchangeStore::drop(std::string_view table) {
-  Files dropped;
+  Table dropped;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = tables_.find(table);
@@ -221,15 +306,13 @@ void ExchangeStore::drop(std::string_view table) {
     }
     dropped = std::move(it->second);
     tables_.erase(it);
-    for (const auto& [_, payloads] : dropped) {
-      forget(payloads);
-    }
+    forget(dropped);
   }
   // 'dropped' frees both tiers' memory outside the lock.
 }
 
 void ExchangeStore::dropQuery(std::string_view queryId) {
-  std::vector<Files> dropped;
+  std::vector<Table> dropped;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto it = tables_.begin(); it != tables_.end();) {
@@ -237,9 +320,7 @@ void ExchangeStore::dropQuery(std::string_view queryId) {
         ++it;
         continue;
       }
-      for (const auto& [_, payloads] : it->second) {
-        forget(payloads);
-      }
+      forget(it->second);
       dropped.push_back(std::move(it->second));
       it = tables_.erase(it);
     }
@@ -250,8 +331,8 @@ void ExchangeStore::dropQuery(std::string_view queryId) {
 std::size_t ExchangeStore::demote(std::size_t bytes) {
   std::lock_guard<std::mutex> lock(mutex_);
   std::size_t moved = 0;
-  for (auto& [_, files] : tables_) {
-    for (auto& [__, payloads] : files) {
+  for (auto& [_, table] : tables_) {
+    for (auto& [__, payloads] : table.files) {
       for (auto& payload : payloads) {
         if (moved >= bytes) {
           break;
@@ -297,15 +378,28 @@ ExchangeStore::Stats ExchangeStore::stats() const {
       .payloads = payloads_};
 }
 
+void ExchangeStore::forget(const StoredPayload& payload) {
+  if (payload.host != nullptr) {
+    hostBytes_ -= payload.bytes;
+  } else {
+    deviceBytes_ -= payload.bytes;
+  }
+  --payloads_;
+}
+
 void ExchangeStore::forget(const std::vector<StoredPayload>& payloads) {
   for (const auto& payload : payloads) {
-    if (payload.host != nullptr) {
-      hostBytes_ -= payload.bytes;
-    } else {
-      deviceBytes_ -= payload.bytes;
-    }
+    forget(payload);
   }
-  payloads_ -= payloads.size();
+}
+
+void ExchangeStore::forget(const Table& table) {
+  for (const auto& [_, payloads] : table.files) {
+    forget(payloads);
+  }
+  for (const auto& [_, keys] : table.keys) {
+    forget(*keys.payload);
+  }
 }
 
 } // namespace facebook::velox::ucx_exchange

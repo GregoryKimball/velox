@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
+#include "velox/experimental/cudf/connectors/hive/FusedForColumnEncoding.h"
 #include "velox/experimental/cudf/exec/CudfHivePartitionFunction.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
@@ -37,7 +38,15 @@
 #include "velox/exec/TableWriter.h"
 
 #include <cudf/concatenate.hpp>
-#include <cudf/partitioning.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/filling.hpp>
+#include <cudf/null_mask.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/search.hpp>
+#include <cudf/sorting.hpp>
+#include <cudf/strings/strings_column_view.hpp>
+#include <cudf/utilities/error.hpp>
+#include <cudf/utilities/traits.hpp>
 
 #include <chrono>
 #include <cstring>
@@ -51,18 +60,27 @@ namespace {
 using connector::hive::HiveColumnHandle;
 using connector::hive::HiveConnectorSplit;
 using connector::hive::HiveTableHandle;
+using cudf_velox::connector::hive::FusedForEncoding;
 
 // The content of every placeholder file. A file the writer leaves empty is not
 // reported to the coordinator (FileDataSink::finalizeWriterFile()).
 constexpr std::string_view kPlaceholder{"velox exchange store\n"};
 
-// Runtime stats of the TableWriter: the bytes it packed (uncompressed size),
-// the bytes it stored in each tier (compressed), and the time adding them took
-// (copies to the host tier included).
+// Runtime stats of the TableWriter: the bytes it stored (uncompressed size),
+// the bytes it stored in each tier (encoded and compressed, keys excluded),
+// and the time adding them took (copies to the host tier included).
 constexpr const char* kLogicalBytes{"exchangeStoreLogicalBytes"};
 constexpr const char* kDeviceBytes{"exchangeStoreDeviceBytes"};
 constexpr const char* kHostBytes{"exchangeStoreHostBytes"};
 constexpr const char* kStoreAddNanos{"exchangeStoreAddNanos"};
+
+// Runtime stats of the TableWriter: per batch, the columns it stored as
+// dictionary indices or as differences, the stored bytes of the dictionaries'
+// keys, and the time choosing and applying the encodings took.
+constexpr const char* kDictionaryColumns{"exchangeStoreDictionaryColumns"};
+constexpr const char* kDeltaColumns{"exchangeStoreDeltaColumns"};
+constexpr const char* kKeysBytes{"exchangeStoreKeysBytes"};
+constexpr const char* kEncodeNanos{"exchangeStoreEncodeNanos"};
 
 // Runtime stats of a temporary table scan: the stored bytes it read from each
 // tier and the time spent copying host-tier payloads to the device.
@@ -74,6 +92,224 @@ constexpr const char* kReadCopyNanos{"exchangeStoreReadCopyNanos"};
 // TableWriter hands each file a slice of every batch, which is a small part of
 // the batch when the table has many buckets.
 constexpr vector_size_t kPayloadRows{1'000'000};
+
+// Returns the bytes of 'column' uncompressed: its values or characters, null
+// mask and children.
+std::size_t uncompressedBytes(cudf::column_view column, cuda::stream_ref stream) {
+  std::size_t bytes = column.nullable()
+      ? cudf::bitmask_allocation_size_bytes(column.size())
+      : 0;
+  if (cudf::is_fixed_width(column.type())) {
+    bytes += static_cast<std::size_t>(column.size()) *
+        cudf::size_of(column.type());
+  } else if (column.type().id() == cudf::type_id::STRING) {
+    bytes += cudf::strings_column_view(column).chars_size(stream);
+  }
+  for (auto child = column.child_begin(); child != column.child_end();
+       ++child) {
+    bytes += uncompressedBytes(*child, stream);
+  }
+  return bytes;
+}
+
+std::size_t uncompressedBytes(cudf::table_view table, cuda::stream_ref stream) {
+  std::size_t bytes = 0;
+  for (const auto& column : table) {
+    bytes += uncompressedBytes(column, stream);
+  }
+  return bytes;
+}
+
+// Returns whether 'compression' packs with fused FOR, the codec for which
+// encodeForFusedFor() chooses encodings.
+bool packsWithFusedFor(ExchangeCompression compression) {
+  return compression == ExchangeCompression::kFusedForBitpacked ||
+      compression == ExchangeCompression::kFusedForByteAligned ||
+      compression == ExchangeCompression::kFusedForBitpackedLanes;
+}
+
+// Groups the rows of 'table' by their bucket in 'buckets', 0 to 'numBuckets'
+// - 1, and returns the grouped rows with the first row of each bucket and the
+// number of rows. Rows keep their order within a bucket, unlike with
+// cudf::partition(), so that keys that arrive in key order keep the small
+// differences they are stored as (see encodeForFusedFor()).
+std::pair<std::unique_ptr<cudf::table>, std::vector<cudf::size_type>>
+partitionInOrder(
+    cudf::table_view table,
+    cudf::column_view buckets,
+    int32_t numBuckets,
+    cuda::stream_ref stream) {
+  const auto tempMr = cudf_velox::get_temp_mr();
+  const auto order = cudf::stable_sorted_order(
+      cudf::table_view{{buckets}},
+      {cudf::order::ASCENDING},
+      {cudf::null_order::AFTER},
+      stream,
+      tempMr);
+  auto grouped = cudf::gather(
+      table,
+      order->view(),
+      cudf::out_of_bounds_policy::DONT_CHECK,
+      stream,
+      cudf::memory_resources{tempMr, tempMr});
+  const auto sortedBuckets = cudf::gather(
+      cudf::table_view{{buckets}},
+      order->view(),
+      cudf::out_of_bounds_policy::DONT_CHECK,
+      stream,
+      cudf::memory_resources{tempMr, tempMr});
+  const cudf::numeric_scalar<int32_t> zero(0, true, stream, tempMr);
+  const auto bucketNumbers =
+      cudf::sequence(numBuckets + 1, zero, stream, tempMr);
+  const auto firstRows = cudf::lower_bound(
+      sortedBuckets->view(),
+      cudf::table_view{{bucketNumbers->view()}},
+      {cudf::order::ASCENDING},
+      {cudf::null_order::AFTER},
+      stream,
+      tempMr);
+  std::vector<cudf::size_type> offsets(numBuckets + 1);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      offsets.data(),
+      firstRows->view().data<cudf::size_type>(),
+      offsets.size() * sizeof(cudf::size_type),
+      cudaMemcpyDeviceToHost,
+      stream.get()));
+  stream.sync();
+  return {std::move(grouped), std::move(offsets)};
+}
+
+// A batch packed for the store: the payload of each bucket, the encoding of
+// each column, which the payloads share, the keys of each dictionary column in
+// column order with their row counts, and for each column of differences in
+// column order the base of each bucket.
+struct PackedBatch {
+  std::vector<PackedExchangePayload> payloads;
+  std::vector<FusedForEncoding> encodings;
+  std::vector<PackedExchangePayload> keys;
+  std::vector<vector_size_t> numKeys;
+  std::vector<std::vector<int64_t>> bases;
+};
+
+// Encodes the columns of 'table' as the scan cache does (see
+// encodeForFusedFor()) and packs each bucket. Bucket b holds rows 'offsets'[b]
+// to 'offsets'[b + 1], so the differences of a column start over at each
+// bucket, and the dictionary of a column holds the keys of every bucket.
+// Reports the encodings as runtime stats.
+PackedBatch packBatch(
+    cudf::table_view table,
+    const std::vector<cudf::size_type>& offsets,
+    ExchangeCompression compression,
+    cuda::stream_ref stream) {
+  VELOX_CHECK_GE(offsets.size(), 2);
+  PackedBatch batch;
+  std::vector<cudf::column_view> columns;
+  // The encoded columns, which 'columns' points into.
+  std::vector<std::unique_ptr<cudf::column>> encodedColumns;
+  if (packsWithFusedFor(compression)) {
+    const auto start = std::chrono::steady_clock::now();
+    const std::vector<cudf::size_type> segmentStarts(
+        offsets.begin(), offsets.end() - 1);
+    int64_t numDictionaryColumns = 0;
+    int64_t numDeltaColumns = 0;
+    for (const auto& input : table) {
+      const auto column =
+          cudf_velox::connector::hive::withoutEmptyNullMask(input);
+      // encodeForFusedFor() encodes top-level fixed-width and string columns.
+      if (!cudf::is_fixed_width(column.type()) &&
+          column.type().id() != cudf::type_id::STRING) {
+        batch.encodings.push_back(FusedForEncoding::kValues);
+        columns.push_back(column);
+        continue;
+      }
+      auto encoded = cudf_velox::connector::hive::encodeForFusedFor(
+          column, segmentStarts, stream, cudf_velox::get_temp_mr());
+      batch.encodings.push_back(encoded.encoding);
+      if (encoded.encoding == FusedForEncoding::kValues) {
+        columns.push_back(column);
+        continue;
+      }
+      columns.push_back(encoded.encoded->view());
+      encodedColumns.push_back(std::move(encoded.encoded));
+      if (encoded.encoding == FusedForEncoding::kDeltas) {
+        ++numDeltaColumns;
+        VELOX_CHECK_EQ(encoded.segmentBases.size(), segmentStarts.size());
+        batch.bases.push_back(std::move(encoded.segmentBases));
+        continue;
+      }
+      ++numDictionaryColumns;
+      batch.numKeys.push_back(encoded.keys->size());
+      batch.keys.push_back(packExchangePayload(
+          cudf::table_view{{encoded.keys->view()}},
+          compression,
+          stream,
+          cudf_velox::get_temp_mr(),
+          cudf_velox::get_output_mr()));
+    }
+    addThreadLocalRuntimeStat(
+        kDictionaryColumns, RuntimeCounter(numDictionaryColumns));
+    addThreadLocalRuntimeStat(kDeltaColumns, RuntimeCounter(numDeltaColumns));
+    addThreadLocalRuntimeStat(
+        kEncodeNanos,
+        RuntimeCounter(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start)
+                .count(),
+            RuntimeCounter::Unit::kNanos));
+    if (encodedColumns.empty()) {
+      // Every column holds its values.
+      batch.encodings.clear();
+    }
+  } else {
+    columns.assign(table.begin(), table.end());
+  }
+  const std::vector<cudf::size_type> splits(offsets.begin() + 1, offsets.end() - 1);
+  batch.payloads = splitExchangePayloads(
+      cudf::table_view(columns),
+      splits,
+      compression,
+      stream,
+      cudf_velox::get_temp_mr(),
+      cudf_velox::get_output_mr());
+  return batch;
+}
+
+// Adds the keys of 'batch' to 'table' in the store, shared by
+// 'numReferences' payloads, and returns the encoding those payloads are
+// stored with, without the bases (see bucketEncoding()).
+ExchangeStore::PayloadEncoding storeKeys(
+    std::string_view table,
+    PackedBatch& batch,
+    uint32_t numReferences,
+    cuda::stream_ref stream) {
+  ExchangeStore::PayloadEncoding encoding;
+  encoding.columns = batch.encodings;
+  uint64_t keysBytes = 0;
+  for (size_t i = 0; i < batch.keys.size(); ++i) {
+    keysBytes += batch.keys[i].packed->gpu_data
+        ? batch.keys[i].packed->gpu_data->size()
+        : 0;
+    encoding.keys.push_back(ExchangeStore::instance().addKeys(
+        table, std::move(batch.keys[i]), batch.numKeys[i], numReferences, stream));
+  }
+  if (!batch.keys.empty()) {
+    addThreadLocalRuntimeStat(
+        kKeysBytes, RuntimeCounter(keysBytes, RuntimeCounter::Unit::kBytes));
+  }
+  return encoding;
+}
+
+// Returns 'encoding' with the bases of 'bucket' of 'batch'.
+ExchangeStore::PayloadEncoding bucketEncoding(
+    const ExchangeStore::PayloadEncoding& encoding,
+    const PackedBatch& batch,
+    int32_t bucket) {
+  auto result = encoding;
+  for (const auto& bases : batch.bases) {
+    result.bases.push_back(bases[bucket]);
+  }
+  return result;
+}
 
 // Packs what a temporary table writer receives into the exchange store under
 // the key of its file. The file itself only gets the placeholder.
@@ -112,9 +348,15 @@ class ExchangeStoreWriter : public dwio::common::Writer {
   void addPayload(
       PackedExchangePayload payload,
       vector_size_t numRows,
+      ExchangeStore::PayloadEncoding encoding,
       cuda::stream_ref stream) {
     checkRunning();
-    store(std::move(payload), numRows, stream);
+    store(std::move(payload), numRows, std::move(encoding), stream);
+  }
+
+  // The table under which the store keeps the file.
+  const std::string& table() const {
+    return table_;
   }
 
   bool finish() override {
@@ -164,29 +406,32 @@ class ExchangeStoreWriter : public dwio::common::Writer {
     pendingRows_ = 0;
   }
 
+  // Packs 'table', all of which belongs to this writer's file, and adds it.
   void add(cudf::table_view table, vector_size_t numRows, cuda::stream_ref stream) {
-    auto payload = packExchangePayload(
-        table,
-        compression_,
-        stream,
-        cudf_velox::get_temp_mr(),
-        cudf_velox::get_output_mr());
+    addThreadLocalRuntimeStat(
+        kLogicalBytes,
+        RuntimeCounter(
+            uncompressedBytes(table, stream), RuntimeCounter::Unit::kBytes));
+    auto batch = packBatch(table, {0, numRows}, compression_, stream);
+    VELOX_CHECK_EQ(batch.payloads.size(), 1);
     stream.sync();
-    store(std::move(payload), numRows, stream);
+    const auto encoding =
+        bucketEncoding(storeKeys(table_, batch, 1, stream), batch, 0);
+    store(std::move(batch.payloads[0]), numRows, encoding, stream);
   }
 
-  // Adds a payload to the store and reports its sizes and tier as runtime
+  // Adds a payload to the store and reports its size and tier as runtime
   // stats of the TableWriter.
   void store(
       PackedExchangePayload payload,
       vector_size_t numRows,
+      ExchangeStore::PayloadEncoding encoding,
       cuda::stream_ref stream) {
-    const auto logicalBytes = payload.logicalDataSize;
     const auto storedBytes =
         payload.packed->gpu_data ? payload.packed->gpu_data->size() : 0;
     const auto start = std::chrono::steady_clock::now();
     const bool toHost = ExchangeStore::instance().add(
-        table_, file_, std::move(payload), numRows, stream);
+        table_, file_, std::move(payload), numRows, std::move(encoding), stream);
     addThreadLocalRuntimeStat(
         kStoreAddNanos,
         RuntimeCounter(
@@ -194,9 +439,6 @@ class ExchangeStoreWriter : public dwio::common::Writer {
                 std::chrono::steady_clock::now() - start)
                 .count(),
             RuntimeCounter::Unit::kNanos));
-    addThreadLocalRuntimeStat(
-        kLogicalBytes,
-        RuntimeCounter(logicalBytes, RuntimeCounter::Unit::kBytes));
     addThreadLocalRuntimeStat(
         toHost ? kHostBytes : kDeviceBytes,
         RuntimeCounter(storedBytes, RuntimeCounter::Unit::kBytes));
@@ -290,32 +532,48 @@ class ExchangeStoreDataSink : public connector::hive::HiveDataSink {
     const auto table = gpuInput->getTableView();
     const auto buckets =
         gpuBucketFunction_->partitions(table, stream, cudf_velox::get_temp_mr());
-    auto [partitioned, offsets] = cudf::partition(
-        table, buckets->view(), bucketCount_, stream, cudf_velox::get_temp_mr());
+    auto [partitioned, offsets] =
+        partitionInOrder(table, buckets->view(), bucketCount_, stream);
     VELOX_CHECK_EQ(offsets.size(), static_cast<size_t>(bucketCount_) + 1);
-    const std::vector<cudf::size_type> splits(offsets.begin() + 1, offsets.end() - 1);
-    auto payloads = splitExchangePayloads(
-        partitioned->view(),
-        splits,
-        compression_,
-        stream,
-        cudf_velox::get_temp_mr(),
-        cudf_velox::get_output_mr());
-    VELOX_CHECK_EQ(payloads.size(), static_cast<size_t>(bucketCount_));
+    addThreadLocalRuntimeStat(
+        kLogicalBytes,
+        RuntimeCounter(
+            uncompressedBytes(table, stream), RuntimeCounter::Unit::kBytes));
+    auto batch = packBatch(partitioned->view(), offsets, compression_, stream);
+    VELOX_CHECK_EQ(batch.payloads.size(), static_cast<size_t>(bucketCount_));
     stream.sync();
     addThreadLocalRuntimeStat(kGpuBatches, RuntimeCounter(1));
 
+    // The writer of each bucket with rows. The keys are stored under the
+    // writers' table and shared by their payloads.
+    std::vector<std::pair<int32_t, uint32_t>> bucketWriters;
     for (int32_t bucket = 0; bucket < bucketCount_; ++bucket) {
-      const auto numRows = offsets[bucket + 1] - offsets[bucket];
-      if (numRows == 0) {
-        continue;
+      if (offsets[bucket + 1] > offsets[bucket]) {
+        bucketWriters.emplace_back(
+            bucket,
+            ensureWriter(
+                connector::hive::WriterId{
+                    std::nullopt, static_cast<uint32_t>(bucket)}));
       }
-      const auto index = ensureWriter(
-          connector::hive::WriterId{std::nullopt, static_cast<uint32_t>(bucket)});
+    }
+    const auto writerAt = [&](uint32_t index) {
       auto* writer = dynamic_cast<ExchangeStoreWriter*>(writers_[index].get());
       VELOX_CHECK_NOT_NULL(writer);
-      const auto bytes = payloads[bucket].logicalDataSize;
-      writer->addPayload(std::move(payloads[bucket]), numRows, stream);
+      return writer;
+    };
+    const auto encoding = storeKeys(
+        writerAt(bucketWriters.front().second)->table(),
+        batch,
+        bucketWriters.size(),
+        stream);
+    for (const auto [bucket, index] : bucketWriters) {
+      const auto numRows = offsets[bucket + 1] - offsets[bucket];
+      const auto bytes = batch.payloads[bucket].logicalDataSize;
+      writerAt(index)->addPayload(
+          std::move(batch.payloads[bucket]),
+          numRows,
+          bucketEncoding(encoding, batch, bucket),
+          stream);
       auto& info = writerInfo_[index];
       info->numWrittenRows += numRows;
       info->currentFileWrittenRows += numRows;
@@ -465,6 +723,62 @@ const std::string& filePath(const connector::ConnectorSplit& split) {
   return hiveSplit->filePath;
 }
 
+// A payload taken from the store and ready to read: the columns that were
+// encoded are decoded into columns of their own, the others stay in the
+// payload's storage.
+struct RestoredPayload {
+  std::unique_ptr<PackedTableWithStream> data;
+  // The decoded column at each encoded column's index, null elsewhere.
+  std::vector<std::unique_ptr<cudf::column>> decoded;
+  cudf::table_view view;
+};
+
+RestoredPayload restore(ExchangeStore::TakenPayload taken, cuda::stream_ref stream) {
+  joinExchangeLanes(*taken.data, cudf_velox::get_output_mr());
+  RestoredPayload restored;
+  restored.view = taken.data->tableView();
+  const auto& encodings = taken.encoding.columns;
+  if (!encodings.empty()) {
+    VELOX_CHECK_EQ(
+        encodings.size(),
+        restored.view.num_columns(),
+        "A stored payload's encodings do not match its columns");
+    std::vector<cudf::column_view> columns(
+        restored.view.begin(), restored.view.end());
+    restored.decoded.resize(columns.size());
+    size_t nextKeys = 0;
+    size_t nextBase = 0;
+    for (size_t i = 0; i < columns.size(); ++i) {
+      std::optional<cudf::column_view> keys;
+      int64_t base = 0;
+      if (encodings[i] == FusedForEncoding::kDictionary) {
+        VELOX_CHECK_LT(nextKeys, taken.keys.size());
+        auto& keysData = *taken.keys[nextKeys++];
+        joinExchangeLanes(keysData, cudf_velox::get_output_mr());
+        keys = keysData.tableView().column(0);
+      } else if (encodings[i] == FusedForEncoding::kDeltas) {
+        VELOX_CHECK_LT(nextBase, taken.encoding.bases.size());
+        base = taken.encoding.bases[nextBase++];
+      }
+      restored.decoded[i] = cudf_velox::connector::hive::decodeFusedForEncoding(
+          encodings[i],
+          columns[i],
+          keys,
+          base,
+          stream,
+          cudf_velox::get_output_mr(),
+          cudf_velox::get_temp_mr());
+      if (restored.decoded[i] != nullptr) {
+        columns[i] = restored.decoded[i]->view();
+      }
+    }
+    restored.view = cudf::table_view(columns);
+    // The keys are freed on 'stream', after the gathers that read them.
+  }
+  restored.data = std::move(taken.data);
+  return restored;
+}
+
 // Returns, for each split of a temporary table, the payloads the writer kept
 // for its file, with the scan's columns.
 class ExchangeStoreDataSource : public connector::DataSource {
@@ -515,22 +829,22 @@ class ExchangeStoreDataSource : public connector::DataSource {
       override {
     const auto targetRows = static_cast<vector_size_t>(
         cudf_velox::CudfConfig::getInstance().batchSizeMinThreshold);
-    std::vector<std::unique_ptr<PackedTableWithStream>> batch;
+    std::vector<RestoredPayload> batch;
     vector_size_t batchRows = 0;
     while (next_ < payloads_.size() &&
            (batch.empty() || batchRows < targetRows) &&
            (batch.empty() ||
-            static_cast<int64_t>(batchRows) + payloads_[next_]->numRows <=
+            static_cast<int64_t>(batchRows) + payloads_[next_].data->numRows <=
                 std::numeric_limits<cudf::size_type>::max())) {
-      auto data = std::move(payloads_[next_++]);
-      joinExchangeLanes(*data, cudf_velox::get_output_mr());
-      if (data->numRows == 0) {
+      auto restored = restore(std::move(payloads_[next_++]), stream_);
+      const auto numRows = restored.data->numRows;
+      if (numRows == 0) {
         continue;
       }
-      completedRows_ += data->numRows;
-      completedBytes_ += data->gpuDataSize();
-      batchRows += data->numRows;
-      batch.push_back(std::move(data));
+      completedRows_ += numRows;
+      completedBytes_ += restored.data->gpuDataSize();
+      batchRows += numRows;
+      batch.push_back(std::move(restored));
     }
     if (batch.size() == 1) {
       return toOutput(std::move(batch[0]));
@@ -586,13 +900,33 @@ class ExchangeStoreDataSource : public connector::DataSource {
   }
 
  private:
-  RowVectorPtr toOutput(std::unique_ptr<PackedTableWithStream> data) {
-    const auto view = data->tableView();
+  RowVectorPtr toOutput(RestoredPayload restored) {
+    const auto view = restored.view;
     VELOX_CHECK_EQ(
         view.num_columns(),
         dataColumns_->size(),
         "A stored payload does not have the temporary table's columns");
+    auto& data = restored.data;
     const auto numRows = data->numRows;
+    if (!restored.decoded.empty()) {
+      // Decoded columns move to the output, the others are copied out of the
+      // payload's storage.
+      std::vector<std::unique_ptr<cudf::column>> columns;
+      for (const auto column : columns_) {
+        if (restored.decoded[column] != nullptr) {
+          columns.push_back(std::move(restored.decoded[column]));
+        } else {
+          columns.push_back(std::make_unique<cudf::column>(
+              view.column(column), data->stream, cudf_velox::get_output_mr()));
+        }
+      }
+      return std::make_shared<cudf_velox::CudfVector>(
+          pool_,
+          outputType_,
+          numRows,
+          std::make_unique<cudf::table>(std::move(columns)),
+          data->stream);
+    }
     if (allColumns_) {
       if (data->table != nullptr) {
         return std::make_shared<cudf_velox::CudfVector>(
@@ -613,12 +947,12 @@ class ExchangeStoreDataSource : public connector::DataSource {
 
   // Concatenates the scan's columns of 'batch' into one CudfVector.
   RowVectorPtr concatenate(
-      const std::vector<std::unique_ptr<PackedTableWithStream>>& batch,
+      const std::vector<RestoredPayload>& batch,
       vector_size_t numRows) {
     std::vector<cudf::table_view> views;
     views.reserve(batch.size());
-    for (const auto& data : batch) {
-      const auto view = data->tableView();
+    for (const auto& restored : batch) {
+      const auto view = restored.view;
       VELOX_CHECK_EQ(
           view.num_columns(),
           dataColumns_->size(),
@@ -642,7 +976,7 @@ class ExchangeStoreDataSource : public connector::DataSource {
   // Whether the output is every column of the table in order.
   bool allColumns_{false};
   cuda::stream_ref stream_{cudaStream_t{cudaStreamDefault}};
-  std::vector<std::unique_ptr<PackedTableWithStream>> payloads_;
+  std::vector<ExchangeStore::TakenPayload> payloads_;
   size_t next_{0};
   uint64_t completedRows_{0};
   uint64_t completedBytes_{0};

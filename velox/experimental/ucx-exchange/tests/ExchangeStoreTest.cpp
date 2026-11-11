@@ -147,8 +147,10 @@ class ExchangeStoreTest : public testing::Test,
       const RowTypePtr& type,
       ExchangeStore::TakeStats* stats = nullptr) {
     std::vector<RowVectorPtr> rows;
-    for (auto& payload :
+    for (auto& taken :
          store.take(table, file, stream_, memoryResource(), stats)) {
+      EXPECT_THAT(taken.encoding.columns, testing::IsEmpty());
+      auto& payload = taken.data;
       joinExchangeLanes(*payload, memoryResource());
       const auto view = payload->table != nullptr
           ? payload->table->view()
@@ -198,8 +200,7 @@ TEST_F(ExchangeStoreTest, roundTripsEveryTpchColumnTypeInEitherTier) {
             "table",
             std::to_string(bucket),
             std::move(payloads[bucket]),
-            offsets[bucket + 1] - offsets[bucket],
-            stream_);
+            offsets[bucket + 1] - offsets[bucket], {}, stream_);
       }
       EXPECT_EQ(store.stats().deviceBytes, device ? totalBytes : 0);
       EXPECT_EQ(store.stats().hostBytes, device ? 0 : totalBytes);
@@ -238,8 +239,7 @@ TEST_F(ExchangeStoreTest, overflowsToHostWhenDeviceTierIsFull) {
         "table",
         "file",
         std::move(payloads[part]),
-        offsets[part + 1] - offsets[part],
-        stream_));
+        offsets[part + 1] - offsets[part], {}, stream_));
   }
   EXPECT_THAT(toHost, testing::ElementsAre(false, true, true));
   EXPECT_EQ(store.stats().deviceBytes, bytes[0]);
@@ -274,11 +274,10 @@ TEST_F(ExchangeStoreTest, dropFreesEveryFileOfOneTableInBothTiers) {
         "dropped",
         std::to_string(bucket),
         std::move(dropped[bucket]),
-        1,
-        stream_);
+        1, {}, stream_);
   }
   ASSERT_GT(store.stats().hostBytes, 0);
-  store.add("kept", "0", std::move(kept[0]), kNumRows, stream_);
+  store.add("kept", "0", std::move(kept[0]), kNumRows, {}, stream_);
 
   store.drop("dropped");
   EXPECT_EQ(store.stats().deviceBytes + store.stats().hostBytes, keptBytes);
@@ -299,10 +298,10 @@ TEST_F(ExchangeStoreTest, dropQueryFreesOnlyThatQuerysTables) {
   auto payloads = pack(input, {300, 700}, compressions().back());
   ExchangeStore store;
   store.setDeviceCapacity(bytesOf(payloads[0]));
-  store.add("__presto_temporary_table_ORC_q1_a", "0", std::move(payloads[0]), 300, stream_);
-  store.add("__presto_temporary_table_ORC_q1_b", "0", std::move(payloads[1]), 400, stream_);
+  store.add("__presto_temporary_table_ORC_q1_a", "0", std::move(payloads[0]), 300, {}, stream_);
+  store.add("__presto_temporary_table_ORC_q1_b", "0", std::move(payloads[1]), 400, {}, stream_);
   const auto keptBytes = bytesOf(payloads[2]);
-  store.add("__presto_temporary_table_ORC_q2_a", "0", std::move(payloads[2]), 300, stream_);
+  store.add("__presto_temporary_table_ORC_q2_a", "0", std::move(payloads[2]), 300, {}, stream_);
 
   store.dropQuery("q1");
   EXPECT_EQ(store.stats().payloads, 1);
@@ -315,6 +314,75 @@ TEST_F(ExchangeStoreTest, dropQueryFreesOnlyThatQuerysTables) {
       testing::SizeIs(1));
 }
 
+TEST_F(ExchangeStoreTest, keepsSharedKeysUntilTheirLastPayloadIsTaken) {
+  using cudf_velox::connector::hive::FusedForEncoding;
+  const auto keysInput = makeRowVector({makeFlatVector<int64_t>({10, 20, 30})});
+  const auto indicesInput =
+      makeRowVector({makeFlatVector<int32_t>({2, 0, 1, 1, 0, 2})});
+  const auto keysType = asRowType(keysInput->type());
+
+  for (const bool device : {true, false}) {
+    SCOPED_TRACE(device ? "device tier" : "host tier");
+    ExchangeStore store;
+    store.setDeviceCapacity(device ? kUnlimited : 0);
+    auto keys = pack(keysInput, {}, ExchangeCompression::kFusedForBitpacked);
+    const auto keysBytes = bytesOf(keys[0]);
+    // Two files of one batch share the keys, a third table has its own.
+    const auto id = store.addKeys("table", std::move(keys[0]), 3, 2, stream_);
+    auto indices =
+        pack(indicesInput, {4}, ExchangeCompression::kFusedForBitpacked);
+    const auto indicesBytes = bytesOf(indices[0]) + bytesOf(indices[1]);
+    const ExchangeStore::PayloadEncoding encoding{
+        {FusedForEncoding::kDictionary}, {id}, {}};
+    store.add("table", "0", std::move(indices[0]), 4, encoding, stream_);
+    store.add("table", "1", std::move(indices[1]), 2, encoding, stream_);
+    EXPECT_EQ(store.stats().payloads, 3);
+    EXPECT_EQ(
+        device ? store.stats().deviceBytes : store.stats().hostBytes,
+        keysBytes + indicesBytes);
+    // Keys stay where they are when the device tier shrinks.
+    store.demote(std::numeric_limits<std::size_t>::max());
+    EXPECT_EQ(store.stats().deviceBytes, device ? keysBytes : 0);
+
+    for (const auto& [file, numRows] :
+         {std::pair<std::string, int>{"0", 4}, {"1", 2}}) {
+      auto taken = store.take("table", file, stream_, memoryResource());
+      ASSERT_EQ(taken.size(), 1);
+      EXPECT_THAT(
+          taken[0].encoding.columns,
+          testing::ElementsAre(FusedForEncoding::kDictionary));
+      ASSERT_EQ(taken[0].keys.size(), 1);
+      EXPECT_EQ(taken[0].data->numRows, numRows);
+      auto& keysData = *taken[0].keys[0];
+      EXPECT_EQ(keysData.numRows, 3);
+      velox::test::assertEqualVectors(
+          keysInput,
+          cudf_velox::with_arrow::toVeloxColumn(
+              keysData.tableView(), pool(), keysType, "", stream_, memoryResource()));
+      // The keys stay while the other file still refers to them.
+      EXPECT_EQ(store.stats().payloads, file == "0" ? 2 : 0);
+    }
+    EXPECT_EQ(store.stats().deviceBytes + store.stats().hostBytes, 0);
+
+    // Dropping a table frees its keys too.
+    auto otherKeys = pack(keysInput, {}, ExchangeCompression::kFusedForBitpacked);
+    const auto otherId =
+        store.addKeys("other", std::move(otherKeys[0]), 3, 1, stream_);
+    auto otherIndices =
+        pack(indicesInput, {}, ExchangeCompression::kFusedForBitpacked);
+    store.add(
+        "other",
+        "0",
+        std::move(otherIndices[0]),
+        6,
+        {{FusedForEncoding::kDictionary}, {otherId}, {}},
+        stream_);
+    store.drop("other");
+    EXPECT_EQ(store.stats().payloads, 0);
+    EXPECT_EQ(store.stats().deviceBytes + store.stats().hostBytes, 0);
+  }
+}
+
 TEST_F(ExchangeStoreTest, demotesDeviceTierToHostAndStaysSmaller) {
   const auto input = makeInput();
   const auto type = asRowType(input->type());
@@ -323,8 +391,8 @@ TEST_F(ExchangeStoreTest, demotesDeviceTierToHostAndStaysSmaller) {
       bytesOf(payloads[0]), bytesOf(payloads[1]), bytesOf(payloads[2])};
   ExchangeStore store;
   store.setDeviceCapacity(kUnlimited);
-  store.add("table", "0", std::move(payloads[0]), 300, stream_);
-  store.add("table", "1", std::move(payloads[1]), 400, stream_);
+  store.add("table", "0", std::move(payloads[0]), 300, {}, stream_);
+  store.add("table", "1", std::move(payloads[1]), 400, {}, stream_);
   ASSERT_EQ(store.stats().deviceBytes, bytes[0] + bytes[1]);
 
   // A one-byte request moves one payload.
@@ -334,7 +402,7 @@ TEST_F(ExchangeStoreTest, demotesDeviceTierToHostAndStaysSmaller) {
   EXPECT_EQ(store.stats().deviceBytes, bytes[0] + bytes[1] - moved);
 
   // The device tier stays at its smaller size: the next payload goes to host.
-  store.add("table", "2", std::move(payloads[2]), 300, stream_);
+  store.add("table", "2", std::move(payloads[2]), 300, {}, stream_);
   EXPECT_EQ(store.stats().hostBytes, moved + bytes[2]);
 
   const std::vector<vector_size_t> offsets{0, 300, 700, kNumRows};
@@ -356,9 +424,9 @@ TEST_F(ExchangeStoreTest, failsWhenHostTierIsFull) {
   ExchangeStore store;
   store.setDeviceCapacity(0);
   store.setHostCapacity(firstBytes);
-  store.add("table", "0", std::move(payloads[0]), 500, stream_);
+  store.add("table", "0", std::move(payloads[0]), 500, {}, stream_);
   VELOX_ASSERT_THROW(
-      store.add("table", "1", std::move(payloads[1]), 500, stream_),
+      store.add("table", "1", std::move(payloads[1]), 500, {}, stream_),
       "The exchange store's host tier is full");
   EXPECT_EQ(store.stats().hostBytes, firstBytes);
   EXPECT_EQ(store.stats().payloads, 1);

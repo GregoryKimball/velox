@@ -54,6 +54,8 @@ class ExchangeStoreTableTest : public CudfHiveConnectorTestBase,
     CudfHiveConnectorTestBase::SetUp();
     // The TableWriter has no GPU operator and runs on the CPU, as in Presto.
     CudfConfig::getInstance().allowCpuFallback = true;
+    // The store encodes columns for fused FOR, the codec of the best runs.
+    CudfConfig::getInstance().exchangeCompression = "fused-for-bitpacked";
     ucx_exchange::registerExchangeStoreTables(GetParam(), 0);
   }
 
@@ -61,9 +63,13 @@ class ExchangeStoreTableTest : public CudfHiveConnectorTestBase,
     // The store is process-wide. A failed test must not leave data behind.
     ucx_exchange::ExchangeStore::instance().drop(kTable);
     ucx_exchange::unregisterExchangeStoreTables();
+    CudfConfig::getInstance().exchangeCompression = "none";
     CudfHiveConnectorTestBase::TearDown();
   }
 
+  // Columns the store encodes as the scan cache does: ascending keys as
+  // differences, strings and decimals with few distinct values as dictionary
+  // indices, and doubles with nulls as they are.
   std::vector<RowVectorPtr> makeInput() {
     std::vector<std::string> names;
     for (vector_size_t row = 0; row < kBatchRows; ++row) {
@@ -72,12 +78,27 @@ class ExchangeStoreTableTest : public CudfHiveConnectorTestBase,
     std::vector<RowVectorPtr> input;
     for (int batch = 0; batch < 3; ++batch) {
       input.push_back(makeRowVector(
-          {"key", "name", "value"},
+          {"key", "name", "quantity", "total", "value"},
           {
               makeFlatVector<int64_t>(
                   kBatchRows,
-                  [batch](auto row) { return batch * kBatchRows + row; }),
+                  [batch](auto row) {
+                    return 1'000'000'000'000 + (batch * kBatchRows + row) * 3;
+                  }),
               makeFlatVector<std::string>(names),
+              makeFlatVector<int64_t>(
+                  kBatchRows,
+                  [](auto row) { return (row * 7 % 50 + 1) * 100; },
+                  nullptr,
+                  DECIMAL(12, 2)),
+              makeFlatVector<int128_t>(
+                  kBatchRows,
+                  [](auto row) {
+                    return static_cast<int128_t>(row % 7) *
+                        1'000'000'000'000'000'000;
+                  },
+                  nullptr,
+                  DECIMAL(38, 2)),
               makeFlatVector<double>(
                   kBatchRows, [](auto row) { return row * 0.5; }, nullEvery(7)),
           }));
@@ -123,8 +144,15 @@ TEST_P(ExchangeStoreTableTest, readsEachBucketFromItsFile) {
   const auto& tableWriteStats = writeStats.at(writePlan->id()).customStats;
   ASSERT_EQ(tableWriteStats.count("exchangeStoreGpuBatches"), 1);
   EXPECT_GT(tableWriteStats.at("exchangeStoreGpuBatches").sum, 0);
-  // The writer reports what it stored in which tier.
+  // The writer reports what it stored in which tier, and how it encoded the
+  // columns: per batch, the key as differences and the name, quantity and
+  // total as dictionaries.
   EXPECT_GT(tableWriteStats.at("exchangeStoreLogicalBytes").sum, 0);
+  const auto numBatches = tableWriteStats.at("exchangeStoreGpuBatches").sum;
+  EXPECT_EQ(tableWriteStats.at("exchangeStoreDeltaColumns").sum, numBatches);
+  EXPECT_EQ(
+      tableWriteStats.at("exchangeStoreDictionaryColumns").sum, 3 * numBatches);
+  EXPECT_GT(tableWriteStats.at("exchangeStoreKeysBytes").sum, 0);
   const auto storedIn = [&](const char* name) {
     return tableWriteStats.count(name) ? tableWriteStats.at(name).sum : 0;
   };
@@ -225,14 +253,17 @@ TEST_P(ExchangeStoreTableTest, readsTheScanColumnsInTheScanOrder) {
             .build());
   }
   ASSERT_EQ(splits.size(), 1);
-  const auto outputType = ROW({"value", "key"}, {DOUBLE(), BIGINT()});
+  // A column of differences, a dictionary column and a column of values.
+  const auto outputType = ROW(
+      {"value", "key", "name"}, {DOUBLE(), BIGINT(), VARCHAR()});
   const auto rows = AssertQueryBuilder(scanPlan(outputType, tableType))
                         .splits(splits)
                         .copyResults(pool());
   std::vector<RowVectorPtr> expected;
   for (const auto& batch : input) {
-    expected.push_back(
-        makeRowVector({"value", "key"}, {batch->childAt(2), batch->childAt(0)}));
+    expected.push_back(makeRowVector(
+        {"value", "key", "name"},
+        {batch->childAt(4), batch->childAt(0), batch->childAt(1)}));
   }
   facebook::velox::exec::test::assertEqualResults(expected, {rows});
 }
