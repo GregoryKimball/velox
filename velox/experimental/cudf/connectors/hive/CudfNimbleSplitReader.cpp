@@ -130,7 +130,7 @@ CudfNimbleSplitReader::readNextChunk() {
   std::unique_ptr<cudf::table> table;
   {
     nvtx3::scoped_range range{"CudfNimbleSplitReader::toDevice"};
-    table = toCudfTable(
+    table = with_arrow::toCudfTable(
         rowVector,
         connectorQueryCtx_->memoryPool(),
         stream_,

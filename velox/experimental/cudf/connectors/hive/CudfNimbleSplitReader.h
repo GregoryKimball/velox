@@ -18,6 +18,7 @@
 
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReader.h"
 
+#include "velox/dwio/common/BufferedInput.h"
 #include "velox/dwio/common/Reader.h"
 #include "velox/dwio/common/ScanSpec.h"
 
