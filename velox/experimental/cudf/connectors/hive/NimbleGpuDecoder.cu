@@ -710,7 +710,7 @@ class StripeDecode {
         indices->view(),
         cudf::out_of_bounds_policy::DONT_CHECK,
         stream_,
-        mr_);
+        cudf::memory_resources{mr_, mr_});
     return std::move(gathered->release()[0]);
   }
 
