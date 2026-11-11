@@ -98,6 +98,16 @@ void TpchQueryBuilder::readFileSchema(
   auto columnNames = columns;
   auto types = fileType->children();
   types.resize(columnNames.size());
+  if (format_ == dwio::common::FileFormat::NIMBLE) {
+    // Nimble stores only the physical type, so DATE columns read back as
+    // INTEGER.
+    for (size_t i = 0; i < types.size(); ++i) {
+      if (types[i]->kind() == TypeKind::INTEGER &&
+          columnNames[i].ends_with("date")) {
+        types[i] = DATE();
+      }
+    }
+  }
   tableMetadata_[tableName].type =
       std::make_shared<RowType>(std::move(columnNames), std::move(types));
   tableMetadata_[tableName].fileColumnNames = std::move(fileColumnNamesMap);
