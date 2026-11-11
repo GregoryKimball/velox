@@ -32,15 +32,18 @@
 #include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
 
-#include <experimental/cudf/connectors/hive/CudfHiveConnector.h>
-
 #include <rmm/mr/pinned_host_memory_resource.hpp>
 
+#include <experimental/cudf/connectors/hive/CudfHiveConnector.h>
 #include <fmt/format.h>
+#include <folly/ScopeGuard.h>
 #include <folly/String.h>
+#include <folly/json.h>
 
 #include <chrono>
+#include <cmath>
 #include <filesystem>
+#include <iomanip>
 #include <sstream>
 
 DECLARE_int64(max_coalesced_bytes);
@@ -49,6 +52,7 @@ DECLARE_int32(parquet_prefetch_rowgroups);
 DECLARE_string(data_path);
 DECLARE_int32(num_repeats);
 DECLARE_int32(run_query_verbose);
+DECLARE_int32(io_meter_column_pct);
 
 using namespace facebook::velox;
 using namespace facebook::velox::common::testutil;
@@ -131,6 +135,26 @@ DEFINE_string(
     "process, initializing (and with --encoded, loading the tables) once. Each "
     "query's output starts with a 'Running query N' line. Overrides "
     "--run_query_verbose.");
+
+DEFINE_double(
+    scale_factor,
+    1,
+    "TPC-H scale factor of the data in --data_path. Sets Q11's FRACTION, "
+    "0.0001 / scale factor.");
+
+namespace {
+bool validateScaleFactor(const char* /*flagName*/, double value) {
+  return std::isfinite(value) && value > 0;
+}
+} // namespace
+
+DEFINE_validator(scale_factor, &validateScaleFactor);
+
+DEFINE_string(
+    results_json_dir,
+    "",
+    "If set, after timing a query, write its result rows to "
+    "<dir>/q<N>.json, DOUBLE values with 17 significant digits.");
 
 namespace {
 
@@ -215,6 +239,46 @@ void printRows(const std::vector<RowVectorPtr>& results, std::ostream& out) {
   out << std::endl;
 }
 
+// Writes {"types": [...], "rows": [[...], ...]} to
+// <--results_json_dir>/q<queryId>.json. A value is null, a DOUBLE with 17
+// significant digits, or what BaseVector::toString() prints for it.
+void writeResultsJson(
+    int32_t queryId,
+    const std::vector<RowVectorPtr>& results) {
+  std::filesystem::create_directories(FLAGS_results_json_dir);
+  folly::dynamic doc = folly::dynamic::object;
+  doc["types"] = folly::dynamic::array;
+  doc["rows"] = folly::dynamic::array;
+  if (!results.empty()) {
+    for (const auto& child : results.front()->children()) {
+      doc["types"].push_back(child->type()->toString());
+    }
+  }
+  for (const auto& batch : results) {
+    for (vector_size_t row = 0; row < batch->size(); ++row) {
+      folly::dynamic values = folly::dynamic::array;
+      for (const auto& child : batch->children()) {
+        if (child->isNullAt(row)) {
+          values.push_back(nullptr);
+        } else if (child->typeKind() == TypeKind::DOUBLE) {
+          const auto* doubles = child->as<SimpleVector<double>>();
+          VELOX_CHECK_NOT_NULL(doubles);
+          std::ostringstream value;
+          value << std::setprecision(17) << doubles->valueAt(row);
+          values.push_back(value.str());
+        } else {
+          values.push_back(child->toString(row));
+        }
+      }
+      doc["rows"].push_back(std::move(values));
+    }
+  }
+  const auto path = fmt::format("{}/q{}.json", FLAGS_results_json_dir, queryId);
+  std::ofstream file(path);
+  file << folly::toJson(doc) << std::endl;
+  VELOX_CHECK(file.good(), "Failed to write {}", path);
+}
+
 } // namespace
 
 void CudfTpchBenchmark::initialize() {
@@ -223,21 +287,22 @@ void CudfTpchBenchmark::initialize() {
         cudf_velox::loadPropertiesFile(FLAGS_cudf_properties));
   }
 
-  TpchBenchmark::initialize();
-  queryBuilder_ = std::make_shared<TpchQueryBuilder>(
-      toFileFormat(FLAGS_data_format));
+  // Not TpchBenchmark::initialize(): the query builder that it makes serves
+  // only TpchBenchmark::runQuery() and the folly benchmarks, which run the
+  // plans of exec::test::TpchQueryBuilder and are not run here.
+  QueryBenchmarkBase::initialize();
+  queryBuilder_ = std::make_unique<cudf_velox::CudfTpchQueryBuilder>(
+      toFileFormat(FLAGS_data_format), FLAGS_scale_factor);
   queryBuilder_->initialize(FLAGS_data_path);
 
   if (FLAGS_encoded) {
-    connector::ConnectorRegistry::global().erase(
-        exec::test::kHiveConnectorId);
+    connector::ConnectorRegistry::global().erase(exec::test::kHiveConnectorId);
     connector::ConnectorRegistry::global().insert(
         exec::test::kHiveConnectorId,
         std::make_shared<encoded::EncodedConnector>(
             exec::test::kHiveConnectorId));
   } else if (FLAGS_velox_cudf_table_scan) {
-    connector::ConnectorRegistry::global().erase(
-        exec::test::kHiveConnectorId);
+    connector::ConnectorRegistry::global().erase(exec::test::kHiveConnectorId);
 
     auto cudfHiveConfigurationValues =
         std::unordered_map<std::string, std::string>();
@@ -264,9 +329,7 @@ void CudfTpchBenchmark::initialize() {
 
     cudf_velox::connector::hive::CudfHiveConnectorFactory cudfHiveFactory;
     auto cudfHiveConnector = cudfHiveFactory.newConnector(
-        exec::test::kHiveConnectorId,
-        cudfHiveProperties,
-        ioExecutor_.get());
+        exec::test::kHiveConnectorId, cudfHiveProperties, ioExecutor_.get());
     connector::ConnectorRegistry::global().insert(
         cudfHiveConnector->connectorId(), cudfHiveConnector);
   }
@@ -348,17 +411,41 @@ CudfTpchBenchmark::listSplits(
   return TpchBenchmark::listSplits(path, numSplitsPerFile, plan);
 }
 
-void CudfTpchBenchmark::runMain(std::ostream& out, RunStats& runStats) {
-  if (FLAGS_run_query_verbose == -1) {
-    TpchBenchmark::runMain(out, runStats);
+void CudfTpchBenchmark::runMain(std::ostream& out, RunStats& /*runStats*/) {
+  if (FLAGS_io_meter_column_pct != 0) {
+    LOG(ERROR)
+        << "--io_meter_column_pct is not supported by velox_cudf_tpch_benchmark";
+    exit(1);
+  }
+  if (FLAGS_run_query_verbose != -1) {
+    executeQuery(FLAGS_run_query_verbose, /*verbose=*/true, out);
     return;
   }
-  const auto plan = queryBuilder_->getQueryPlan(FLAGS_run_query_verbose);
+  // Every query, in place of TpchBenchmark's folly benchmarks.
+  for (int32_t queryId = 1; queryId <= 22; ++queryId) {
+    out << "Running query " << queryId << std::endl;
+    try {
+      executeQuery(queryId, /*verbose=*/false, out);
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "Query " << queryId << " failed: " << e.what()
+                 << ". Exiting";
+      exit(1);
+    }
+  }
+}
+
+void CudfTpchBenchmark::executeQuery(
+    int32_t queryId,
+    bool verbose,
+    std::ostream& out) {
+  const auto plan = queryBuilder_->getQueryPlan(queryId);
+  // run() runs a query --num_repeats times; time each run on its own.
   const auto repeats = FLAGS_num_repeats;
   FLAGS_num_repeats = 1;
-  std::pair<
-      std::unique_ptr<exec::TaskCursor>,
-      std::vector<RowVectorPtr>>
+  SCOPE_EXIT {
+    FLAGS_num_repeats = repeats;
+  };
+  std::pair<std::unique_ptr<exec::TaskCursor>, std::vector<RowVectorPtr>>
       result;
   for (int32_t repeat = 0; repeat < repeats; ++repeat) {
     // The previous run's vectors must go before the cursor owning their pool.
@@ -377,10 +464,14 @@ void CudfTpchBenchmark::runMain(std::ostream& out, RunStats& runStats) {
     }
     out << fmt::format("Repeat {} wall time us: {}", repeat, us) << std::endl;
   }
-  FLAGS_num_repeats = repeats;
-  VELOX_CHECK_NOT_NULL(
-      result.first, "Query {} failed", FLAGS_run_query_verbose);
+  VELOX_CHECK_NOT_NULL(result.first, "Query {} failed", queryId);
 
+  if (!FLAGS_results_json_dir.empty()) {
+    writeResultsJson(queryId, result.second);
+  }
+  if (!verbose) {
+    return;
+  }
   if (FLAGS_include_results) {
     printRows(result.second, out);
   }
@@ -395,8 +486,7 @@ void CudfTpchBenchmark::runMain(std::ostream& out, RunStats& runStats) {
              stats.numTotalSplits,
              stats.numFinishedSplits)
       << std::endl;
-  out << exec::printPlanWithStats(
-             *plan.plan, stats, FLAGS_include_custom_stats)
+  out << exec::printPlanWithStats(*plan.plan, stats, FLAGS_include_custom_stats)
       << std::endl;
 }
 

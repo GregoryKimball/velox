@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "velox/experimental/cudf/benchmarks/CudfTpchQueryBuilder.h"
+
 #include "velox/benchmarks/tpch/TpchBenchmark.h"
 #include "velox/common/base/Exceptions.h"
 
@@ -27,15 +29,22 @@
 #include <unordered_map>
 #include <vector>
 
-/// With --run_query_verbose, prints the wall time of each of the
-/// --num_repeats runs ('Repeat N wall time us: T'), and with --include_results
-/// every column of every result row as '{a, b, ...}'.
+/// Runs the TPC-H plans of cudf_velox::CudfTpchQueryBuilder. Every entry point
+/// runs those plans: --run_query_verbose and --run_queries run the given
+/// queries, and without either all 22 queries run, each --num_repeats times.
+/// TpchBenchmark's own query builder, runQuery() and folly benchmarks, which
+/// run the plans of exec::test::TpchQueryBuilder, are not used.
+///
+/// For each query it prints the wall time of each of the --num_repeats runs
+/// ('Repeat N wall time us: T'). With --run_query_verbose or --run_queries it
+/// also prints the plan with its runtime statistics, with --include_results
+/// every column of every result row as '{a, b, ...}', and with
+/// --results_json_dir it writes the result rows to <dir>/q<N>.json.
 class CudfTpchBenchmark : public TpchBenchmark {
  public:
   void initialize() override;
 
-  void runMain(std::ostream& out, facebook::velox::RunStats& runStats)
-      override;
+  void runMain(std::ostream& out, facebook::velox::RunStats& runStats) override;
 
   std::shared_ptr<facebook::velox::config::ConfigBase> makeConnectorProperties()
       override;
@@ -49,7 +58,12 @@ class CudfTpchBenchmark : public TpchBenchmark {
   void shutdown() override;
 
  private:
-  std::shared_ptr<facebook::velox::exec::test::TpchQueryBuilder> queryBuilder_;
+  // Runs 'queryId' --num_repeats times and prints the time of each run. With
+  // 'verbose', also prints the results and statistics of the last run.
+  void executeQuery(int32_t queryId, bool verbose, std::ostream& out);
+
+  std::unique_ptr<facebook::velox::cudf_velox::CudfTpchQueryBuilder>
+      queryBuilder_;
 };
 
 namespace facebook::velox::cudf_velox {
