@@ -17,19 +17,25 @@
 #pragma once
 
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReader.h"
+#include "velox/experimental/cudf/connectors/hive/NimbleGpuDecoder.h"
 
-#include "velox/dwio/common/BufferedInput.h"
-#include "velox/dwio/common/Reader.h"
-#include "velox/dwio/common/ScanSpec.h"
+#include "velox/common/file/File.h"
+
+namespace facebook::nimble {
+class TabletReader;
+}
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
-/// Reads a Nimble split for the cuDF Hive data source. The stripes of the
-/// split are decoded on the CPU by the selective Nimble reader and copied to
-/// the device, where the subfield filters are applied.
+/// Reads a Nimble split for the cuDF Hive data source, one stripe per chunk.
+/// The host reads the stripe's stream bytes and walks their encoding headers;
+/// NimbleGpuDecoder decompresses and decodes the payloads on the device, where
+/// the subfield filters are then applied. Only scalar columns are supported.
 class CudfNimbleSplitReader : public CudfSplitReader {
  public:
   using CudfSplitReader::CudfSplitReader;
+
+  ~CudfNimbleSplitReader() override;
 
   /// A Nimble file has no Parquet footer, so there is never any metadata.
   const std::vector<cudf::io::parquet::FileMetaData>& fileMetaDatas() override;
@@ -42,15 +48,16 @@ class CudfNimbleSplitReader : public CudfSplitReader {
   std::optional<TableChunk> readNextChunk() override;
 
  private:
-  // Opens the split's file through the file handle cache and the registered
-  // BufferedInput builder, so reads go through the AsyncDataCache.
-  std::unique_ptr<dwio::common::BufferedInput> makeBufferedInput(
-      const dwio::common::ReaderOptions& readerOptions);
-
-  std::shared_ptr<common::ScanSpec> scanSpec_;
-  std::unique_ptr<dwio::common::Reader> reader_;
-  std::unique_ptr<dwio::common::RowReader> rowReader_;
-  VectorPtr batch_;
+  std::shared_ptr<ReadFile> readFile_;
+  std::shared_ptr<facebook::nimble::TabletReader> tablet_;
+  // The stream id of each read column.
+  std::vector<uint32_t> streamIds_;
+  std::vector<cudf::data_type> cudfTypes_;
+  // Stripes that start inside the split's byte range, in file order.
+  std::vector<uint32_t> stripes_;
+  size_t nextStripe_{0};
+  bool compactRowCount_{false};
+  NimbleGpuDecoder decoder_;
 };
 
 } // namespace facebook::velox::cudf_velox::connector::hive

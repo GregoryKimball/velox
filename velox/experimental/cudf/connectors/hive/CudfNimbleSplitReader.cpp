@@ -19,9 +19,11 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
-#include "velox/connectors/common/BufferedInputBuilder.h"
 #include "velox/connectors/hive/FileHandle.h"
-#include "velox/dwio/common/ReaderFactory.h"
+#include "velox/dwio/nimble/common/SchemaReader.h"
+#include "velox/dwio/nimble/common/SchemaSerialization.h"
+#include "velox/dwio/nimble/tablet/Constants.h"
+#include "velox/dwio/nimble/tablet/TabletReader.h"
 
 #include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
@@ -31,22 +33,16 @@
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
-namespace {
-
-// Rows requested from the CPU reader per chunk. A read stops early at the end
-// of the split.
-constexpr uint64_t kNimbleReadBatchRows = 1 << 20;
-
-} // namespace
+CudfNimbleSplitReader::~CudfNimbleSplitReader() = default;
 
 const std::vector<cudf::io::parquet::FileMetaData>&
 CudfNimbleSplitReader::fileMetaDatas() {
   return fileMetaDatas_;
 }
 
-std::unique_ptr<dwio::common::BufferedInput>
-CudfNimbleSplitReader::makeBufferedInput(
-    const dwio::common::ReaderOptions& readerOptions) {
+void CudfNimbleSplitReader::prepareSplitInternal(
+    dwio::common::RuntimeStats& /*runtimeStats*/) {
+  nvtx3::scoped_range range{"CudfNimbleSplitReader::prepareSplit"};
   const auto fileHandleKey = FileHandleKey{
       .filename = split_->filePath,
       .tokenProvider = connectorQueryCtx_->fsTokenProvider()};
@@ -55,89 +51,95 @@ CudfNimbleSplitReader::makeBufferedInput(
   auto fileHandle = fileHandleFactory_->generate(
       fileHandleKey, &fileProperties, ioStats_ ? ioStats_.get() : nullptr);
   VELOX_CHECK_NOT_NULL(fileHandle.get());
+  readFile_ = fileHandle->file;
 
-  auto input = velox::connector::BufferedInputBuilder::getInstance()->create(
-      *fileHandle,
-      readerOptions,
-      connectorQueryCtx_,
-      ioStatistics_,
-      ioStats_,
-      executor_);
-  if (input == nullptr) {
-    input = std::make_unique<dwio::common::BufferedInput>(
-        fileHandle->file, readerOptions.memoryPool());
-  }
-  return input;
-}
+  tablet_ = facebook::nimble::TabletReader::create(
+      readFile_, connectorQueryCtx_->memoryPool(), {});
+  compactRowCount_ = tablet_->properties().compactRowCountEncoding();
 
-void CudfNimbleSplitReader::prepareSplitInternal(
-    dwio::common::RuntimeStats& /*runtimeStats*/) {
-  nvtx3::scoped_range range{"CudfNimbleSplitReader::prepareSplit"};
-  auto* pool = connectorQueryCtx_->memoryPool();
+  auto schemaSection = tablet_->loadOptionalSection(
+      std::string(facebook::nimble::kSchemaSection));
+  VELOX_CHECK(schemaSection.has_value(), "Nimble file has no schema");
+  const auto schema = facebook::nimble::SchemaDeserializer::deserialize(
+      schemaSection->content().data());
+  const auto& root = schema->asRow();
 
-  scanSpec_ = std::make_shared<common::ScanSpec>("<root>");
+  streamIds_.clear();
+  cudfTypes_.clear();
   for (size_t i = 0; i < readColumnNames_.size(); ++i) {
-    scanSpec_->addFieldRecursively(
-        readColumnNames_[i], *readColumnTypes_[i], i);
+    const auto child = root.findChild(readColumnNames_[i]);
+    VELOX_CHECK(
+        child.has_value(),
+        "Column {} not found in Nimble file {}",
+        readColumnNames_[i],
+        split_->filePath);
+    const auto& type = root.childAt(*child);
+    VELOX_CHECK(
+        type->kind() == facebook::nimble::Kind::Scalar,
+        "GPU Nimble reader supports only scalar columns, not {}",
+        readColumnNames_[i]);
+    streamIds_.push_back(type->asScalar().scalarDescriptor().offset());
+    cudfTypes_.push_back(veloxToCudfDataType(readColumnTypes_[i]));
   }
   noColumnsToRead_ = readColumnNames_.empty();
 
-  dwio::common::ReaderOptions readerOptions(pool);
-  readerOptions.setFileFormat(dwio::common::FileFormat::NIMBLE);
-  readerOptions.setSelectiveNimbleReaderEnabled(true);
-  readerOptions.setScanSpec(scanSpec_);
-  readerOptions.setDataIoStats(ioStatistics_);
-  readerOptions.setMetadataIoStats(ioStatistics_);
-
-  reader_ = dwio::common::getReaderFactory(dwio::common::FileFormat::NIMBLE)
-                ->createReader(makeBufferedInput(readerOptions), readerOptions);
-
-  dwio::common::RowReaderOptions rowReaderOptions;
-  rowReaderOptions.setScanSpec(scanSpec_);
-  auto requestedType = ROW(
-      std::vector<std::string>(readColumnNames_),
-      std::vector<TypePtr>(readColumnTypes_));
-  rowReaderOptions.setRequestedType(requestedType);
-  rowReaderOptions.range(split_->start, split_->length);
-  rowReader_ = reader_->createRowReader(rowReaderOptions);
-  batch_ = BaseVector::create(requestedType, 0, pool);
+  stripes_.clear();
+  nextStripe_ = 0;
+  const uint64_t splitEnd = split_->start + split_->length;
+  for (uint32_t stripe = 0; stripe < tablet_->stripeCount(); ++stripe) {
+    const auto offset = tablet_->stripeOffset(stripe);
+    if (offset >= split_->start && offset < splitEnd) {
+      stripes_.push_back(stripe);
+    }
+  }
 }
 
 std::optional<CudfSplitReader::TableChunk>
 CudfNimbleSplitReader::readNextChunk() {
-  VELOX_CHECK_NOT_NULL(rowReader_, "Nimble row reader not present");
-
-  uint64_t numRows{0};
-  {
-    nvtx3::scoped_range range{"CudfNimbleSplitReader::cpuDecode"};
-    numRows = rowReader_->next(kNimbleReadBatchRows, batch_);
-  }
-  if (numRows == 0) {
+  VELOX_CHECK_NOT_NULL(tablet_, "Nimble tablet not open");
+  if (nextStripe_ >= stripes_.size()) {
     return std::nullopt;
   }
-
-  auto rowVector = std::dynamic_pointer_cast<RowVector>(batch_);
-  VELOX_CHECK_NOT_NULL(rowVector, "Nimble reader returned a non-row batch");
+  const auto stripe = stripes_[nextStripe_++];
+  const auto numRows =
+      static_cast<cudf::size_type>(tablet_->stripeRowCount(stripe));
   if (noColumnsToRead_) {
     return TableChunk{
         std::make_unique<cudf::table>(
             std::vector<std::unique_ptr<cudf::column>>{}),
-        rowVector->size()};
-  }
-  for (auto& child : rowVector->children()) {
-    child = BaseVector::loadedVectorShared(child);
+        numRows};
   }
 
-  const auto* filter = subfieldFilterAst();
-  std::unique_ptr<cudf::table> table;
+  std::vector<std::vector<uint8_t>> streamBytes(streamIds_.size());
   {
-    nvtx3::scoped_range range{"CudfNimbleSplitReader::toDevice"};
-    table = with_arrow::toCudfTable(
-        rowVector,
-        connectorQueryCtx_->memoryPool(),
-        stream_,
-        filter != nullptr ? get_temp_mr() : get_output_mr());
+    nvtx3::scoped_range range{"CudfNimbleSplitReader::read"};
+    const auto stripeId = tablet_->stripeIdentifier(stripe);
+    const auto stripeOffset = tablet_->stripeOffset(stripe);
+    for (size_t i = 0; i < streamIds_.size(); ++i) {
+      const auto location = tablet_->streamLocation(stripeId, streamIds_[i]);
+      if (location.size == 0) {
+        continue;
+      }
+      streamBytes[i].resize(location.size);
+      readFile_->pread(
+          stripeOffset + location.offset, location.size, streamBytes[i].data());
+      if (ioStatistics_) {
+        ioStatistics_->incRawBytesRead(location.size);
+      }
+    }
   }
+  std::vector<std::span<const uint8_t>> streams(
+      streamBytes.begin(), streamBytes.end());
+
+  const auto* filter = subfieldFilterAst();
+  auto columns = decoder_.decode(
+      streams,
+      cudfTypes_,
+      numRows,
+      compactRowCount_,
+      stream_,
+      filter != nullptr ? get_temp_mr() : get_output_mr());
+  auto table = std::make_unique<cudf::table>(std::move(columns));
 
   if (filter != nullptr) {
     nvtx3::scoped_range range{"CudfNimbleSplitReader::filter"};
@@ -151,10 +153,12 @@ CudfNimbleSplitReader::readNextChunk() {
 }
 
 void CudfNimbleSplitReader::resetSplit() {
-  rowReader_.reset();
-  reader_.reset();
-  scanSpec_.reset();
-  batch_.reset();
+  tablet_.reset();
+  readFile_.reset();
+  streamIds_.clear();
+  cudfTypes_.clear();
+  stripes_.clear();
+  nextStripe_ = 0;
   CudfSplitReader::resetSplit();
 }
 
