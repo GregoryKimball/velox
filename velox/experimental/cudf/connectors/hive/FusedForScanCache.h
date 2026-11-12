@@ -67,6 +67,12 @@ class FusedForScanCache {
   /// 'bytes'.
   void reserveDeviceCapacity(uint64_t bytes);
 
+  /// Sets the bytes of encoded data held in device memory to 'bytes' for the
+  /// query about to run, which needs the rest of the device: frees device
+  /// blocks above it now, and lets the device tier grow back up to it,
+  /// whatever earlier queries shrank it to.
+  void limitDeviceCapacity(uint64_t bytes);
+
   /// Returns whether every column in 'columns' of 'file' is cached.
   bool containsAll(
       std::string_view file,

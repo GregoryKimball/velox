@@ -119,6 +119,12 @@ class CudfHiveConfig {
   static constexpr const char* kFusedForScanCacheDeviceBytes =
       "cudf.hive.fused-for-scan-cache-device-bytes";
 
+  // Device memory in MiB the scan cache may hold while the query runs: the
+  // query states how much the rest of it needs. The Hive catalog session
+  // property scan_cache_device_limit_mb; 0 keeps the configured size.
+  static constexpr const char* kScanCacheDeviceLimitMbSession =
+      "scan_cache_device_limit_mb";
+
   // Whether to serialize concurrent I/O request submission batches.
   static constexpr const char* kSerializeIoRequests =
       "cudf.hive.serialize-io-requests";

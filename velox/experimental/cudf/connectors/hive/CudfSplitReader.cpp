@@ -308,7 +308,17 @@ void CudfSplitReader::prepareSplitInternal(
       capacity > 0 and fusedForCacheEligible()) {
     auto& cache = FusedForScanCache::instance();
     cache.reserveCapacity(capacity);
-    cache.reserveDeviceCapacity(cudfHiveConfig_->fusedForScanCacheDeviceBytes());
+    // A query that states how much device memory it needs bounds the device
+    // tier for its run (session property scan_cache_device_limit_mb).
+    const auto limitMb = connectorQueryCtx_->sessionProperties()->get<uint64_t>(
+        CudfHiveConfig::kScanCacheDeviceLimitMbSession, 0);
+    if (limitMb > 0) {
+      cache.limitDeviceCapacity(std::min<uint64_t>(
+          limitMb << 20, cudfHiveConfig_->fusedForScanCacheDeviceBytes()));
+    } else {
+      cache.reserveDeviceCapacity(
+          cudfHiveConfig_->fusedForScanCacheDeviceBytes());
+    }
     fusedForCacheHit_ = cache.containsAll(split_->filePath, readColumnNames_);
     fusedForCacheRead_ = fusedForCacheHit_ or
         cache.mayCache(split_->filePath, readColumnNames_);

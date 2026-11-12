@@ -113,6 +113,23 @@ void FusedForScanCache::reserveDeviceCapacity(uint64_t bytes) {
   }
 }
 
+void FusedForScanCache::limitDeviceCapacity(uint64_t bytes) {
+  if (deviceCapacity_.load(std::memory_order_relaxed) == bytes &&
+      !deviceTierShrunk_.load(std::memory_order_relaxed)) {
+    return;
+  }
+  std::size_t allocated = 0;
+  {
+    std::shared_lock lock(mutex_);
+    allocated = deviceAllocatedBytes_;
+  }
+  if (allocated > bytes) {
+    releaseDeviceBlocks(allocated - bytes);
+  }
+  deviceCapacity_.store(bytes, std::memory_order_relaxed);
+  deviceTierShrunk_.store(false, std::memory_order_relaxed);
+}
+
 std::string FusedForScanCache::key(
     std::string_view file,
     std::string_view name) {
