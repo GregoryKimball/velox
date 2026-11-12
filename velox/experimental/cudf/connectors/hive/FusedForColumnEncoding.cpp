@@ -269,6 +269,33 @@ FusedForEncodedColumn encodeForFusedFor(
   return result;
 }
 
+FusedForEncodedColumn encodeAsFusedFor(
+    FusedForEncoding encoding,
+    cudf::column_view input,
+    const std::vector<cudf::size_type>& segmentStarts,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref tempMr) {
+  const auto column = withoutEmptyNullMask(input);
+  FusedForEncodedColumn result;
+  switch (encoding) {
+    case FusedForEncoding::kValues:
+      break;
+    case FusedForEncoding::kDictionary:
+      if (auto dictionary = encodeDictionary(column, stream, tempMr)) {
+        takeDictionary(std::move(dictionary), result);
+      }
+      break;
+    case FusedForEncoding::kDeltas:
+      if (auto deltas = encodeDeltas(column, segmentStarts, stream, tempMr)) {
+        result.encoding = FusedForEncoding::kDeltas;
+        result.encoded = std::move(deltas->differences);
+        result.segmentBases = std::move(deltas->segmentBases);
+      }
+      break;
+  }
+  return result;
+}
+
 std::unique_ptr<cudf::column> decodeFusedForEncoding(
     FusedForEncoding encoding,
     cudf::column_view values,

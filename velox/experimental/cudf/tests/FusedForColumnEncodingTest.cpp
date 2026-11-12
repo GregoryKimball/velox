@@ -174,6 +174,68 @@ TEST_F(FusedForColumnEncodingTest, encodesAscendingKeysAsDifferences) {
       keys, FusedForEncoding::kDeltas, {0, 3'000, 3'000, 11'111, kNumRows});
 }
 
+TEST_F(FusedForColumnEncodingTest, encodesAsAnEarlierChoice) {
+  const auto ascending = toCudf(makeFlatVector<int64_t>(
+      kNumRows, [](auto row) { return 1'000'000 + row * 4; }));
+  const std::vector<cudf::size_type> starts{0, 5'000, 12'345};
+  auto deltas = encodeAsFusedFor(
+      FusedForEncoding::kDeltas,
+      ascending->view().column(0),
+      starts,
+      stream_,
+      memoryResource());
+  ASSERT_EQ(deltas.encoding, FusedForEncoding::kDeltas);
+  EXPECT_FALSE(deltas.packedValues.has_value());
+  ASSERT_EQ(deltas.segmentBases.size(), starts.size());
+  EXPECT_EQ(deltas.segmentBases[1], 1'000'000 + 5'000 * 4);
+  auto restored = decodeFusedForEncoding(
+      FusedForEncoding::kDeltas,
+      cudf::slice(deltas.encoded->view(), {5'000, 12'345}, stream_).front(),
+      std::nullopt,
+      deltas.segmentBases[1],
+      stream_,
+      memoryResource(),
+      memoryResource());
+  velox::test::assertEqualVectors(
+      toVelox(ascending->view().column(0), BIGINT())->slice(5'000, 7'345),
+      toVelox(restored->view(), BIGINT()));
+
+  const auto modes = toCudf(makeFlatVector<std::string>(
+      kNumRows, [](auto row) { return fmt::format("mode {}", row % 7); }));
+  auto dictionary = encodeAsFusedFor(
+      FusedForEncoding::kDictionary,
+      modes->view().column(0),
+      {},
+      stream_,
+      memoryResource());
+  ASSERT_EQ(dictionary.encoding, FusedForEncoding::kDictionary);
+  EXPECT_EQ(dictionary.keys->size(), 7);
+  EXPECT_FALSE(dictionary.packedKeys.has_value());
+
+  // Data that no longer allows the earlier choice keeps its values.
+  const auto negative = toCudf(makeFlatVector<int64_t>(
+      kNumRows, [](auto row) { return row - 10; }));
+  EXPECT_EQ(
+      encodeAsFusedFor(
+          FusedForEncoding::kDeltas,
+          negative->view().column(0),
+          {},
+          stream_,
+          memoryResource())
+          .encoding,
+      FusedForEncoding::kValues);
+  const auto distinct = toCudf(makeFlatVector<std::string>(
+      kNumRows, [](auto row) { return fmt::format("comment {}", row); }));
+  const auto noDictionary = encodeAsFusedFor(
+      FusedForEncoding::kDictionary,
+      distinct->view().column(0),
+      {},
+      stream_,
+      memoryResource());
+  EXPECT_EQ(noDictionary.encoding, FusedForEncoding::kValues);
+  EXPECT_EQ(noDictionary.encoded, nullptr);
+}
+
 TEST_F(FusedForColumnEncodingTest, keepsValuesWhenNoEncodingApplies) {
   // Nulls rule out both encodings.
   expectRoundTrip(

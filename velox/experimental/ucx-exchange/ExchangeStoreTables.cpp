@@ -53,6 +53,7 @@
 #include <limits>
 #include <mutex>
 #include <numeric>
+#include <optional>
 
 namespace facebook::velox::ucx_exchange {
 namespace {
@@ -196,11 +197,15 @@ struct PackedBatch {
 // encodeForFusedFor()) and packs each bucket. Bucket b holds rows 'offsets'[b]
 // to 'offsets'[b + 1], so the differences of a column start over at each
 // bucket, and the dictionary of a column holds the keys of every bucket.
-// Reports the encodings as runtime stats.
+// 'chosen' holds a writer's encoding per column, chosen on its first batch:
+// the batches of a temporary table carry the same kind of data, so later
+// batches are encoded the same way without trying the others
+// (encodeAsFusedFor()). Reports the encodings as runtime stats.
 PackedBatch packBatch(
     cudf::table_view table,
     const std::vector<cudf::size_type>& offsets,
     ExchangeCompression compression,
+    std::vector<std::optional<FusedForEncoding>>& chosen,
     cuda::stream_ref stream) {
   VELOX_CHECK_GE(offsets.size(), 2);
   PackedBatch batch;
@@ -213,9 +218,10 @@ PackedBatch packBatch(
         offsets.begin(), offsets.end() - 1);
     int64_t numDictionaryColumns = 0;
     int64_t numDeltaColumns = 0;
-    for (const auto& input : table) {
+    chosen.resize(table.num_columns());
+    for (cudf::size_type i = 0; i < table.num_columns(); ++i) {
       const auto column =
-          cudf_velox::connector::hive::withoutEmptyNullMask(input);
+          cudf_velox::connector::hive::withoutEmptyNullMask(table.column(i));
       // encodeForFusedFor() encodes top-level fixed-width and string columns.
       if (!cudf::is_fixed_width(column.type()) &&
           column.type().id() != cudf::type_id::STRING) {
@@ -223,8 +229,14 @@ PackedBatch packBatch(
         columns.push_back(column);
         continue;
       }
-      auto encoded = cudf_velox::connector::hive::encodeForFusedFor(
-          column, segmentStarts, stream, cudf_velox::get_temp_mr());
+      auto encoded = chosen[i].has_value()
+          ? cudf_velox::connector::hive::encodeAsFusedFor(
+                *chosen[i], column, segmentStarts, stream, cudf_velox::get_temp_mr())
+          : cudf_velox::connector::hive::encodeForFusedFor(
+                column, segmentStarts, stream, cudf_velox::get_temp_mr());
+      if (!chosen[i].has_value()) {
+        chosen[i] = encoded.encoding;
+      }
       batch.encodings.push_back(encoded.encoding);
       if (encoded.encoding == FusedForEncoding::kValues) {
         columns.push_back(column);
@@ -413,7 +425,8 @@ class ExchangeStoreWriter : public dwio::common::Writer {
         kLogicalBytes,
         RuntimeCounter(
             uncompressedBytes(table, stream), RuntimeCounter::Unit::kBytes));
-    auto batch = packBatch(table, {0, numRows}, compression_, stream);
+    auto batch =
+        packBatch(table, {0, numRows}, compression_, encodings_, stream);
     VELOX_CHECK_EQ(batch.payloads.size(), 1);
     stream.sync();
     const auto encoding =
@@ -448,6 +461,8 @@ class ExchangeStoreWriter : public dwio::common::Writer {
   const std::unique_ptr<dwio::common::FileSink> sink_;
   const std::shared_ptr<memory::MemoryPool> pool_;
   const ExchangeCompression compression_;
+  // The encoding of each column, chosen on the first batch (see packBatch()).
+  std::vector<std::optional<FusedForEncoding>> encodings_;
   std::string table_;
   std::string file_;
   // CPU rows not packed yet.
@@ -590,7 +605,8 @@ class ExchangeStoreDataSink : public connector::hive::HiveDataSink {
         kLogicalBytes,
         RuntimeCounter(
             uncompressedBytes(table, stream), RuntimeCounter::Unit::kBytes));
-    auto batch = packBatch(partitioned->view(), offsets, compression_, stream);
+    auto batch = packBatch(
+        partitioned->view(), offsets, compression_, encodings_, stream);
     VELOX_CHECK_EQ(batch.payloads.size(), static_cast<size_t>(bucketCount_));
     stream.sync();
     addThreadLocalRuntimeStat(kGpuBatches, RuntimeCounter(1));
@@ -662,6 +678,8 @@ class ExchangeStoreDataSink : public connector::hive::HiveDataSink {
   const RowTypePtr inputType_;
   memory::MemoryPool* const pool_;
   const ExchangeCompression compression_;
+  // The encoding of each column, chosen on the first batch (see packBatch()).
+  std::vector<std::optional<FusedForEncoding>> encodings_;
   const std::optional<cudf_velox::CudfHivePartitionFunction> gpuBucketFunction_;
   // GPU batches not stored yet.
   std::vector<std::shared_ptr<cudf_velox::CudfVector>> pending_;

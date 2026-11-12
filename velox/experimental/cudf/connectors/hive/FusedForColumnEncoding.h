@@ -88,6 +88,19 @@ FusedForEncodedColumn encodeForFusedFor(
     cuda::stream_ref stream,
     rmm::device_async_resource_ref tempMr);
 
+/// Encodes 'column' as 'encoding', chosen by encodeForFusedFor() for earlier
+/// data of the same kind, without trying the other encodings or packing:
+/// 'packedValues' and 'packedKeys' stay unset. Falls back to kValues when
+/// 'column' does not allow 'encoding': it has nulls, a dictionary would need
+/// more keys than encodeForFusedFor() allows, or a difference would start from
+/// a negative value. 'segmentStarts' is as for encodeForFusedFor().
+FusedForEncodedColumn encodeAsFusedFor(
+    FusedForEncoding encoding,
+    cudf::column_view column,
+    const std::vector<cudf::size_type>& segmentStarts,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref tempMr);
+
 /// Restores a column that was encoded as 'encoding' from 'values', which holds
 /// the dictionary indices or the differences of one segment, 'keys', which
 /// holds the keys of a dictionary, and 'base', the base of the segment (0
