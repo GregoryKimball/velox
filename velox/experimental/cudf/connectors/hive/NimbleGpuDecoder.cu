@@ -42,6 +42,7 @@
 #include <atomic>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -1574,26 +1575,50 @@ void decompressPayloads(
 
 } // namespace
 
-uint8_t* NimbleGpuDecoder::hostBuffer(size_t size) {
-  struct Pinned {
-    uint8_t* data{nullptr};
-    size_t size{0};
-    ~Pinned() {
-      if (data != nullptr) {
-        cudaFreeHost(data);
+namespace {
+// Pinned buffers not in use. They are never freed: cudaMallocHost costs about
+// 100 ms per buffer.
+struct PinnedPool {
+  std::mutex mutex;
+  std::vector<std::pair<uint8_t*, size_t>> free;
+};
+
+PinnedPool& pinnedPool() {
+  static auto* pool = new PinnedPool();
+  return *pool;
+}
+} // namespace
+
+NimbleGpuDecoder::PinnedBuffer::PinnedBuffer(size_t size) {
+  auto& pool = pinnedPool();
+  {
+    std::lock_guard<std::mutex> lock{pool.mutex};
+    auto best = pool.free.end();
+    for (auto it = pool.free.begin(); it != pool.free.end(); ++it) {
+      if (it->second >= size &&
+          (best == pool.free.end() || it->second < best->second)) {
+        best = it;
       }
     }
-  };
-  static thread_local Pinned pinned;
-  if (size > pinned.size) {
-    if (pinned.data != nullptr) {
-      checkCuda(cudaFreeHost(pinned.data));
-      pinned.data = nullptr;
+    if (best != pool.free.end()) {
+      data_ = best->first;
+      size_ = best->second;
+      pool.free.erase(best);
+      return;
     }
-    pinned.size = std::max(size, 2 * pinned.size);
-    checkCuda(cudaMallocHost(&pinned.data, pinned.size));
   }
-  return pinned.data;
+  constexpr size_t kGranularity = size_t{64} << 20;
+  size_ = std::max<size_t>(
+      (size + kGranularity - 1) / kGranularity * kGranularity, kGranularity);
+  void* data = nullptr;
+  checkCuda(cudaMallocHost(&data, size_));
+  data_ = static_cast<uint8_t*>(data);
+}
+
+NimbleGpuDecoder::PinnedBuffer::~PinnedBuffer() {
+  auto& pool = pinnedPool();
+  std::lock_guard<std::mutex> lock{pool.mutex};
+  pool.free.emplace_back(data_, size_);
 }
 
 std::vector<std::unique_ptr<cudf::column>> NimbleGpuDecoder::decode(

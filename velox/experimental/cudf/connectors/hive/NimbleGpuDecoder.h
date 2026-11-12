@@ -51,9 +51,22 @@ struct NimbleStripeStreams {
 class NimbleGpuDecoder {
  public:
   /// A pinned host buffer of at least `size` bytes for the stream bytes of a
-  /// batch. It belongs to the calling thread and is reused by its next call,
-  /// so it is valid until then.
-  static uint8_t* hostBuffer(size_t size);
+  /// batch, taken from a process-wide pool and returned to it on destruction.
+  class PinnedBuffer {
+   public:
+    explicit PinnedBuffer(size_t size);
+    ~PinnedBuffer();
+    PinnedBuffer(const PinnedBuffer&) = delete;
+    PinnedBuffer& operator=(const PinnedBuffer&) = delete;
+
+    uint8_t* data() const {
+      return data_;
+    }
+
+   private:
+    uint8_t* data_;
+    size_t size_;
+  };
 
   /// Decodes column i of every stripe as types[i] and concatenates the stripes
   /// in order. Every stream lies in `hostBytes`, a pinned buffer that is copied
