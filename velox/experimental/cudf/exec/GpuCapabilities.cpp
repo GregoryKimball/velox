@@ -114,6 +114,7 @@ std::string GpuCapabilities::toJson() const {
   object["computeCapability"] =
       fmt::format("{}.{}", computeCapabilityMajor, computeCapabilityMinor);
   object["totalMemoryBytes"] = totalMemoryBytes;
+  object["availableMemoryBytes"] = availableMemoryBytes;
   object["multiprocessorCount"] = multiprocessorCount;
   object["maxThreadsPerMultiprocessor"] = maxThreadsPerMultiprocessor;
   object["l2CacheBytes"] = l2CacheBytes;
@@ -133,12 +134,14 @@ std::string GpuCapabilities::toString() const {
     return "GPU capabilities unknown";
   }
   return fmt::format(
-      "{} (device {}, sm_{}{}, {:.1f} GiB, {} SMs, {} peer device(s))",
+      "{} (device {}, sm_{}{}, {:.1f} GiB, {:.1f} GiB available, {} SMs, {} "
+      "peer device(s))",
       name,
       deviceIndex,
       computeCapabilityMajor,
       computeCapabilityMinor,
       static_cast<double>(totalMemoryBytes) / (1024.0 * 1024.0 * 1024.0),
+      static_cast<double>(availableMemoryBytes) / (1024.0 * 1024.0 * 1024.0),
       multiprocessorCount,
       numPeerDevices);
 }
@@ -177,6 +180,16 @@ GpuCapabilities readGpuCapabilities(int32_t deviceIndex) {
   capabilities.computeCapabilityMinor = properties.minor;
   capabilities.totalMemoryBytes =
       static_cast<int64_t>(properties.totalGlobalMem);
+  // cudaMemGetInfo() describes the current device only.
+  int current = -1;
+  std::size_t freeBytes = 0;
+  std::size_t totalBytes = 0;
+  if (cudaGetDevice(&current) == cudaSuccess && current == resolvedIndex &&
+      cudaMemGetInfo(&freeBytes, &totalBytes) == cudaSuccess) {
+    capabilities.availableMemoryBytes = static_cast<int64_t>(freeBytes);
+  } else {
+    clearLastCudaError();
+  }
   capabilities.multiprocessorCount = properties.multiProcessorCount;
   capabilities.maxThreadsPerMultiprocessor =
       properties.maxThreadsPerMultiProcessor;

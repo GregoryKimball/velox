@@ -25,6 +25,9 @@ namespace {
 TEST(GpuCapabilitiesTest, describesTheDevice) {
   const auto capabilities = readGpuCapabilities(kCurrentDevice);
   ASSERT_GT(capabilities.totalMemoryBytes, 0);
+  // The CUDA context takes some memory, and other processes may hold more.
+  EXPECT_GT(capabilities.availableMemoryBytes, 0);
+  EXPECT_LT(capabilities.availableMemoryBytes, capabilities.totalMemoryBytes);
   EXPECT_GE(capabilities.deviceIndex, 0);
   EXPECT_FALSE(capabilities.name.empty());
   EXPECT_GT(capabilities.multiprocessorCount, 0);
@@ -57,6 +60,7 @@ TEST(GpuCapabilitiesTest, unreadableDeviceYieldsAnEmptyDescription) {
   // well past any real device count is the reachable way to force that path.
   const auto capabilities = readGpuCapabilities(1 << 20);
   EXPECT_EQ(capabilities.totalMemoryBytes, 0);
+  EXPECT_EQ(capabilities.availableMemoryBytes, 0);
   EXPECT_EQ(capabilities.deviceIndex, -1);
   EXPECT_EQ(capabilities.toString(), "GPU capabilities unknown");
 }
@@ -64,6 +68,7 @@ TEST(GpuCapabilitiesTest, unreadableDeviceYieldsAnEmptyDescription) {
 TEST(GpuCapabilitiesTest, jsonCarriesTheDescription) {
   const auto json = readGpuCapabilities(kCurrentDevice).toJson();
   EXPECT_NE(json.find("\"totalMemoryBytes\""), std::string::npos);
+  EXPECT_NE(json.find("\"availableMemoryBytes\""), std::string::npos);
   EXPECT_NE(json.find("\"computeCapability\""), std::string::npos);
   EXPECT_EQ(json.front(), '{');
   EXPECT_EQ(json.back(), '}');

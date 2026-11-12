@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/connectors/hive/FusedForColumnEncoding.h"
 
 #include "velox/common/base/Exceptions.h"
+#include "velox/experimental/cudf/exec/GpuCapabilities.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 
 #include <glog/logging.h>
@@ -41,6 +42,21 @@ namespace {
 // own allocation.
 constexpr std::size_t kBlockBytes = std::size_t{1} << 30;
 constexpr std::size_t kAlignment = 256;
+
+// Returns whether the device tier may hold 'tierBytes': at most half the
+// device memory this process can use, and only while the operators'
+// allocations plus the tier stay under three quarters of it, so that the tier
+// does not take memory that queries need. A failed allocation shrinks the tier
+// further (releaseDeviceBlocks()).
+bool deviceTierFits(std::size_t tierBytes) {
+  const auto available = gpuCapabilities().availableMemoryBytes;
+  if (available <= 0) {
+    return true;
+  }
+  const auto tier = static_cast<int64_t>(tierBytes);
+  const auto allocated = std::max<int64_t>(cudfAllocatedBytes(), 0);
+  return tier <= available / 2 && allocated + tier <= available / 4 * 3;
+}
 
 std::size_t alignUp(std::size_t bytes) {
   return (bytes + kAlignment - 1) / kAlignment * kAlignment;
@@ -100,6 +116,23 @@ bool FusedForScanCache::containsAll(
     }
   }
   return true;
+}
+
+std::size_t FusedForScanCache::decodedBytes(
+    std::string_view file,
+    const std::vector<std::string>& columns) const {
+  std::shared_lock lock(mutex_);
+  std::size_t bytes = 0;
+  for (const auto& name : columns) {
+    const auto it = entries_.find(key(file, name));
+    VELOX_CHECK(it != entries_.end(), "Column is not cached: {}", name);
+    const auto& entry = it->second;
+    bytes += entry.values.logicalDataSize;
+    if (entry.keys.has_value()) {
+      bytes += entry.values.logicalDataSize + entry.keys->logicalDataSize;
+    }
+  }
+  return bytes;
 }
 
 bool FusedForScanCache::mayCache(
@@ -290,7 +323,8 @@ void* FusedForScanCache::allocateDevice(std::size_t bytes) {
     // Whole blocks count against the capacity, so the device never holds more
     // than it.
     const auto blockBytes = std::max(bytes, kBlockBytes);
-    if (deviceAllocatedBytes_ + blockBytes > capacity) {
+    if (deviceAllocatedBytes_ + blockBytes > capacity ||
+        !deviceTierFits(deviceAllocatedBytes_ + blockBytes)) {
       return nullptr;
     }
     void* block = nullptr;

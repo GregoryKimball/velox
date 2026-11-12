@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/connectors/hive/CachingDataSource.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReader.h"
 #include "velox/experimental/cudf/connectors/hive/FusedForScanCache.h"
+#include "velox/experimental/cudf/exec/GpuCapabilities.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
@@ -561,9 +562,23 @@ void CudfSplitReader::setupFirstPassChunking() {
     return;
   }
   if (fusedForCacheHit_) {
-    // A split served from the fused FOR scan cache is read here instead.
+    // A split served from the fused FOR scan cache is read here instead, if
+    // its decoded file fits: it stays allocated until the driver reads it.
+    // Ahead-of-time decoding hides latency while device memory is ample and
+    // gives way to the operators when it is not (allocated bytes plus the file
+    // over half of what the process can use); the file is then decoded when
+    // read.
     if (fusedForCacheRead_ and not fusedForCacheChunk_.has_value()) {
-      fusedForCacheChunk_ = readFromFusedForCache(determineCudfMemoryResource());
+      const auto available = gpuCapabilities().availableMemoryBytes;
+      const auto decodedBytes = static_cast<int64_t>(
+          FusedForScanCache::instance().decodedBytes(
+              split_->filePath, readColumnNames_));
+      if (available <= 0 or
+          std::max<int64_t>(cudfAllocatedBytes(), 0) + decodedBytes <=
+              available / 2) {
+        fusedForCacheChunk_ =
+            readFromFusedForCache(determineCudfMemoryResource());
+      }
     }
     return;
   }

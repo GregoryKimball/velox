@@ -74,6 +74,12 @@ struct GpuCapabilities {
   /// CudfConfig::memoryPercent.
   int64_t totalMemoryBytes{0};
 
+  /// Device memory free when the description was read, which registration does
+  /// before cuDF allocates anything: what this process can expect to use, as
+  /// the CUDA context and other processes hold the rest. The anchor for sizes
+  /// that must leave room for the operators. Zero when it could not be read.
+  int64_t availableMemoryBytes{0};
+
   /// Streaming multiprocessor count and the threads each can hold resident.
   /// Together these bound useful concurrency, which is what decides how many
   /// operator instances can share the device before they only contend.

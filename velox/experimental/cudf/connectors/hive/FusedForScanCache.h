@@ -87,6 +87,14 @@ class FusedForScanCache {
       cuda::stream_ref stream,
       rmm::device_async_resource_ref tempMr);
 
+  /// Returns about how many device bytes decoding 'columns' of 'file' takes:
+  /// each column's decoded size, which for a dictionary-encoded column counts
+  /// its 4-byte indices twice for the gathered values. The columns must be
+  /// cached.
+  std::size_t decodedBytes(
+      std::string_view file,
+      const std::vector<std::string>& columns) const;
+
   /// A cached column decoded on the device. 'view' points into memory the
   /// object owns: the decoded packed allocation, or 'column'.
   struct DecodedColumn {

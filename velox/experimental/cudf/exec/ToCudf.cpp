@@ -482,9 +482,15 @@ void registerCudf() {
     ucx_exchange::registerUcxTransports();
   }
   if (CudfConfig::getInstance().exchangeStore) {
+    // The device tier holds at most a quarter of the device memory this
+    // process can use; the rest goes to pinned host memory.
+    auto storeDeviceBytes = CudfConfig::getInstance().exchangeStoreDeviceBytes;
+    if (gpuCapabilities().availableMemoryBytes > 0) {
+      storeDeviceBytes = std::min<uint64_t>(
+          storeDeviceBytes, gpuCapabilities().availableMemoryBytes / 4);
+    }
     ucx_exchange::registerExchangeStoreTables(
-        CudfConfig::getInstance().exchangeStoreDeviceBytes,
-        CudfConfig::getInstance().exchangeStoreHostBytes);
+        storeDeviceBytes, CudfConfig::getInstance().exchangeStoreHostBytes);
   }
 #endif
 
