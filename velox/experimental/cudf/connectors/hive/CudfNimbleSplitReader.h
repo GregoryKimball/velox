@@ -21,6 +21,10 @@
 
 #include "velox/common/file/File.h"
 
+#include <folly/futures/Future.h>
+
+#include <optional>
+
 namespace facebook::nimble {
 class TabletReader;
 }
@@ -48,6 +52,20 @@ class CudfNimbleSplitReader : public CudfSplitReader {
   std::optional<TableChunk> readNextChunk() override;
 
  private:
+  // A batch of stripes whose stream bytes are being read into `pinned`.
+  struct PendingBatch {
+    std::unique_ptr<NimbleGpuDecoder::PinnedBuffer> pinned;
+    std::vector<NimbleStripeStreams> stripes;
+    size_t bytes{0};
+    folly::SemiFuture<std::vector<folly::Unit>> reads;
+  };
+
+  // Starts reading the next batch, if any stripes are left.
+  std::optional<PendingBatch> startBatch();
+
+  // Waits for the reads of the pending batch, ignoring their errors.
+  void dropPending();
+
   std::shared_ptr<ReadFile> readFile_;
   std::shared_ptr<facebook::nimble::TabletReader> tablet_;
   // The stream id of each read column.
@@ -58,6 +76,8 @@ class CudfNimbleSplitReader : public CudfSplitReader {
   size_t nextStripe_{0};
   bool compactRowCount_{false};
   NimbleGpuDecoder decoder_;
+  // Read while the previous batch is decoded and consumed.
+  std::optional<PendingBatch> pending_;
 };
 
 } // namespace facebook::velox::cudf_velox::connector::hive
