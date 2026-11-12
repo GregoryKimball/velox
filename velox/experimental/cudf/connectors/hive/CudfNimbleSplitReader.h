@@ -57,7 +57,8 @@ class CudfNimbleSplitReader : public CudfSplitReader {
     std::unique_ptr<NimbleGpuDecoder::PinnedBuffer> pinned;
     std::vector<NimbleStripeStreams> stripes;
     size_t bytes{0};
-    folly::SemiFuture<std::vector<folly::Unit>> reads;
+    folly::SemiFuture<std::vector<folly::Unit>> reads{
+        folly::makeSemiFuture(std::vector<folly::Unit>{})};
   };
 
   // Starts reading the next batch, if any stripes are left.
