@@ -19,6 +19,7 @@
 //
 // Usage: nimble_dump_lite <schema|streams|layout|histogram> <file> [stripe]
 
+#include "velox/common/file/FileSystems.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/dwio/nimble/tools/NimbleDumpLib.h"
 
@@ -34,6 +35,7 @@ int main(int argc, char** argv) {
   }
   facebook::velox::memory::MemoryManager::initialize(
       facebook::velox::memory::MemoryManager::Options{});
+  facebook::velox::filesystems::registerLocalFileSystem();
   const std::string command = argv[1];
   std::optional<uint32_t> stripe;
   if (argc > 3) {
