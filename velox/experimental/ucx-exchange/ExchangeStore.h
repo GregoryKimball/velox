@@ -24,6 +24,7 @@
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/stream>
+#include <cuda_runtime_api.h>
 
 #include <cstdint>
 #include <limits>
@@ -166,10 +167,21 @@ class ExchangeStore {
       return data_;
     }
 
+    // Marks the end of an asynchronous copy into the buffer, enqueued on
+    // 'stream'. Readers wait for it (orderReadsOn()), and so does the
+    // destructor, so that the buffer does not return to its pool while the
+    // copy still writes to it.
+    void recordWrite(cuda::stream_ref stream);
+
+    // Makes work enqueued on 'stream' from now on wait for the copy recorded
+    // by recordWrite(), if any.
+    void orderReadsOn(cuda::stream_ref stream) const;
+
    private:
     HostPool& pool_;
     void* data_;
     const std::size_t bytes_;
+    cudaEvent_t written_{nullptr};
   };
 
   // Returns the host tier's pool, creating it on first use. Called with

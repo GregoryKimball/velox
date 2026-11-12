@@ -260,6 +260,23 @@ TEST_F(ExchangeStoreTest, overflowsToHostWhenDeviceTierIsFull) {
   EXPECT_EQ(store.stats().hostBytes, 0);
 }
 
+TEST_F(ExchangeStoreTest, readsHostTierCopiedOnAnotherStream) {
+  const auto input = makeInput();
+  const auto type = asRowType(input->type());
+  auto payloads = pack(input, {}, compressions().back());
+  ExchangeStore store;
+  store.setDeviceCapacity(0);
+  // The copy to the host tier runs behind the writer on the writer's stream;
+  // the reader neither shares that stream nor synchronizes it.
+  rmm::cuda_stream writer;
+  ASSERT_TRUE(
+      store.add("table", "file", std::move(payloads[0]), kNumRows, {}, writer));
+  const auto rows = takeRows(store, "table", "file", type);
+  ASSERT_EQ(rows.size(), 1);
+  velox::test::assertEqualVectors(expectedRows(input, 0, kNumRows), rows[0]);
+  EXPECT_EQ(store.stats().hostBytes, 0);
+}
+
 TEST_F(ExchangeStoreTest, dropFreesEveryFileOfOneTableInBothTiers) {
   const auto input = makeInput();
   const auto type = asRowType(input->type());

@@ -53,8 +53,29 @@ ExchangeStore::HostBuffer::HostBuffer(HostPool& pool, std::size_t bytes)
       bytes_(bytes) {}
 
 ExchangeStore::HostBuffer::~HostBuffer() {
+  if (written_ != nullptr) {
+    // A destructor must not throw: report a failed wait and release anyway.
+    const auto status = cudaEventSynchronize(written_);
+    LOG_IF(ERROR, status != cudaSuccess)
+        << "Waiting for a copy into the exchange store's host tier failed: "
+        << cudaGetErrorString(status);
+    cudaEventDestroy(written_);
+  }
   pool_.pool.deallocate(
       hostPoolStream(), data_, bytes_, rmm::CUDA_ALLOCATION_ALIGNMENT);
+}
+
+void ExchangeStore::HostBuffer::recordWrite(cuda::stream_ref stream) {
+  if (written_ == nullptr) {
+    CUDF_CUDA_TRY(cudaEventCreateWithFlags(&written_, cudaEventDisableTiming));
+  }
+  CUDF_CUDA_TRY(cudaEventRecord(written_, stream.get()));
+}
+
+void ExchangeStore::HostBuffer::orderReadsOn(cuda::stream_ref stream) const {
+  if (written_ != nullptr) {
+    CUDF_CUDA_TRY(cudaStreamWaitEvent(stream.get(), written_, 0));
+  }
 }
 
 ExchangeStore::ExchangeStore() = default;
@@ -130,7 +151,10 @@ bool ExchangeStore::place(StoredPayload& stored, cuda::stream_ref stream) {
         stored.bytes,
         cudaMemcpyDeviceToHost,
         stream.get()));
-    stream.sync();
+    // The copy runs behind the writer: readers and the host buffer's release
+    // wait for it, and the device buffer is freed after it in stream order.
+    stored.host->recordWrite(stream);
+    stored.device->set_stream(stream);
     stored.device.reset();
   }
   return toHost;
@@ -229,6 +253,9 @@ std::vector<ExchangeStore::TakenPayload> ExchangeStore::take(
           payload.bytes;
     }
     auto device = std::make_unique<rmm::device_buffer>(payload.bytes, stream, mr);
+    if (payload.host != nullptr) {
+      payload.host->orderReadsOn(stream);
+    }
     if (payload.bytes > 0) {
       CUDF_CUDA_TRY(cudaMemcpyAsync(
           device->data(),
