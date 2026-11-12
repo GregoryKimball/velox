@@ -1998,8 +1998,12 @@ void CudfGroupby::computeFinalGroupbyStreaming(CudfVectorPtr input) {
     auto preparedInput =
         makeStreamingGroupbyInputView(input->getTableView(), stateStream);
     if (streamingGroupbyPartitions_.empty()) {
+      // A lifespan of grouped execution already holds one bucket's share of
+      // the groups; splitting it again only adds fixed cost per lifespan.
       const auto numPartitions =
-          CudfConfig::getInstance().streamingGroupbyPartitions;
+          operatorCtx_->driverCtx()->splitGroupId == exec::kUngroupedGroupId
+          ? CudfConfig::getInstance().streamingGroupbyPartitions
+          : 1;
       streamingGroupbyPartitions_.resize(numPartitions);
       auto lockedStats = stats_.wlock();
       lockedStats->addRuntimeStat(
