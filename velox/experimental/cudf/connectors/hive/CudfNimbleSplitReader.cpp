@@ -44,7 +44,9 @@ folly::Executor* readExecutor() {
 
 } // namespace
 
-CudfNimbleSplitReader::~CudfNimbleSplitReader() = default;
+CudfNimbleSplitReader::~CudfNimbleSplitReader() {
+  dropPending();
+}
 
 const std::vector<cudf::io::parquet::FileMetaData>&
 CudfNimbleSplitReader::fileMetaDatas() {
@@ -108,20 +110,11 @@ void CudfNimbleSplitReader::prepareSplitInternal(
   }
 }
 
-std::optional<CudfSplitReader::TableChunk>
-CudfNimbleSplitReader::readNextChunk() {
-  VELOX_CHECK_NOT_NULL(tablet_, "Nimble tablet not open");
+std::optional<CudfNimbleSplitReader::PendingBatch>
+CudfNimbleSplitReader::startBatch() {
   if (nextStripe_ >= stripes_.size()) {
     return std::nullopt;
   }
-  if (noColumnsToRead_) {
-    const auto stripe = stripes_[nextStripe_++];
-    return TableChunk{
-        std::make_unique<cudf::table>(
-            std::vector<std::unique_ptr<cudf::column>>{}),
-        static_cast<cudf::size_type>(tablet_->stripeRowCount(stripe))};
-  }
-
   // Stripes are batched up to a stored-byte budget so that one decode sees
   // many compressed frames.
   constexpr size_t kBatchBytes = size_t{128} << 20;
@@ -154,40 +147,77 @@ CudfNimbleSplitReader::readNextChunk() {
 
   // The streams are read straight into the pinned buffer that goes to the
   // device, in pieces spread over the read threads.
-  NimbleGpuDecoder::PinnedBuffer pinned{batchBytes};
-  auto* host = pinned.data();
+  PendingBatch pending;
+  pending.pinned =
+      std::make_unique<NimbleGpuDecoder::PinnedBuffer>(batchBytes);
+  pending.bytes = batchBytes;
+  auto* host = pending.pinned->data();
+  constexpr uint64_t kPieceBytes = uint64_t{4} << 20;
+  std::vector<folly::SemiFuture<folly::Unit>> pieces;
+  size_t offset = 0;
+  size_t next = 0;
+  for (auto& entry : batch) {
+    for (size_t i = 0; i < streamIds_.size(); ++i) {
+      const auto& read = reads[next++];
+      for (uint64_t done = 0; done < read.size; done += kPieceBytes) {
+        const auto size = std::min(kPieceBytes, read.size - done);
+        auto* out = host + offset + done;
+        const auto fileOffset = read.fileOffset + done;
+        pieces.push_back(
+            folly::via(readExecutor(), [this, fileOffset, size, out] {
+              readFile_->pread(fileOffset, size, out);
+            }).semi());
+      }
+      entry.streams.emplace_back(host + offset, read.size);
+      offset += read.size;
+    }
+  }
+  pending.stripes = std::move(batch);
+  pending.reads = folly::collect(std::move(pieces));
+  return pending;
+}
+
+void CudfNimbleSplitReader::dropPending() {
+  if (pending_) {
+    pending_->reads.wait();
+    pending_.reset();
+  }
+}
+
+std::optional<CudfSplitReader::TableChunk>
+CudfNimbleSplitReader::readNextChunk() {
+  VELOX_CHECK_NOT_NULL(tablet_, "Nimble tablet not open");
+  if (noColumnsToRead_) {
+    if (nextStripe_ >= stripes_.size()) {
+      return std::nullopt;
+    }
+    const auto stripe = stripes_[nextStripe_++];
+    return TableChunk{
+        std::make_unique<cudf::table>(
+            std::vector<std::unique_ptr<cudf::column>>{}),
+        static_cast<cudf::size_type>(tablet_->stripeRowCount(stripe))};
+  }
+
+  if (!pending_) {
+    pending_ = startBatch();
+  }
+  if (!pending_) {
+    return std::nullopt;
+  }
+  auto current = std::move(*pending_);
+  pending_ = startBatch();
   {
     nvtx3::scoped_range range{"CudfNimbleSplitReader::read"};
-    constexpr uint64_t kPieceBytes = uint64_t{4} << 20;
-    std::vector<folly::SemiFuture<folly::Unit>> pieces;
-    size_t offset = 0;
-    size_t next = 0;
-    for (auto& entry : batch) {
-      for (size_t i = 0; i < streamIds_.size(); ++i) {
-        const auto& read = reads[next++];
-        for (uint64_t done = 0; done < read.size; done += kPieceBytes) {
-          const auto size = std::min(kPieceBytes, read.size - done);
-          auto* out = host + offset + done;
-          const auto fileOffset = read.fileOffset + done;
-          pieces.push_back(
-              folly::via(readExecutor(), [this, fileOffset, size, out] {
-                readFile_->pread(fileOffset, size, out);
-              }).semi());
-        }
-        entry.streams.emplace_back(host + offset, read.size);
-        offset += read.size;
-      }
-    }
-    folly::collect(std::move(pieces)).get();
-    if (ioStatistics_) {
-      ioStatistics_->incRawBytesRead(batchBytes);
-    }
+    std::move(current.reads).get();
+  }
+  if (ioStatistics_) {
+    ioStatistics_->incRawBytesRead(current.bytes);
   }
 
   const auto* filter = subfieldFilterAst();
   auto columns = decoder_.decode(
-      batch,
-      std::span<const uint8_t>{host, batchBytes},
+      current.stripes,
+      std::span<const uint8_t>{current.pinned->data(), current.bytes},
       cudfTypes_,
       compactRowCount_,
       stream_,
@@ -206,6 +236,7 @@ CudfNimbleSplitReader::readNextChunk() {
 }
 
 void CudfNimbleSplitReader::resetSplit() {
+  dropPending();
   tablet_.reset();
   readFile_.reset();
   streamIds_.clear();
