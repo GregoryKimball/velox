@@ -122,7 +122,7 @@ CudfNimbleSplitReader::startBatch() {
   // many compressed frames.
   static const size_t kBatchBytes = [] {
     const char* mb = std::getenv("NIMBLE_GPU_BATCH_MB");
-    return size_t{mb != nullptr ? std::stoul(mb) : 128} << 20;
+    return size_t{mb != nullptr ? std::stoul(mb) : 512} << 20;
   }();
   constexpr int64_t kBatchRows = int64_t{1} << 28;
   struct Read {
