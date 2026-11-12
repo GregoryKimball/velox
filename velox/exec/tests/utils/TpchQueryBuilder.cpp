@@ -21,6 +21,7 @@
 #include "velox/tpch/gen/TpchGen.h"
 
 #include <fstream>
+#include <unordered_set>
 
 namespace facebook::velox::exec::test {
 
@@ -100,11 +101,25 @@ void TpchQueryBuilder::readFileSchema(
   types.resize(columnNames.size());
   if (format_ == dwio::common::FileFormat::NIMBLE) {
     // Nimble stores only the physical type, so DATE columns read back as
-    // INTEGER.
+    // INTEGER and the DECIMAL(15, 2) columns of the TPC-H schema as BIGINT.
+    static const std::unordered_set<std::string> kDecimalColumns{
+        "l_quantity",
+        "l_extendedprice",
+        "l_discount",
+        "l_tax",
+        "o_totalprice",
+        "ps_supplycost",
+        "p_retailprice",
+        "c_acctbal",
+        "s_acctbal"};
     for (size_t i = 0; i < types.size(); ++i) {
       if (types[i]->kind() == TypeKind::INTEGER &&
           columnNames[i].ends_with("date")) {
         types[i] = DATE();
+      } else if (
+          types[i]->kind() == TypeKind::BIGINT &&
+          kDecimalColumns.count(columnNames[i]) > 0) {
+        types[i] = DECIMAL(15, 2);
       }
     }
   }
