@@ -617,7 +617,7 @@ class ExchangeStoreDataSink : public connector::hive::HiveDataSink {
         batch,
         bucketWriters.size(),
         stream);
-    for (const auto [bucket, index] : bucketWriters) {
+    for (const auto& [bucket, index] : bucketWriters) {
       const auto numRows = offsets[bucket + 1] - offsets[bucket];
       const auto bytes = batch.payloads[bucket].logicalDataSize;
       writerAt(index)->addPayload(
