@@ -159,6 +159,28 @@ void TpchQueryBuilder::initialize(const std::string& dataPath) {
       }
     }
   }
+  const auto lineitem = tableMetadata_.find(kLineitem);
+  if (lineitem != tableMetadata_.end() && lineitem->second.type &&
+      lineitem->second.type->containsChild("l_discount")) {
+    decimal_ = lineitem->second.type->findChild("l_discount")->isDecimal();
+  }
+}
+
+std::string TpchQueryBuilder::number(
+    const std::string& value,
+    int precision,
+    int scale) const {
+  return decimal_
+      ? fmt::format("cast({} as decimal({}, {}))", value, precision, scale)
+      : value;
+}
+
+std::string TpchQueryBuilder::discountedPrice() const {
+  return fmt::format("l_extendedprice * ({} - l_discount)", number("1.0"));
+}
+
+std::string TpchQueryBuilder::wide(const std::string& expr) const {
+  return decimal_ ? fmt::format("cast({} as decimal(38, 6))", expr) : expr;
 }
 
 const std::vector<std::string>& TpchQueryBuilder::getTableNames() {
@@ -254,8 +276,9 @@ TpchPlan TpchQueryBuilder::getQ1Plan() const {
                "l_linestatus",
                "l_quantity",
                "l_extendedprice",
-               "l_extendedprice * (1.0 - l_discount) AS l_sum_disc_price",
-               "l_extendedprice * (1.0 - l_discount) * (1.0 + l_tax) AS l_sum_charge",
+               discountedPrice() + " AS l_sum_disc_price",
+               discountedPrice() + " * (" + number("1.0") +
+                   " + l_tax) AS l_sum_charge",
                "l_discount"})
           .partialAggregation(
               {"l_returnflag", "l_linestatus"},
@@ -554,7 +577,7 @@ TpchPlan TpchQueryBuilder::getQ3Plan() const {
               {shipDateFilter})
           .captureScanNodeId(lineitemPlanNodeId)
           .project(
-              {"l_extendedprice * (1.0 - l_discount) AS part_revenue",
+              {discountedPrice() + " AS part_revenue",
                "l_orderkey"})
           .hashJoin(
               {"l_orderkey"},
@@ -738,7 +761,7 @@ TpchPlan TpchQueryBuilder::getQ5Plan() const {
           .tableScan(kLineitem, lineitemSelectedRowType, lineitemFileColumns)
           .captureScanNodeId(lineitemScanNodeId)
           .project(
-              {"l_extendedprice * (1.0 - l_discount) AS part_revenue",
+              {discountedPrice() + " AS part_revenue",
                "l_orderkey",
                "l_suppkey"})
           .hashJoin(
@@ -797,8 +820,9 @@ TpchPlan TpchQueryBuilder::getQ6Plan() const {
                       selectedRowType,
                       fileColumnNames,
                       {shipDateFilter,
-                       "l_discount between 0.05 and 0.07",
-                       "l_quantity < 24.0"})
+                       "l_discount between " + number("0.05") + " and " +
+                           number("0.07"),
+                       "l_quantity < " + number("24.0")})
                   .captureScanNodeId(lineitemPlanNodeId)
                   .project({"l_extendedprice * l_discount"})
                   .partialAggregation({}, {"sum(p0)"})
@@ -933,7 +957,7 @@ TpchPlan TpchQueryBuilder::getQ7Plan() const {
           .project(
               {"cust_nation",
                "supp_nation",
-               "l_extendedprice * (1.0 - l_discount) as part_revenue",
+               discountedPrice() + " as part_revenue",
                "year(l_shipdate) as l_year"})
           .partialAggregation(
               {"supp_nation", "cust_nation", "l_year"},
@@ -1111,12 +1135,13 @@ TpchPlan TpchQueryBuilder::getQ8Plan() const {
               "",
               {"n_name", "o_orderdate", "l_extendedprice", "l_discount"})
           .project(
-              {"l_extendedprice * (1.0 - l_discount) as volume",
+              {discountedPrice() + " as volume",
                "n_name",
                "o_orderdate"})
           .project(
               {"volume",
-               "(CASE WHEN n_name = 'BRAZIL' THEN volume ELSE 0.0 END) as brazil_volume",
+               "(CASE WHEN n_name = 'BRAZIL' THEN volume ELSE " +
+                   number("0.0", 31, 4) + " END) as brazil_volume",
                "year(o_orderdate) AS o_year"})
           .partialAggregation(
               {"o_year"},
@@ -1256,7 +1281,7 @@ TpchPlan TpchQueryBuilder::getQ9Plan(const std::string& partFilter) const {
           .project(
               {"n_name AS nation",
                "year(o_orderdate) AS o_year",
-               "l_extendedprice * (1.0 - l_discount) - ps_supplycost * l_quantity AS amount"})
+               discountedPrice() + " - ps_supplycost * l_quantity AS amount"})
           .partialAggregation(
               {"nation", "o_year"}, {"sum(amount) AS sum_profit"})
           .localPartition(std::vector<std::string>{})
@@ -1360,7 +1385,7 @@ TpchPlan TpchQueryBuilder::getQ10Plan() const {
                       {lineitemReturnFlagFilter})
                   .captureScanNodeId(lineitemScanNodeId)
                   .project(
-                      {"l_extendedprice * (1.0 - l_discount) AS part_revenue",
+                      {discountedPrice() + " AS part_revenue",
                        "l_orderkey"})
                   .hashJoin(
                       {"l_orderkey"},
@@ -1404,6 +1429,10 @@ TpchPlan TpchQueryBuilder::getQ10Plan() const {
 }
 
 TpchPlan TpchQueryBuilder::getQ11Plan() const {
+  const std::string costQuantity = decimal_
+      ? "ps_supplycost * cast(ps_availqty as decimal(19, 0))"
+      : "ps_supplycost * ps_availqty";
+
   // Column definitions.
   std::vector<std::string> partsuppColumns = {
       "ps_partkey", "ps_suppkey", "ps_availqty", "ps_supplycost"};
@@ -1474,11 +1503,13 @@ TpchPlan TpchQueryBuilder::getQ11Plan() const {
               supplierJoinNationSubQuery,
               "",
               {"ps_availqty", "ps_suppkey", "ps_supplycost"})
-          .project({"ps_supplycost * ps_availqty AS product_cost_qty"})
+          .project({costQuantity + " AS product_cost_qty"})
           .partialAggregation({}, {"sum(product_cost_qty) AS sum_cost_qty"})
           .localPartition({})
           .finalAggregation()
-          .project({"sum_cost_qty * 0.0001 AS filter_cost_qty"})
+          .project(
+              {"sum_cost_qty * " + number("0.0001", 5, 4) +
+               " AS filter_cost_qty"})
           .planNode();
 
   // Query plan.
@@ -1510,14 +1541,14 @@ TpchPlan TpchQueryBuilder::getQ11Plan() const {
               "",
               {"ps_partkey", "ps_availqty", "ps_supplycost"})
           .project(
-              {"ps_supplycost * ps_availqty AS product_cost_qty", "ps_partkey"})
+              {costQuantity + " AS product_cost_qty", "ps_partkey"})
           .partialAggregation(
               {"ps_partkey"}, {"sum(product_cost_qty) AS value"})
           .localPartition({"ps_partkey"})
           .finalAggregation()
           .nestedLoopJoin(
               subQueryPlan, {"ps_partkey", "value", "filter_cost_qty"})
-          .filter("value > filter_cost_qty")
+          .filter(wide("value") + " > " + wide("filter_cost_qty"))
           .project({"ps_partkey", "value"})
           .orderBy({"value DESC"}, false)
           .planNode();
@@ -1696,7 +1727,7 @@ TpchPlan TpchQueryBuilder::getQ14Plan() const {
               shipDateFilter)
           .captureScanNodeId(lineitemScanNodeId)
           .project(
-              {"l_extendedprice * (1.0 - l_discount) as part_revenue",
+              {discountedPrice() + " as part_revenue",
                "l_shipdate",
                "l_partkey"})
           .hashJoin(
@@ -1706,7 +1737,8 @@ TpchPlan TpchQueryBuilder::getQ14Plan() const {
               "",
               {"part_revenue", "p_type"})
           .project(
-              {"(CASE WHEN (p_type LIKE 'PROMO%') THEN part_revenue ELSE 0.0 END) as filter_revenue",
+              {"(CASE WHEN (p_type LIKE 'PROMO%') THEN part_revenue ELSE " +
+                   number("0.0", 31, 4) + " END) as filter_revenue",
                "part_revenue"})
           .partialAggregation(
               {},
@@ -1715,7 +1747,8 @@ TpchPlan TpchQueryBuilder::getQ14Plan() const {
           .localPartition(std::vector<std::string>{})
           .finalAggregation()
           .project(
-              {"100.00 * total_promo_revenue/total_revenue as promo_revenue"})
+              {number("100.00", 5, 2) +
+               " * total_promo_revenue/total_revenue as promo_revenue"})
           .planNode();
 
   TpchPlan context;
@@ -1756,7 +1789,7 @@ TpchPlan TpchQueryBuilder::getQ15Plan() const {
           .captureScanNodeId(lineitemScanNodeId)
           .project(
               {"l_suppkey",
-               "l_extendedprice * (1.0 - l_discount) as part_revenue"})
+               discountedPrice() + " as part_revenue"})
           .partialAggregation(
               {"l_suppkey"}, {"sum(part_revenue) as total_revenue"})
           .localPartition(std::vector<std::string>{})
@@ -1775,7 +1808,7 @@ TpchPlan TpchQueryBuilder::getQ15Plan() const {
           .captureScanNodeId(lineitemScanNodeIdSubQuery)
           .project(
               {"l_suppkey as supplier_no",
-               "l_extendedprice * (1.0 - l_discount) as part_revenue"})
+               discountedPrice() + " as part_revenue"})
           .partialAggregation(
               {"supplier_no"}, {"sum(part_revenue) as total_revenue"})
           .localPartition(std::vector<std::string>{})
@@ -1968,12 +2001,13 @@ TpchPlan TpchQueryBuilder::getQ17Plan() const {
               {"l_partkey"},
               {"p_partkey"},
               lineitemJoinPart,
-              "l_quantity < 0.2 * avg_",
+              wide("l_quantity") + " < " +
+                  wide(number("0.2", 2, 1) + " * avg_"),
               {"l_extendedprice"})
           .partialAggregation({}, {"sum(l_extendedprice) as partial_sum"})
           .localPartition(std::vector<std::string>{})
           .finalAggregation()
-          .project({"(partial_sum / 7.0) as avg_yearly"})
+          .project({"(partial_sum / " + number("7.0", 2, 1) + ") as avg_yearly"})
           .planNode();
 
   TpchPlan context;
@@ -2014,7 +2048,7 @@ TpchPlan TpchQueryBuilder::getQ18Plan() const {
           .partialAggregation({"l_orderkey"}, {"sum(l_quantity) AS quantity"})
           .localPartition({"l_orderkey"})
           .finalAggregation()
-          .filter("quantity > 300.0")
+          .filter("quantity > " + number("300.0", 38, 2))
           .planNode();
 
   auto plan =
@@ -2086,19 +2120,24 @@ TpchPlan TpchQueryBuilder::getQ19Plan() const {
   const std::string shipModeFilter = "l_shipmode IN ('AIR', 'AIR REG')";
   const std::string shipInstructFilter =
       "(l_shipinstruct = 'DELIVER IN PERSON')";
+  const auto quantityBetween = [&](const char* low, const char* high) {
+    return "(l_quantity between " + number(low) + " and " + number(high) + ")";
+  };
   const std::string joinFilterExpr =
       "     ((p_brand = 'Brand#12')"
-      "     AND (l_quantity between 1.0 and 11.0)"
+      "     AND " +
+      quantityBetween("1.0", "11.0") +
       "     AND (p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG'))"
       "     AND (p_size BETWEEN 1 AND 5))"
       " OR  ((p_brand ='Brand#23')"
       "     AND (p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK'))"
-      "     AND (l_quantity between 10.0 and 20.0)"
+      "     AND " +
+      quantityBetween("10.0", "20.0") +
       "     AND (p_size BETWEEN 1 AND 10))"
       " OR  ((p_brand = 'Brand#34')"
       "     AND (p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG'))"
-      "     AND (l_quantity between 20.0 and 30.0)"
-      "     AND (p_size BETWEEN 1 AND 15))";
+      "     AND " +
+      quantityBetween("20.0", "30.0") + "     AND (p_size BETWEEN 1 AND 15))";
 
   auto part = PlanBuilder(planNodeIdGenerator, pool_.get())
                   .filtersAsNode(filtersAsNode_)
@@ -2115,7 +2154,7 @@ TpchPlan TpchQueryBuilder::getQ19Plan() const {
                       {shipModeFilter, shipInstructFilter})
                   .captureScanNodeId(lineitemScanNodeId)
                   .project(
-                      {"l_extendedprice * (1.0 - l_discount) as part_revenue",
+                      {discountedPrice() + " as part_revenue",
                        "l_shipmode",
                        "l_shipinstruct",
                        "l_partkey",
@@ -2249,12 +2288,15 @@ TpchPlan TpchQueryBuilder::getQ20Plan() const {
               {"l_partkey", "l_suppkey"}, {"sum(l_quantity) AS sum_qty"})
           .localPartition({"l_partkey", "l_suppkey"})
           .finalAggregation()
-          .project({"l_partkey", "l_suppkey", "0.5 * sum_qty AS filter_qty"})
+          .project(
+              {"l_partkey",
+               "l_suppkey",
+               number("0.5", 1, 1) + " * sum_qty AS filter_qty"})
           .hashJoin(
               {"l_partkey", "l_suppkey"},
               {"ps_partkey", "ps_suppkey"},
               partsuppJoinPart,
-              "ps_availqty > filter_qty",
+              wide("ps_availqty") + " > " + wide("filter_qty"),
               {"ps_suppkey"})
           .hashJoin(
               {"ps_suppkey"},
@@ -2457,7 +2499,7 @@ TpchPlan TpchQueryBuilder::getQ22Plan() const {
               kCustomer,
               customerSelectedRowType,
               customerFileColumns,
-              {"c_acctbal > 0.0"},
+              {"c_acctbal > " + number("0.0")},
               phoneFilter)
           .captureScanNodeId(customerScanNodeId)
           .partialAggregation({}, {"avg(c_acctbal) as avg_acctbal"})
@@ -2478,7 +2520,7 @@ TpchPlan TpchQueryBuilder::getQ22Plan() const {
           .nestedLoopJoin(
               customerAvgAccountBalance,
               {"c_acctbal", "avg_acctbal", "c_custkey", "c_phone"})
-          .filter("c_acctbal > avg_acctbal")
+          .filter(wide("c_acctbal") + " > " + wide("avg_acctbal"))
           .hashJoin(
               {"c_custkey"},
               {"o_custkey"},
