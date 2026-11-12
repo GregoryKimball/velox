@@ -301,15 +301,98 @@ __global__ void varintDecodeKernel(
 }
 
 // A leaf encoding that gives O(1) access to value i.
+// Varint leaves are decoded into 8-byte trivial leaves before the chunks that
+// read them.
 struct FastLeaf {
-  enum Kind : uint8_t { kTrivial, kFixedBitWidth, kConstant, kIdentity };
+  enum Kind : uint8_t {
+    kTrivial,
+    kFixedBitWidth,
+    kConstant,
+    kIdentity,
+    kVarint
+  };
   const uint8_t* data{nullptr};
-  // FixedBitWidth baseline, or the Constant value.
+  // FixedBitWidth or Varint baseline, or the Constant value.
   uint64_t baseline{0};
+  // Values and payload bytes of a Varint leaf.
+  uint32_t count{0};
+  uint32_t numBytes{0};
   Kind kind{kTrivial};
   uint8_t width{0};
   uint8_t bitWidth{0};
 };
+
+// The payload of a Varint leaf, at byteBase in the batch's varint bytes.
+struct VarintSegment {
+  const uint8_t* data;
+  uint64_t baseline;
+  uint32_t numBytes;
+  uint32_t byteBase;
+  uint8_t width;
+};
+
+constexpr int kVarintBytesPerBlock = 4096;
+
+__device__ int findSegment(const uint32_t* blockStarts, int numSegments) {
+  int lo = 0;
+  int hi = numSegments - 1;
+  while (lo < hi) {
+    const int mid = (lo + hi + 1) / 2;
+    if (blockStarts[mid] <= blockIdx.x) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return lo;
+}
+
+__global__ void varintEndFlagsKernel(
+    const VarintSegment* segments,
+    const uint32_t* blockStarts,
+    int numSegments,
+    uint32_t* flags) {
+  const int s = findSegment(blockStarts, numSegments);
+  const VarintSegment segment = segments[s];
+  const uint32_t begin = (blockIdx.x - blockStarts[s]) * kVarintBytesPerBlock;
+  const uint32_t end = min(begin + kVarintBytesPerBlock, segment.numBytes);
+  for (uint32_t j = begin + threadIdx.x; j < end; j += blockDim.x) {
+    flags[segment.byteBase + j] = (segment.data[j] & 0x80) == 0;
+  }
+}
+
+// `index` is the exclusive scan of the end flags, so it numbers the values of
+// all segments in order.
+__global__ void varintValuesKernel(
+    const VarintSegment* segments,
+    const uint32_t* blockStarts,
+    int numSegments,
+    const uint32_t* index,
+    uint64_t* out,
+    uint32_t numValues) {
+  const int s = findSegment(blockStarts, numSegments);
+  const VarintSegment segment = segments[s];
+  const uint32_t begin = (blockIdx.x - blockStarts[s]) * kVarintBytesPerBlock;
+  const uint32_t end = min(begin + kVarintBytesPerBlock, segment.numBytes);
+  for (uint32_t j = begin + threadIdx.x; j < end; j += blockDim.x) {
+    if (segment.data[j] & 0x80) {
+      continue;
+    }
+    uint32_t start = j;
+    while (start > 0 && j - start < 9 && (segment.data[start - 1] & 0x80)) {
+      --start;
+    }
+    uint64_t value = 0;
+    for (uint32_t k = start, shift = 0; k <= j; ++k, shift += 7) {
+      value |= static_cast<uint64_t>(segment.data[k] & 0x7f) << shift;
+    }
+    const uint32_t v = index[segment.byteBase + j];
+    if (v < numValues) {
+      value += segment.baseline;
+      out[v] = segment.width == 4 ? static_cast<uint32_t>(value) : value;
+    }
+  }
+}
 
 // One chunk decoded by decodeFastChunksKernel. Row i maps to a run when the
 // chunk is run-length encoded, then through dictionary indices, then to a
@@ -454,6 +537,66 @@ void launchFastChunks(
       stream.get()));
   decodeFastChunksKernel<<<numBlocks, kBlockSize, 0, stream.get()>>>(
       deviceChunks.data(), deviceStarts.data(), static_cast<int>(chunks.size()));
+  checkCuda(cudaGetLastError());
+}
+
+template <typename T>
+void scanInPlace(
+    T* data,
+    int64_t n,
+    bool inclusive,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr);
+
+// Decodes the varints of all segments into out, in segment order.
+void decodeVarints(
+    const std::vector<VarintSegment>& segments,
+    uint32_t numBytes,
+    uint64_t* out,
+    uint32_t numValues,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  std::vector<VarintSegment> nonEmpty;
+  std::vector<uint32_t> blockStarts;
+  uint32_t numBlocks = 0;
+  for (const auto& segment : segments) {
+    if (segment.numBytes == 0) {
+      continue;
+    }
+    nonEmpty.push_back(segment);
+    blockStarts.push_back(numBlocks);
+    numBlocks +=
+        (segment.numBytes + kVarintBytesPerBlock - 1) / kVarintBytesPerBlock;
+  }
+  if (nonEmpty.empty()) {
+    return;
+  }
+  rmm::device_uvector<VarintSegment> deviceSegments(nonEmpty.size(), stream, mr);
+  rmm::device_uvector<uint32_t> deviceStarts(blockStarts.size(), stream, mr);
+  rmm::device_uvector<uint32_t> index(numBytes, stream, mr);
+  checkCuda(cudaMemcpyAsync(
+      deviceSegments.data(),
+      nonEmpty.data(),
+      nonEmpty.size() * sizeof(VarintSegment),
+      cudaMemcpyHostToDevice,
+      stream.get()));
+  checkCuda(cudaMemcpyAsync(
+      deviceStarts.data(),
+      blockStarts.data(),
+      blockStarts.size() * sizeof(uint32_t),
+      cudaMemcpyHostToDevice,
+      stream.get()));
+  const auto numSegments = static_cast<int>(nonEmpty.size());
+  varintEndFlagsKernel<<<numBlocks, kBlockSize, 0, stream.get()>>>(
+      deviceSegments.data(), deviceStarts.data(), numSegments, index.data());
+  scanInPlace(index.data(), numBytes, false, stream, mr);
+  varintValuesKernel<<<numBlocks, kBlockSize, 0, stream.get()>>>(
+      deviceSegments.data(),
+      deviceStarts.data(),
+      numSegments,
+      index.data(),
+      out,
+      numValues);
   checkCuda(cudaGetLastError());
 }
 
@@ -868,6 +1011,20 @@ class StripeDecode {
         leaf.kind = FastLeaf::kConstant;
         leaf.baseline = reader.uN(width);
         return true;
+      case EncodingType::kVarint: {
+        if (width != 4 && width != 8) {
+          return false;
+        }
+        leaf.kind = FastLeaf::kVarint;
+        leaf.baseline = reader.uN(width);
+        leaf.count = rows;
+        if (resolve) {
+          const auto bytes = payload(Codec::kUncompressed, reader.rest());
+          leaf.data = bytes.data;
+          leaf.numBytes = static_cast<uint32_t>(bytes.size);
+        }
+        return true;
+      }
       default:
         return false;
     }
@@ -1469,13 +1626,12 @@ std::vector<std::unique_ptr<cudf::column>> NimbleGpuDecoder::decode(
           ChunkShape shape;
           fast[i] = walk.fastShape((*chunks)[c], types[i], false, shape);
           chars[i] += shape.charsSize;
-        }
-        if (!fast[i] && chunks.has_value() && !chunks->empty()) {
           static std::atomic<int> logged{0};
-          if (logged++ < 32) {
-            LOG(INFO) << "Nimble GPU decode: column " << i
+          if (!fast[i] && logged++ < 32) {
+            LOG(INFO) << "Nimble GPU decode: column " << i << " type "
+                      << static_cast<int>(types[i].id())
                       << " on the general path: "
-                      << walk.describe(chunks->front());
+                      << walk.describe((*chunks)[c]);
           }
         }
       }
@@ -1578,6 +1734,52 @@ std::vector<std::unique_ptr<cudf::column>> NimbleGpuDecoder::decode(
                 " rows, stripe has " + std::to_string(stripe.numRows));
       }
     }
+
+    // Varint leaves are decoded first and then read as 8-byte trivial leaves.
+    std::vector<VarintSegment> segments;
+    std::vector<std::pair<FastLeaf*, uint64_t>> varintLeaves;
+    uint64_t numVarintBytes = 0;
+    uint64_t numVarints = 0;
+    for (auto& column : fastColumns) {
+      for (auto& shape : column.shapes) {
+        for (FastLeaf* leaf :
+             {&shape.chunk.values,
+              &shape.chunk.indices,
+              &shape.runLengths,
+              &shape.entryLengths}) {
+          if (leaf->kind != FastLeaf::kVarint) {
+            continue;
+          }
+          segments.push_back(VarintSegment{
+              leaf->data,
+              leaf->baseline,
+              leaf->numBytes,
+              static_cast<uint32_t>(numVarintBytes),
+              leaf->width});
+          numVarintBytes += leaf->numBytes;
+          varintLeaves.emplace_back(leaf, numVarints);
+          numVarints += leaf->count;
+        }
+      }
+    }
+    NIMBLE_GPU_CHECK(
+        numVarintBytes <= std::numeric_limits<uint32_t>::max() &&
+            numVarints <= std::numeric_limits<uint32_t>::max(),
+        "too many varint bytes in a batch");
+    rmm::device_uvector<uint64_t> varints(numVarints, stream, mr);
+    for (auto [leaf, offset] : varintLeaves) {
+      leaf->kind = FastLeaf::kTrivial;
+      leaf->width = 8;
+      leaf->baseline = 0;
+      leaf->data = reinterpret_cast<const uint8_t*>(varints.data() + offset);
+    }
+    decodeVarints(
+        segments,
+        static_cast<uint32_t>(numVarintBytes),
+        varints.data(),
+        static_cast<uint32_t>(numVarints),
+        stream,
+        mr);
 
     // Run lengths, string entry lengths and string bytes go first; the
     // run lengths and entry lengths are then scanned into run ends and
