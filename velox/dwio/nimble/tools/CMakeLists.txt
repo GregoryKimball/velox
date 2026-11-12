@@ -93,6 +93,9 @@ target_link_libraries(
 # instrumentation include Meta-internal headers that are not part of the OSS
 # export, so they have no OSS build.
 
+add_executable(nimble_dump_lite NimbleDumpLite.cpp)
+target_link_libraries(nimble_dump_lite nimble_dump_lib velox_memory Folly::folly)
+
 if(VELOX_ENABLE_PARQUET)
   add_executable(nimble_parquet_to_nimble ParquetToNimble.cpp)
   target_link_libraries(
