@@ -101,6 +101,20 @@ class TpchQueryBuilder {
       const std::string& filePath,
       const std::vector<std::string>& columns);
 
+  // 'value' as is for DOUBLE money columns, and cast to DECIMAL(precision,
+  // scale) for DECIMAL ones, which do not mix with DOUBLE or BIGINT operands.
+  std::string number(
+      const std::string& value,
+      int precision = 15,
+      int scale = 2) const;
+
+  // l_extendedprice * (1 - l_discount), a DECIMAL(31, 4) for DECIMAL data.
+  std::string discountedPrice() const;
+
+  // 'expr' cast to DECIMAL(38, 6) for DECIMAL data, so that it compares with
+  // another such expression of a different precision or scale.
+  std::string wide(const std::string& expr) const;
+
   TpchPlan getQ1Plan() const;
   TpchPlan getQ2Plan() const;
   TpchPlan getQ3Plan() const;
@@ -166,6 +180,9 @@ class TpchQueryBuilder {
   std::shared_ptr<io::IoStatistics> metadataIoStats_ =
       std::make_shared<io::IoStatistics>();
   const bool filtersAsNode_;
+  // Whether the money and quantity columns are DECIMAL(15, 2) rather than
+  // DOUBLE.
+  bool decimal_{false};
 };
 
 } // namespace facebook::velox::exec::test
