@@ -129,7 +129,7 @@ CudfNimbleSplitReader::startBatch() {
   // decoded size is bounded too, like Parquet's chunk read limit.
   static const size_t kDecodedBytes = [] {
     const char* mb = std::getenv("NIMBLE_GPU_BATCH_DECODED_MB");
-    return size_t{mb != nullptr ? std::stoul(mb) : 1024} << 20;
+    return size_t{mb != nullptr ? std::stoul(mb) : 2048} << 20;
   }();
   constexpr int64_t kBatchRows = int64_t{1} << 28;
   struct Read {
