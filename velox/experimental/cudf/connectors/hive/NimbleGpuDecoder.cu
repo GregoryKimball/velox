@@ -39,6 +39,7 @@
 
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -296,6 +297,103 @@ __global__ void varintDecodeKernel(
   }
 }
 
+// A leaf encoding that gives O(1) access to value i.
+struct FastLeaf {
+  enum Kind : uint8_t { kTrivial, kFixedBitWidth, kConstant };
+  const uint8_t* data{nullptr};
+  // FixedBitWidth baseline, or the Constant value.
+  uint64_t baseline{0};
+  Kind kind{kTrivial};
+  uint8_t width{0};
+  uint8_t bitWidth{0};
+};
+
+// One chunk of a fixed-width column decoded by decodeFastChunksKernel: a leaf,
+// or a dictionary whose alphabet and indices are leaves.
+struct FastChunk {
+  FastLeaf values;
+  FastLeaf indices;
+  uint8_t* out{nullptr};
+  uint32_t numRows{0};
+  uint8_t outWidth{0};
+  bool dictionary{false};
+};
+
+constexpr int kFastRowsPerBlock = 4096;
+
+__device__ uint64_t readLeaf(const FastLeaf& leaf, uint64_t i) {
+  switch (leaf.kind) {
+    case FastLeaf::kTrivial:
+      switch (leaf.width) {
+        case 1:
+          return leaf.data[i];
+        case 2:
+          return reinterpret_cast<const uint16_t*>(leaf.data)[i];
+        case 4:
+          return reinterpret_cast<const uint32_t*>(leaf.data)[i];
+        default:
+          return reinterpret_cast<const uint64_t*>(leaf.data)[i];
+      }
+    case FastLeaf::kFixedBitWidth: {
+      const uint64_t bit = i * leaf.bitWidth;
+      const uint8_t* p = leaf.data + (bit >> 3);
+      const int shift = bit & 7;
+      uint64_t word = loadUnaligned<uint64_t>(p) >> shift;
+      if (shift + leaf.bitWidth > 64) {
+        word |= static_cast<uint64_t>(p[8]) << (64 - shift);
+      }
+      const uint64_t mask = leaf.bitWidth == 64
+          ? ~uint64_t{0}
+          : (uint64_t{1} << leaf.bitWidth) - 1;
+      return (word & mask) + leaf.baseline;
+    }
+    default:
+      return leaf.baseline;
+  }
+}
+
+// Each block decodes up to kFastRowsPerBlock rows of one chunk; blockStarts[c]
+// is the first block of chunk c, with a final entry for the total.
+__global__ void decodeFastChunksKernel(
+    const FastChunk* chunks,
+    const uint32_t* blockStarts,
+    int numChunks) {
+  int lo = 0;
+  int hi = numChunks - 1;
+  while (lo < hi) {
+    const int mid = (lo + hi + 1) / 2;
+    if (blockStarts[mid] <= blockIdx.x) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  const FastChunk chunk = chunks[lo];
+  const uint64_t begin =
+      static_cast<uint64_t>(blockIdx.x - blockStarts[lo]) * kFastRowsPerBlock;
+  const uint64_t end =
+      min(begin + kFastRowsPerBlock, static_cast<uint64_t>(chunk.numRows));
+  for (uint64_t i = begin + threadIdx.x; i < end; i += blockDim.x) {
+    const uint64_t value = chunk.dictionary
+        ? readLeaf(chunk.values, readLeaf(chunk.indices, i))
+        : readLeaf(chunk.values, i);
+    switch (chunk.outWidth) {
+      case 1:
+        chunk.out[i] = static_cast<uint8_t>(value);
+        break;
+      case 2:
+        reinterpret_cast<uint16_t*>(chunk.out)[i] = static_cast<uint16_t>(value);
+        break;
+      case 4:
+        reinterpret_cast<uint32_t*>(chunk.out)[i] = static_cast<uint32_t>(value);
+        break;
+      default:
+        reinterpret_cast<uint64_t*>(chunk.out)[i] = value;
+        break;
+    }
+  }
+}
+
 int gridSize(int64_t numValues) {
   return static_cast<int>(std::min<int64_t>(
       (numValues + kBlockSize - 1) / kBlockSize, int64_t{1} << 20));
@@ -388,7 +486,115 @@ class StripeDecode {
     return result;
   }
 
+  // The encodings of a stream's chunks, or nothing if a chunk is compressed
+  // at the chunk level.
+  static std::optional<std::vector<std::span<const uint8_t>>> chunks(
+      std::span<const uint8_t> bytes) {
+    std::vector<std::span<const uint8_t>> result;
+    ByteReader reader{bytes};
+    while (reader.remaining() > 0) {
+      const auto length = reader.u32();
+      if (reader.u8() != 0) {
+        return std::nullopt;
+      }
+      result.push_back(reader.take(length));
+    }
+    return result;
+  }
+
+  // Describes a chunk for decodeFastChunksKernel if its shape allows. Before
+  // the payloads are decompressed `resolve` is false and only the shape is
+  // checked; afterwards the leaves get their device bytes.
+  bool fastChunk(
+      std::span<const uint8_t> bytes,
+      cudf::data_type type,
+      bool resolve,
+      FastChunk& chunk) {
+    if (!cudf::is_fixed_width(type) || type.id() == cudf::type_id::BOOL8) {
+      return false;
+    }
+    const int width = cudf::size_of(type);
+    ByteReader reader{bytes};
+    const auto encoding = static_cast<EncodingType>(reader.u8());
+    const auto dataType = static_cast<DataType>(reader.u8());
+    const uint32_t rows = compactRowCount_ ? reader.varint() : reader.u32();
+    chunk.outWidth = width;
+    chunk.numRows = rows;
+    if (encoding != EncodingType::kDictionary) {
+      uint32_t leafRows = 0;
+      chunk.dictionary = false;
+      return fastLeaf(bytes, width, resolve, chunk.values, leafRows);
+    }
+    if (physicalWidth(dataType) != width) {
+      return false;
+    }
+    const auto alphabetSize = reader.u32();
+    const auto alphabet = reader.take(alphabetSize);
+    uint32_t alphabetRows = 0;
+    uint32_t indexRows = 0;
+    chunk.dictionary = true;
+    if (!fastLeaf(alphabet, width, resolve, chunk.values, alphabetRows) ||
+        !fastLeaf(reader.rest(), 4, resolve, chunk.indices, indexRows)) {
+      return false;
+    }
+    NIMBLE_GPU_CHECK(indexRows == rows, "dictionary index row count");
+    return true;
+  }
+
  private:
+  bool fastLeaf(
+      std::span<const uint8_t> bytes,
+      int width,
+      bool resolve,
+      FastLeaf& leaf,
+      uint32_t& rows) {
+    ByteReader reader{bytes};
+    const auto encoding = static_cast<EncodingType>(reader.u8());
+    const auto dataType = static_cast<DataType>(reader.u8());
+    rows = compactRowCount_ ? reader.varint() : reader.u32();
+    if (dataType == DataType::kBool || dataType == DataType::kString ||
+        physicalWidth(dataType) != width) {
+      return false;
+    }
+    leaf.width = width;
+    switch (encoding) {
+      case EncodingType::kTrivial: {
+        leaf.kind = FastLeaf::kTrivial;
+        const auto codec = static_cast<Codec>(reader.u8());
+        if (resolve) {
+          const auto bytes = payload(codec, reader.rest());
+          NIMBLE_GPU_CHECK(
+              bytes.size == static_cast<size_t>(rows) * width,
+              "trivial payload size mismatch");
+          leaf.data = bytes.data;
+        }
+        return true;
+      }
+      case EncodingType::kFixedBitWidth: {
+        leaf.kind = FastLeaf::kFixedBitWidth;
+        const auto codec = static_cast<Codec>(reader.u8());
+        leaf.baseline = reader.uN(width);
+        leaf.bitWidth = reader.u8();
+        NIMBLE_GPU_CHECK(
+            leaf.bitWidth <= 8 * width, "bit width exceeds the type");
+        if (resolve) {
+          const auto packed = payload(codec, reader.rest());
+          NIMBLE_GPU_CHECK(
+              packed.size >= (static_cast<uint64_t>(rows) * leaf.bitWidth + 7) / 8,
+              "fixed bit width payload too small");
+          leaf.data = packed.data;
+        }
+        return true;
+      }
+      case EncodingType::kConstant:
+        leaf.kind = FastLeaf::kConstant;
+        leaf.baseline = reader.uN(width);
+        return true;
+      default:
+        return false;
+    }
+  }
+
   std::unique_ptr<cudf::column> decodeEncoding(
       std::span<const uint8_t> bytes,
       cudf::data_type type) {
@@ -950,11 +1156,22 @@ std::vector<std::unique_ptr<cudf::column>> NimbleGpuDecoder::decode(
         stripe.streams.size() == types.size(), "one type per stream");
   }
   StripeDecode walk{compactRowCount, stream, mr};
+  // Columns whose every chunk decodeFastChunksKernel handles.
+  std::vector<bool> fast(types.size(), true);
   {
     nvtx3::scoped_range range{"NimbleGpuDecoder::plan"};
     for (const auto& stripe : stripes) {
       for (size_t i = 0; i < types.size(); ++i) {
         walk.decodeStream(stripe.streams[i], types[i], stripe.numRows);
+        if (!fast[i]) {
+          continue;
+        }
+        const auto chunks = StripeDecode::chunks(stripe.streams[i]);
+        fast[i] = chunks.has_value() && !chunks->empty();
+        FastChunk chunk;
+        for (size_t c = 0; fast[i] && c < chunks->size(); ++c) {
+          fast[i] = walk.fastChunk((*chunks)[c], types[i], false, chunk);
+        }
       }
     }
   }
@@ -1015,12 +1232,73 @@ std::vector<std::unique_ptr<cudf::column>> NimbleGpuDecoder::decode(
   decompressPayloads(
       payloads, Codec::kLz4, stagingData, outputData, outputOffsets, stream, mr);
 
-  std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.reserve(types.size());
+  std::vector<std::unique_ptr<cudf::column>> columns(types.size());
   walk.collecting = false;
+  cudf::size_type totalRows = 0;
+  for (const auto& stripe : stripes) {
+    totalRows += stripe.numRows;
+  }
   {
     nvtx3::scoped_range range{"NimbleGpuDecoder::decode"};
+    std::vector<FastChunk> fastChunks;
+    std::vector<uint32_t> blockStarts;
+    uint32_t numBlocks = 0;
     for (size_t i = 0; i < types.size(); ++i) {
+      if (!fast[i]) {
+        continue;
+      }
+      columns[i] = cudf::make_fixed_width_column(
+          types[i], totalRows, cudf::mask_state::UNALLOCATED, stream, mr);
+      auto* out = columns[i]->mutable_view().head<uint8_t>();
+      const auto width = cudf::size_of(types[i]);
+      size_t row = 0;
+      for (const auto& stripe : stripes) {
+        const size_t stripeEnd = row + stripe.numRows;
+        const auto chunks = StripeDecode::chunks(stripe.streams[i]);
+        for (const auto chunkBytes : *chunks) {
+          FastChunk chunk;
+          walk.fastChunk(chunkBytes, types[i], true, chunk);
+          chunk.out = out + row * width;
+          row += chunk.numRows;
+          if (chunk.numRows == 0) {
+            continue;
+          }
+          blockStarts.push_back(numBlocks);
+          numBlocks += (chunk.numRows + kFastRowsPerBlock - 1) / kFastRowsPerBlock;
+          fastChunks.push_back(chunk);
+        }
+        NIMBLE_GPU_CHECK(
+            row == stripeEnd,
+            "stream has " + std::to_string(row - (stripeEnd - stripe.numRows)) +
+                " rows, stripe has " + std::to_string(stripe.numRows));
+      }
+    }
+    if (!fastChunks.empty()) {
+      rmm::device_uvector<FastChunk> deviceChunks(fastChunks.size(), stream, mr);
+      rmm::device_uvector<uint32_t> deviceStarts(blockStarts.size(), stream, mr);
+      checkCuda(cudaMemcpyAsync(
+          deviceChunks.data(),
+          fastChunks.data(),
+          fastChunks.size() * sizeof(FastChunk),
+          cudaMemcpyHostToDevice,
+          stream.get()));
+      checkCuda(cudaMemcpyAsync(
+          deviceStarts.data(),
+          blockStarts.data(),
+          blockStarts.size() * sizeof(uint32_t),
+          cudaMemcpyHostToDevice,
+          stream.get()));
+      decodeFastChunksKernel<<<numBlocks, kBlockSize, 0, stream.get()>>>(
+          deviceChunks.data(),
+          deviceStarts.data(),
+          static_cast<int>(fastChunks.size()));
+      checkCuda(cudaGetLastError());
+    }
+
+    for (size_t i = 0; i < types.size(); ++i) {
+      if (fast[i]) {
+        continue;
+      }
       std::vector<std::unique_ptr<cudf::column>> parts;
       parts.reserve(stripes.size());
       for (const auto& stripe : stripes) {
@@ -1028,7 +1306,7 @@ std::vector<std::unique_ptr<cudf::column>> NimbleGpuDecoder::decode(
             walk.decodeStream(stripe.streams[i], types[i], stripe.numRows));
       }
       if (parts.size() == 1) {
-        columns.push_back(std::move(parts[0]));
+        columns[i] = std::move(parts[0]);
         continue;
       }
       std::vector<cudf::column_view> views;
@@ -1036,7 +1314,7 @@ std::vector<std::unique_ptr<cudf::column>> NimbleGpuDecoder::decode(
       for (const auto& part : parts) {
         views.push_back(part->view());
       }
-      columns.push_back(cudf::concatenate(views, stream, mr));
+      columns[i] = cudf::concatenate(views, stream, mr);
     }
   }
   checkCuda(cudaGetLastError());
