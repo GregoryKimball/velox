@@ -52,6 +52,15 @@ rmm::device_async_resource_ref get_output_mr();
 /// queries free their allocations.
 int64_t cudfAllocatedBytes();
 
+/// Returns the most bytes cudfAllocatedBytes() counted from the main memory
+/// resource since the previous call, or since cuDF was registered, and starts
+/// the next such window at the current count. -1 if cuDF is not registered.
+int64_t takeCudfPeakAllocatedBytes();
+
+/// Forgets the window of takeCudfPeakAllocatedBytes(). Called before the
+/// statistics adaptor that holds it is destroyed.
+void endCudfPeakWindow();
+
 /// Registers a function that frees device memory its owner holds outside the
 /// cuDF memory resource (e.g. a cache), given the size of a failed allocation.
 /// It returns whether it freed any.

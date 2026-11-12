@@ -106,6 +106,35 @@ TEST_F(GpuResourcesTest, allocatedBytesTracksLiveAllocations) {
   assertTracksAllocations({cudf::get_current_device_resource_ref()});
 }
 
+TEST_F(GpuResourcesTest, peakAllocatedBytesCoversEachWindow) {
+  EXPECT_EQ(takeCudfPeakAllocatedBytes(), -1);
+  registerCudf();
+  auto stream = cudfGlobalStreamPool().get_stream();
+  const auto resource = cudf::get_current_device_resource_ref();
+  // Allocated before the window, so it counts in the window's peak as it does
+  // in the live count.
+  rmm::device_buffer before(kAllocSize, stream, resource);
+  takeCudfPeakAllocatedBytes();
+  int64_t largest{0};
+  {
+    rmm::device_buffer large(2 * kAllocSize, stream, resource);
+    largest = cudfAllocatedBytes();
+  }
+  rmm::device_buffer small(kAllocSize, stream, resource);
+  const auto withSmall = cudfAllocatedBytes();
+  EXPECT_GT(largest, withSmall);
+  EXPECT_EQ(takeCudfPeakAllocatedBytes(), largest);
+
+  // The next window starts from the bytes still allocated and only frees.
+  EXPECT_EQ(cudfAllocatedBytes(), withSmall);
+  before = rmm::device_buffer(0, stream, resource);
+  EXPECT_LT(cudfAllocatedBytes(), withSmall);
+  EXPECT_EQ(takeCudfPeakAllocatedBytes(), withSmall);
+
+  unregisterCudf();
+  EXPECT_EQ(takeCudfPeakAllocatedBytes(), -1);
+}
+
 TEST_F(GpuResourcesTest, allocatedBytesIncludesSeparateOutputResource) {
   auto& config = CudfConfig::getInstance();
   config.memoryResource = "async";

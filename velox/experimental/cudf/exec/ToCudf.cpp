@@ -37,12 +37,17 @@
 
 #include "folly/Conv.h"
 #include "velox/common/base/Exceptions.h"
+#include "velox/exec/Task.h"
 
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <rmm/mr/failure_callback_resource_adaptor.hpp>
 
 #include <cuda.h>
+
+#include <fstream>
+#include <sstream>
+#include <string>
 
 static const std::string kCudfAdapterName = "cuDF";
 
@@ -53,6 +58,52 @@ namespace {
 template <class... Deriveds, class Base>
 bool isAnyOf(const Base* p) {
   return ((dynamic_cast<const Deriveds*>(p) != nullptr) || ...);
+}
+
+// Returns the most resident memory this process had since the previous call (or
+// its start), and resets that high-water mark. -1 if it cannot be read.
+int64_t takeHostPeakResidentBytes() {
+  std::ifstream status("/proc/self/status");
+  std::string line;
+  int64_t kilobytes{-1};
+  while (std::getline(status, line)) {
+    // The line reads "VmHWM:<spaces><kilobytes> kB".
+    if (line.rfind("VmHWM:", 0) == 0) {
+      std::istringstream(line.substr(6)) >> kilobytes;
+      break;
+    }
+  }
+  // Writing 5 resets the high-water mark to the current resident size.
+  std::ofstream("/proc/self/clear_refs") << "5";
+  return kilobytes < 0 ? -1 : kilobytes * 1'024;
+}
+
+// Logs the device and host memory peaks of each busy period of the worker:
+// from the first task that starts while no task runs to the completion of the
+// last running one. With one query at a time, these are the query's peaks (one
+// line per stage section when sections do not overlap), without a restart.
+class MemoryPeakLogger : public exec::TaskListener {
+ public:
+  void onTaskCompletion(
+      const std::string& /*taskUuid*/,
+      const std::string& taskId,
+      exec::TaskState /*state*/,
+      std::exception_ptr /*error*/,
+      exec::TaskStats /*stats*/) override {
+    for (const auto& task : exec::Task::getRunningTasks()) {
+      if (task->isRunning()) {
+        return;
+      }
+    }
+    LOG(INFO) << "Memory peak while busy: device "
+              << takeCudfPeakAllocatedBytes() << " bytes, host resident "
+              << takeHostPeakResidentBytes() << " bytes, last task " << taskId;
+  }
+};
+
+std::shared_ptr<MemoryPeakLogger>& memoryPeakLogger() {
+  static std::shared_ptr<MemoryPeakLogger> logger;
+  return logger;
 }
 
 } // namespace
@@ -437,6 +488,11 @@ void registerCudf() {
   }
 #endif
 
+  memoryPeakLogger() = std::make_shared<MemoryPeakLogger>();
+  exec::registerTaskListener(memoryPeakLogger());
+  // Starts the first window at registration.
+  takeCudfPeakAllocatedBytes();
+
   isCudfRegistered = true;
 }
 
@@ -447,11 +503,16 @@ void unregisterCudf() {
   ucx_exchange::unregisterUcxTransports();
   ucx_exchange::unregisterExchangeStoreTables();
 #endif
+  if (memoryPeakLogger() != nullptr) {
+    exec::unregisterTaskListener(memoryPeakLogger());
+    memoryPeakLogger() = nullptr;
+  }
   // Reset the any_resource copies before the adaptors they were copied from,
   // so that the wrapped upstream resources are released here.
   output_mr_.reset();
   mr_.reset();
   outputStatsMr_.reset();
+  endCudfPeakWindow();
   statsMr_.reset();
   // Undo registerCudf()'s operator adapter registration.
   OperatorAdapterRegistry::getInstance().clear();

@@ -176,15 +176,57 @@ bool releaseDeviceMemory(std::size_t bytes) {
   return false;
 }
 
+namespace {
+
+// Guards the counter frame that takeCudfPeakAllocatedBytes() keeps on top of
+// statsMr_'s stack, and the bytes allocated when that frame was pushed. The
+// frame counts allocations net of frees since then, so the current and peak
+// bytes are its values plus the bytes at the push.
+std::mutex& peakWindowMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+bool peakWindowOpen{false};
+int64_t peakWindowStartBytes{0};
+
+} // namespace
+
 int64_t cudfAllocatedBytes() {
   if (!statsMr_.has_value()) {
     return -1;
   }
-  int64_t bytes = statsMr_->get_bytes_counter().value;
+  std::lock_guard lock(peakWindowMutex());
+  int64_t bytes = statsMr_->get_bytes_counter().value +
+      (peakWindowOpen ? peakWindowStartBytes : 0);
   if (outputStatsMr_.has_value()) {
     bytes += outputStatsMr_->get_bytes_counter().value;
   }
   return bytes;
+}
+
+int64_t takeCudfPeakAllocatedBytes() {
+  if (!statsMr_.has_value()) {
+    return -1;
+  }
+  std::lock_guard lock(peakWindowMutex());
+  int64_t peak{0};
+  if (peakWindowOpen) {
+    peak = peakWindowStartBytes + statsMr_->pop_counters().first.peak;
+  } else {
+    peak = statsMr_->get_bytes_counter().peak;
+  }
+  // After the pop, the bottom frame counts every allocation, including those
+  // made between the pop and this push.
+  peakWindowStartBytes = statsMr_->push_counters().first.value;
+  peakWindowOpen = true;
+  return peak;
+}
+
+void endCudfPeakWindow() {
+  std::lock_guard lock(peakWindowMutex());
+  peakWindowOpen = false;
+  peakWindowStartBytes = 0;
 }
 
 } // namespace facebook::velox::cudf_velox
