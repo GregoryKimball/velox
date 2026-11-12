@@ -59,6 +59,16 @@ DEFINE_uint64(
     min_chunk_raw_kb,
     0,
     "Raw size below which a stream is not chunked; 0 keeps the writer default");
+DEFINE_bool(
+    exact_bits,
+    false,
+    "Pack FixedBitWidth values at their exact bit width instead of rounding "
+    "the width up to whole bytes");
+DEFINE_string(
+    read_factors,
+    "",
+    "Candidate encodings and their read factors for encoding selection, as "
+    "<Encoding>=<factor>;...; empty keeps the writer default");
 DEFINE_uint64(read_batch_rows, 1 << 16, "Rows per Parquet read batch");
 DEFINE_int32(threads, 8, "Files converted in parallel");
 
@@ -121,10 +131,15 @@ uint64_t convertFile(const FileTask& task, memory::MemoryPool& rootPool) {
   writerOptions.compressionOptions.zstdCompressionLevel = FLAGS_zstd_level;
   // The default encoding selection policy carries its own compression
   // options, so it is rebuilt with these.
+  writerOptions.fixedBitWidthUseExactBits = FLAGS_exact_bits;
+  using facebook::nimble::ManualEncodingSelectionPolicyFactory;
   writerOptions.encodingSelectionPolicyCreator =
-      [factory = facebook::nimble::ManualEncodingSelectionPolicyFactory{
-           facebook::nimble::ManualEncodingSelectionPolicyFactory::
-               defaultEncodingReadFactors(),
+      [factory = ManualEncodingSelectionPolicyFactory{
+           FLAGS_read_factors.empty()
+               ? ManualEncodingSelectionPolicyFactory::
+                     defaultEncodingReadFactors()
+               : ManualEncodingSelectionPolicyFactory::parseEncodingReadFactors(
+                     FLAGS_read_factors),
            writerOptions.compressionOptions}](
           facebook::nimble::DataType dataType) {
         return factory.createPolicy(dataType);
