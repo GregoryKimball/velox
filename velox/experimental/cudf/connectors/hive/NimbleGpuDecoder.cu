@@ -324,15 +324,16 @@ constexpr int kFastRowsPerBlock = 4096;
 __device__ uint64_t readLeaf(const FastLeaf& leaf, uint64_t i) {
   switch (leaf.kind) {
     case FastLeaf::kTrivial:
+      // Uncompressed payloads sit at arbitrary offsets in the file bytes.
       switch (leaf.width) {
         case 1:
           return leaf.data[i];
         case 2:
-          return reinterpret_cast<const uint16_t*>(leaf.data)[i];
+          return loadUnaligned<uint16_t>(leaf.data + 2 * i);
         case 4:
-          return reinterpret_cast<const uint32_t*>(leaf.data)[i];
+          return loadUnaligned<uint32_t>(leaf.data + 4 * i);
         default:
-          return reinterpret_cast<const uint64_t*>(leaf.data)[i];
+          return loadUnaligned<uint64_t>(leaf.data + 8 * i);
       }
     case FastLeaf::kFixedBitWidth: {
       const uint64_t bit = i * leaf.bitWidth;
@@ -1139,14 +1140,31 @@ void decompressPayloads(
 
 } // namespace
 
-NimbleGpuDecoder::~NimbleGpuDecoder() {
-  if (pinned_ != nullptr) {
-    cudaFreeHost(pinned_);
+uint8_t* NimbleGpuDecoder::hostBuffer(size_t size) {
+  struct Pinned {
+    uint8_t* data{nullptr};
+    size_t size{0};
+    ~Pinned() {
+      if (data != nullptr) {
+        cudaFreeHost(data);
+      }
+    }
+  };
+  static thread_local Pinned pinned;
+  if (size > pinned.size) {
+    if (pinned.data != nullptr) {
+      checkCuda(cudaFreeHost(pinned.data));
+      pinned.data = nullptr;
+    }
+    pinned.size = std::max(size, 2 * pinned.size);
+    checkCuda(cudaMallocHost(&pinned.data, pinned.size));
   }
+  return pinned.data;
 }
 
 std::vector<std::unique_ptr<cudf::column>> NimbleGpuDecoder::decode(
     std::span<const NimbleStripeStreams> stripes,
+    std::span<const uint8_t> hostBytes,
     std::span<const cudf::data_type> types,
     bool compactRowCount,
     cuda::stream_ref stream,
@@ -1176,49 +1194,36 @@ std::vector<std::unique_ptr<cudf::column>> NimbleGpuDecoder::decode(
     }
   }
 
-  // Stage the stored payload bytes, each 16-byte aligned, and copy them over
-  // in one transfer. Decompressed payloads get their own aligned slots.
+  // The whole host buffer goes over in one transfer, and payloads are used in
+  // place. Decompressed payloads get their own aligned slots.
   auto& payloads = walk.payloads;
-  size_t stagingSize = 0;
   size_t outputSize = 0;
   std::vector<size_t> outputOffsets(payloads.size());
   for (size_t i = 0; i < payloads.size(); ++i) {
-    payloads[i].stagingOffset = stagingSize;
-    // The padding covers 8-byte loads past the end of bit-packed data.
-    stagingSize += alignUp(payloads[i].stored.size() + 8);
+    const auto* stored = payloads[i].stored.data();
+    NIMBLE_GPU_CHECK(
+        stored >= hostBytes.data() &&
+            stored + payloads[i].stored.size() <=
+                hostBytes.data() + hostBytes.size(),
+        "payload outside the host buffer");
+    payloads[i].stagingOffset = stored - hostBytes.data();
     if (payloads[i].codec != Codec::kUncompressed) {
       outputOffsets[i] = outputSize;
+      // The padding covers 8-byte loads past the end of bit-packed data.
       outputSize += alignUp(payloads[i].size + 8);
     }
   }
-  // The previous stripe's transfer from the pinned buffer has completed:
-  // decode() synchronizes before returning.
-  if (stagingSize > pinnedSize_) {
-    if (pinned_ != nullptr) {
-      checkCuda(cudaFreeHost(pinned_));
-      pinned_ = nullptr;
-    }
-    pinnedSize_ = std::max(stagingSize, 2 * pinnedSize_);
-    checkCuda(cudaMallocHost(&pinned_, pinnedSize_));
-  }
-  rmm::device_buffer staging(stagingSize, stream, mr);
+  // The padding covers 8-byte loads past the end of the last payload.
+  rmm::device_buffer staging(hostBytes.size() + 8, stream, mr);
   rmm::device_buffer output(outputSize, stream, mr);
-  {
+  if (!hostBytes.empty()) {
     nvtx3::scoped_range range{"NimbleGpuDecoder::stage"};
-    for (const auto& payload : payloads) {
-      std::memcpy(
-          pinned_ + payload.stagingOffset,
-          payload.stored.data(),
-          payload.stored.size());
-    }
-    if (stagingSize > 0) {
-      checkCuda(cudaMemcpyAsync(
-          staging.data(),
-          pinned_,
-          stagingSize,
-          cudaMemcpyHostToDevice,
-          stream.get()));
-    }
+    checkCuda(cudaMemcpyAsync(
+        staging.data(),
+        hostBytes.data(),
+        hostBytes.size(),
+        cudaMemcpyHostToDevice,
+        stream.get()));
   }
   auto* stagingData = static_cast<const uint8_t*>(staging.data());
   for (auto& payload : payloads) {

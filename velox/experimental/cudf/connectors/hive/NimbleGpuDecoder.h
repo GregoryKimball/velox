@@ -40,36 +40,32 @@ struct NimbleStripeStreams {
 ///
 /// Encoding headers are not compressed, so the host walks each stream's
 /// chunks and encoding trees directly from the file bytes. Only the leaf
-/// payloads go to the device: they are staged into one pinned buffer, copied
-/// in one transfer, decompressed in one batch per codec, and then decoded by
-/// CUDA kernels and cuDF primitives. Batching stripes gives the decompressor
-/// more frames to spread across the GPU.
+/// bytes go to the device, in one transfer from a pinned buffer; payloads are
+/// decompressed in one batch per codec, and then decoded by CUDA kernels and
+/// cuDF primitives. Batching stripes gives the decompressor more frames to
+/// spread across the GPU.
 ///
 /// Supported encodings: Trivial, FixedBitWidth, Constant, Varint, Dictionary,
 /// RLE, MainlyConstant, Nullable and SparseBool, with Zstd or LZ4 payloads.
 /// Anything else throws.
 class NimbleGpuDecoder {
  public:
-  NimbleGpuDecoder() = default;
-  ~NimbleGpuDecoder();
-
-  NimbleGpuDecoder(const NimbleGpuDecoder&) = delete;
-  NimbleGpuDecoder& operator=(const NimbleGpuDecoder&) = delete;
+  /// A pinned host buffer of at least `size` bytes for the stream bytes of a
+  /// batch. It belongs to the calling thread and is reused by its next call,
+  /// so it is valid until then.
+  static uint8_t* hostBuffer(size_t size);
 
   /// Decodes column i of every stripe as types[i] and concatenates the stripes
-  /// in order. An empty stream decodes to all nulls. `compactRowCount` is the
-  /// file's compactRowCountEncoding property.
+  /// in order. Every stream lies in `hostBytes`, a pinned buffer that is copied
+  /// to the device whole. An empty stream decodes to all nulls.
+  /// `compactRowCount` is the file's compactRowCountEncoding property.
   std::vector<std::unique_ptr<cudf::column>> decode(
       std::span<const NimbleStripeStreams> stripes,
+      std::span<const uint8_t> hostBytes,
       std::span<const cudf::data_type> types,
       bool compactRowCount,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr);
-
- private:
-  // Pinned staging buffer for the payloads, reused across stripes.
-  uint8_t* pinned_{nullptr};
-  size_t pinnedSize_{0};
 };
 
 } // namespace facebook::velox::cudf_velox::connector::hive

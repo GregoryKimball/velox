@@ -115,49 +115,58 @@ CudfNimbleSplitReader::readNextChunk() {
   // many compressed frames.
   constexpr size_t kBatchBytes = size_t{128} << 20;
   constexpr int64_t kBatchRows = int64_t{1} << 28;
-  std::vector<std::vector<uint8_t>> streamBytes;
+  struct Read {
+    uint64_t fileOffset;
+    uint64_t size;
+  };
+  std::vector<Read> reads;
   std::vector<NimbleStripeStreams> batch;
+  size_t batchBytes = 0;
+  int64_t batchRows = 0;
+  while (nextStripe_ < stripes_.size() && batchBytes < kBatchBytes) {
+    const auto stripe = stripes_[nextStripe_];
+    const auto numRows = static_cast<int64_t>(tablet_->stripeRowCount(stripe));
+    if (!batch.empty() && batchRows + numRows > kBatchRows) {
+      break;
+    }
+    ++nextStripe_;
+    const auto stripeId = tablet_->stripeIdentifier(stripe);
+    const auto stripeOffset = tablet_->stripeOffset(stripe);
+    batch.emplace_back().numRows = static_cast<cudf::size_type>(numRows);
+    for (size_t i = 0; i < streamIds_.size(); ++i) {
+      const auto location = tablet_->streamLocation(stripeId, streamIds_[i]);
+      reads.push_back({stripeOffset + location.offset, location.size});
+      batchBytes += location.size;
+    }
+    batchRows += numRows;
+  }
+
+  // The streams are read straight into the pinned buffer that goes to the
+  // device.
+  auto* host = NimbleGpuDecoder::hostBuffer(batchBytes);
   {
     nvtx3::scoped_range range{"CudfNimbleSplitReader::read"};
-    size_t batchBytes = 0;
-    int64_t batchRows = 0;
-    while (nextStripe_ < stripes_.size() && batchBytes < kBatchBytes) {
-      const auto stripe = stripes_[nextStripe_];
-      const auto numRows = static_cast<int64_t>(tablet_->stripeRowCount(stripe));
-      if (!batch.empty() && batchRows + numRows > kBatchRows) {
-        break;
-      }
-      ++nextStripe_;
-      const auto stripeId = tablet_->stripeIdentifier(stripe);
-      const auto stripeOffset = tablet_->stripeOffset(stripe);
-      auto& entry = batch.emplace_back();
-      entry.numRows = static_cast<cudf::size_type>(numRows);
+    size_t offset = 0;
+    size_t next = 0;
+    for (auto& entry : batch) {
       for (size_t i = 0; i < streamIds_.size(); ++i) {
-        const auto location = tablet_->streamLocation(stripeId, streamIds_[i]);
-        auto& bytes = streamBytes.emplace_back(location.size);
-        if (location.size > 0) {
-          readFile_->pread(
-              stripeOffset + location.offset, location.size, bytes.data());
+        const auto& read = reads[next++];
+        if (read.size > 0) {
+          readFile_->pread(read.fileOffset, read.size, host + offset);
           if (ioStatistics_) {
-            ioStatistics_->incRawBytesRead(location.size);
+            ioStatistics_->incRawBytesRead(read.size);
           }
         }
-        batchBytes += location.size;
+        entry.streams.emplace_back(host + offset, read.size);
+        offset += read.size;
       }
-      batchRows += numRows;
-    }
-  }
-  // streamBytes is complete, so the spans into it are stable.
-  size_t next = 0;
-  for (auto& entry : batch) {
-    for (size_t i = 0; i < streamIds_.size(); ++i) {
-      entry.streams.emplace_back(streamBytes[next++]);
     }
   }
 
   const auto* filter = subfieldFilterAst();
   auto columns = decoder_.decode(
       batch,
+      std::span<const uint8_t>{host, batchBytes},
       cudfTypes_,
       compactRowCount_,
       stream_,
