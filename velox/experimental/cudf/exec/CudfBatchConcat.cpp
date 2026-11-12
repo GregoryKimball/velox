@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfBatchConcat.h"
+#include "velox/experimental/cudf/exec/GpuCapabilities.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 
@@ -56,6 +57,11 @@ std::optional<uint64_t> getTargetBytes(const RowTypePtr& outputType) {
   return targetBytes;
 }
 
+// A buffer flushes at this fraction of the device memory available to the
+// process. Concatenation holds the inputs and the output at once, in every
+// driver of every concatenating pipeline.
+constexpr int64_t kAvailableMemoryShare = 64;
+
 size_t getTargetRows() {
   const auto targetRows = CudfConfig::getInstance().batchSizeMinThreshold;
   VELOX_CHECK_GT(
@@ -80,17 +86,28 @@ CudfBatchConcat::CudfBatchConcat(
           std::nullopt,
           planNode),
       targetBytes_(getTargetBytes(outputType_)),
-      targetRows_(getTargetRows()) {}
+      targetRows_(getTargetRows()),
+      availableMemoryShareBytes_(
+          outputType_->size() == 0
+              ? 0
+              : std::max<int64_t>(
+                    gpuCapabilities().availableMemoryBytes /
+                        kAvailableMemoryShare,
+                    0)) {}
 
 bool CudfBatchConcat::meetsTarget(size_t numRows, uint64_t numBytes) const {
   if (targetBytes_.has_value()) {
     return numBytes >= targetBytes_.value();
   }
-  return numRows >= targetRows_;
+  return numRows >= targetRows_ ||
+      (availableMemoryShareBytes_ > 0 &&
+       numBytes >= availableMemoryShareBytes_);
 }
 
 uint64_t CudfBatchConcat::estimateBytes(const CudfVector& vector) const {
-  return targetBytes_.has_value() ? vector.estimateFlatSize() : 0;
+  return targetBytes_.has_value() || availableMemoryShareBytes_ > 0
+      ? vector.estimateFlatSize()
+      : 0;
 }
 
 void CudfBatchConcat::doAddInput(RowVectorPtr input) {

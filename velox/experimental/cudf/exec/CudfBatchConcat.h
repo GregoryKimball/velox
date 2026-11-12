@@ -52,15 +52,16 @@ class CudfBatchConcat : public CudfOperatorBase {
 
  private:
   // Returns true if 'numRows' rows occupying 'numBytes' estimated GPU bytes
-  // meet the flush target: the byte target when set, the row target otherwise.
+  // meet the flush target: the byte target when set, otherwise the row target
+  // or the share of available device memory, whichever comes first.
   bool meetsTarget(size_t numRows, uint64_t numBytes) const;
 
   bool targetReached() const {
     return meetsTarget(currentNumRows_, currentBytes_);
   }
 
-  // Returns the estimated GPU bytes of 'vector', or 0 when no byte target is
-  // set.
+  // Returns the estimated GPU bytes of 'vector', or 0 when no byte limit
+  // applies.
   uint64_t estimateBytes(const CudfVector& vector) const;
 
   // Input vectors awaiting concatenation.
@@ -72,7 +73,8 @@ class CudfBatchConcat : public CudfOperatorBase {
   // Rows held in buffer_.
   size_t currentNumRows_{0};
 
-  // Estimated GPU bytes held in buffer_. Tracked only when targetBytes_ is set.
+  // Estimated GPU bytes held in buffer_. Tracked when targetBytes_ or
+  // availableMemoryShareBytes_ is set.
   uint64_t currentBytes_{0};
 
   // Byte target from batchSizeMinBytes. Unset for a zero-column output.
@@ -80,6 +82,12 @@ class CudfBatchConcat : public CudfOperatorBase {
 
   // Row target from batchSizeMinThreshold, used when targetBytes_ is unset.
   const size_t targetRows_;
+
+  // With a row target, also flush once the buffer holds this many estimated
+  // bytes: a fixed fraction of the device memory the process can use, so that
+  // the row target, sized for ample memory, does not set a memory floor on a
+  // smaller device. Zero when that memory is unknown.
+  const uint64_t availableMemoryShareBytes_;
 };
 
 } // namespace facebook::velox::cudf_velox
