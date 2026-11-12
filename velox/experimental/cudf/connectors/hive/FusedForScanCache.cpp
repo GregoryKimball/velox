@@ -32,6 +32,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
+#include <limits>
 #include <mutex>
 
 namespace facebook::velox::cudf_velox::connector::hive {
@@ -57,6 +59,16 @@ bool deviceTierFits(std::size_t tierBytes) {
   const auto allocated = std::max<int64_t>(cudfAllocatedBytes(), 0);
   return tier <= available / 2 && allocated + tier <= available / 4 * 3;
 }
+
+// A slice of a cached file decodes to about this many bytes per row, the
+// width of a typical scan's columns; slices take 1/kSliceShare of the device
+// memory available to the process. Concatenation downstream keeps batches
+// within the same share (CudfBatchConcat).
+constexpr int64_t kNominalRowBytes = 32;
+constexpr int64_t kSliceShare = 64;
+constexpr cudf::size_type kMinSliceRows = 1 << 20;
+
+std::atomic<cudf::size_type> testingSliceRows{0};
 
 std::size_t alignUp(std::size_t bytes) {
   return (bytes + kAlignment - 1) / kAlignment * kAlignment;
@@ -123,7 +135,7 @@ bool FusedForScanCache::containsAll(
   return true;
 }
 
-std::size_t FusedForScanCache::decodedBytes(
+std::size_t FusedForScanCache::decodedSliceBytes(
     std::string_view file,
     const std::vector<std::string>& columns) const {
   std::shared_lock lock(mutex_);
@@ -132,12 +144,43 @@ std::size_t FusedForScanCache::decodedBytes(
     const auto it = entries_.find(key(file, name));
     VELOX_CHECK(it != entries_.end(), "Column is not cached: {}", name);
     const auto& entry = it->second;
-    bytes += entry.values.logicalDataSize;
-    if (entry.keys.has_value()) {
-      bytes += entry.values.logicalDataSize + entry.keys->logicalDataSize;
+    std::size_t values = 0;
+    for (const auto& slice : entry.values) {
+      values = std::max(values, slice.logicalDataSize);
     }
+    bytes += entry.keys.has_value()
+        ? 2 * values + entry.keys->logicalDataSize
+        : values;
   }
   return bytes;
+}
+
+void FusedForScanCache::testingSetSliceRows(cudf::size_type rows) {
+  testingSliceRows.store(rows, std::memory_order_relaxed);
+}
+
+cudf::size_type FusedForScanCache::sliceRows() {
+  if (const auto rows = testingSliceRows.load(std::memory_order_relaxed);
+      rows > 0) {
+    return rows;
+  }
+  const auto available = gpuCapabilities().availableMemoryBytes;
+  if (available <= 0) {
+    return std::numeric_limits<cudf::size_type>::max();
+  }
+  return static_cast<cudf::size_type>(std::clamp<int64_t>(
+      available / kSliceShare / kNominalRowBytes,
+      kMinSliceRows,
+      std::numeric_limits<cudf::size_type>::max()));
+}
+
+std::size_t FusedForScanCache::numSlices(
+    std::string_view file,
+    std::string_view name) const {
+  std::shared_lock lock(mutex_);
+  const auto it = entries_.find(key(file, name));
+  VELOX_CHECK(it != entries_.end(), "Column is not cached: {}", name);
+  return it->second.values.size();
 }
 
 bool FusedForScanCache::mayCache(
@@ -175,7 +218,16 @@ bool FusedForScanCache::insert(
     return false;
   }
 
-  auto encodedColumn = encodeForFusedFor(column, {}, stream, tempMr);
+  // Rows at which slices start, when the column takes more than one.
+  std::vector<cudf::size_type> sliceStarts;
+  const auto rowsPerSlice = sliceRows();
+  if (column.size() > rowsPerSlice) {
+    for (cudf::size_type start = 0; start < column.size();
+         start += std::min(rowsPerSlice, column.size() - start)) {
+      sliceStarts.push_back(start);
+    }
+  }
+  auto encodedColumn = encodeForFusedFor(column, sliceStarts, stream, tempMr);
   if (!encodedColumn.packedValues.has_value()) {
     // A string column with many distinct values: fused FOR would not compress
     // it.
@@ -183,15 +235,34 @@ bool FusedForScanCache::insert(
     uncacheable_.insert(std::move(entryKey));
     return false;
   }
-  auto& values = *encodedColumn.packedValues;
+  // The encoding is chosen on the whole column; with several slices, the
+  // encoded values are packed again, one payload per slice.
+  std::vector<cudf::detail::fused_for_packed_columns> values;
+  if (sliceStarts.size() > 1) {
+    const auto source = encodedColumn.encoded != nullptr
+        ? encodedColumn.encoded->view()
+        : withoutEmptyNullMask(column);
+    cudf::detail::fused_for_options options;
+    options.layout = cudf::detail::fused_for_layout::bitpacked;
+    values = cudf::detail::contiguous_split_fused_for(
+        cudf::table_view{{source}},
+        std::vector<cudf::size_type>(sliceStarts.begin() + 1, sliceStarts.end()),
+        stream,
+        tempMr,
+        options);
+  } else {
+    values.push_back(std::move(*encodedColumn.packedValues));
+  }
   auto& keys = encodedColumn.packedKeys;
   const bool deltas = encodedColumn.encoding == FusedForEncoding::kDeltas;
   const auto payloadBytes =
       [](const cudf::detail::fused_for_packed_columns& packed) {
         return packed.wire_data->size() + packed.metadata->size();
       };
-  const auto bytes =
-      payloadBytes(values) + (keys.has_value() ? payloadBytes(*keys) : 0);
+  auto bytes = keys.has_value() ? payloadBytes(*keys) : 0;
+  for (const auto& slice : values) {
+    bytes += payloadBytes(slice);
+  }
 
   std::unique_lock lock(mutex_);
   if (entries_.contains(entryKey)) {
@@ -203,11 +274,17 @@ bool FusedForScanCache::insert(
     return false;
   }
   Entry entry;
-  entry.values = store(std::move(values), stream);
+  entry.values.reserve(values.size());
+  for (auto& slice : values) {
+    entry.values.push_back(store(std::move(slice), stream));
+  }
   if (keys.has_value()) {
     entry.keys = store(std::move(*keys), stream);
   }
   entry.deltas = deltas;
+  if (deltas && sliceStarts.size() > 1) {
+    entry.sliceBases = std::move(encodedColumn.segmentBases);
+  }
   stream.sync();
   entries_.emplace(std::move(entryKey), std::move(entry));
   usedBytes_.fetch_add(bytes, std::memory_order_relaxed);
@@ -283,6 +360,7 @@ FusedForScanCache::decodePayload(
 FusedForScanCache::DecodedColumn FusedForScanCache::decode(
     std::string_view file,
     std::string_view name,
+    std::size_t slice,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr,
     rmm::device_async_resource_ref tempMr) const {
@@ -298,13 +376,15 @@ FusedForScanCache::DecodedColumn FusedForScanCache::decode(
     entry = &it->second;
   }
 
-  auto [values, valuesView] = decodePayload(entry->values, stream, tempMr);
+  VELOX_CHECK_LT(slice, entry->values.size(), "No such slice of {}", name);
+  auto [values, valuesView] =
+      decodePayload(entry->values[slice], stream, tempMr);
   if (entry->deltas) {
     auto column = decodeFusedForEncoding(
         FusedForEncoding::kDeltas,
         valuesView,
         std::nullopt,
-        0,
+        entry->sliceBases.empty() ? 0 : entry->sliceBases[slice],
         stream,
         mr,
         tempMr);
@@ -369,7 +449,9 @@ bool FusedForScanCache::releaseDeviceBlocks(std::size_t bytes) {
       }
     };
     for (auto& [name, entry] : entries_) {
-      dropIfInBlock(entry.values);
+      for (auto& slice : entry.values) {
+        dropIfInBlock(slice);
+      }
       if (entry.keys.has_value()) {
         dropIfInBlock(*entry.keys);
       }

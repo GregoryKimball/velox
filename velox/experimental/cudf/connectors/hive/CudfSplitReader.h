@@ -259,9 +259,10 @@ class CudfSplitReader : public NvtxHelper {
   // Reads every read column of the file without filter and caches it.
   void fillFusedForCache();
 
-  // Reads the selected row groups of the split from the fused FOR scan cache,
-  // filling it first if needed, and applies the pushdown filter. Returns
-  // nullopt when the cache is full, and the split is then read from Parquet.
+  // Reads the selected row groups of the next slice of the split from the
+  // fused FOR scan cache, filling it first if needed, and applies the pushdown
+  // filter. Returns nullopt when the cache is full, and the split is then read
+  // from Parquet.
   std::optional<TableChunk> readFromFusedForCache(
       rmm::device_async_resource_ref mr);
 
@@ -300,8 +301,14 @@ class CudfSplitReader : public NvtxHelper {
   // Rows of each row group of the file, in file order.
   std::vector<std::size_t> rowGroupNumRows_;
 
-  // The split read from the fused FOR scan cache while it was prepared.
+  // The first slice of the split, read from the fused FOR scan cache while it
+  // was prepared.
   std::optional<TableChunk> fusedForCacheChunk_;
+
+  // The next slice of the split to read from the fused FOR scan cache, and
+  // the file row it starts at.
+  std::size_t fusedForCacheSlice_{0};
+  cudf::size_type fusedForCacheSliceRow_{0};
 
   struct TotalScanTimeCallbackData {
     uint64_t startTimeUs;

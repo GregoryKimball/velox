@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSource.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveTableHandle.h"
+#include "velox/experimental/cudf/connectors/hive/FusedForScanCache.h"
 #include "velox/experimental/cudf/expression/SubfieldFiltersToAst.h"
 #include "velox/experimental/cudf/tests/utils/CudfHiveConnectorTestBase.h"
 
@@ -51,6 +52,7 @@
 #include <cudf/io/parquet.hpp>
 
 #include <fmt/ranges.h>
+#include <folly/ScopeGuard.h>
 #include <folly/synchronization/Baton.h>
 #include <folly/synchronization/Latch.h>
 
@@ -726,6 +728,75 @@ TEST_F(TableScanTest, directBufferInputRawInputBytes) {
   assertStorageReadStats(runtimeStats, filePath->fileSize());
   ASSERT_GT(runtimeStats.at("totalScanTime").sum, 0);
   ASSERT_GT(runtimeStats.at("ioWaitWallNanos").sum, 0);
+}
+
+TEST_F(TableScanTest, fusedForScanCacheReadsSlices) {
+  // A file of three slices: differences restart in each slice, dictionary
+  // keys are shared by all of them.
+  constexpr vector_size_t kNumRows = 2'000;
+  constexpr cudf::size_type kSliceRows = 700;
+  auto vectors = {makeRowVector(
+      {"c0", "c1", "c2", "c3"},
+      {
+          makeFlatVector<int64_t>(
+              kNumRows, [](auto row) { return 1'000'000'000'000 + row * 3; }),
+          makeFlatVector<int64_t>(
+              kNumRows,
+              [](auto row) { return (row % 7) * 1'000'000'000'000; }),
+          makeFlatVector<std::string>(
+              kNumRows,
+              [](auto row) { return fmt::format("mode {}", row % 5); }),
+          makeFlatVector<double>(kNumRows, [](auto row) { return row * 0.5; }),
+      })};
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), *vectors.begin());
+  createDuckDbTable({*vectors.begin()});
+
+  resetCudfHiveConnector(std::make_shared<config::ConfigBase>(
+      std::unordered_map<std::string, std::string>{
+          {cudf_velox::connector::hive::CudfHiveConfig::kFusedForScanCacheBytes,
+           "1073741824"},
+      }));
+  cudf_velox::connector::hive::FusedForScanCache::testingSetSliceRows(
+      kSliceRows);
+  SCOPE_EXIT {
+    cudf_velox::connector::hive::FusedForScanCache::testingSetSliceRows(0);
+  };
+
+  const auto rowType = asRowType((*vectors.begin())->type());
+  auto scan = [&](common::SubfieldFilters filters, const std::string& sql) {
+    auto plan =
+        PlanBuilder(pool_.get())
+            .startTableScan()
+            .outputType(rowType)
+            .tableHandle(makeTableHandle(
+                "parquet_table", rowType, std::move(filters), nullptr))
+            .assignments(HiveConnectorTestBase::allRegularColumns(rowType))
+            .endTableScan()
+            .planNode();
+    auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+                    .splits(makeCudfHiveConnectorSplits({filePath}))
+                    .assertResults(sql);
+    return getTableScanRuntimeStats(task);
+  };
+  // The first scan reads Parquet and fills the cache.
+  auto stats = scan({}, "SELECT * FROM tmp");
+  ASSERT_EQ(stats.at("cudfFusedForCacheFills").sum, 1);
+  // Later scans decode one slice per chunk.
+  stats = scan({}, "SELECT * FROM tmp");
+  EXPECT_EQ(stats.count("cudfFusedForCacheFills"), 0);
+  EXPECT_EQ(stats.at("cudfFusedForCacheReads").sum, 3);
+  stats = scan(
+      common::test::SubfieldFiltersBuilder()
+          .add(
+              "c0",
+              std::make_unique<common::BigintRange>(
+                  1'000'000'001'500,
+                  std::numeric_limits<int64_t>::max(),
+                  false))
+          .build(),
+      "SELECT * FROM tmp WHERE c0 >= 1000000001500");
+  EXPECT_EQ(stats.at("cudfFusedForCacheReads").sum, 3);
 }
 
 TEST_F(TableScanTest, columnAliases) {

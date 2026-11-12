@@ -87,13 +87,26 @@ class FusedForScanCache {
       cuda::stream_ref stream,
       rmm::device_async_resource_ref tempMr);
 
-  /// Returns about how many device bytes decoding 'columns' of 'file' takes:
-  /// each column's decoded size, which for a dictionary-encoded column counts
-  /// its 4-byte indices twice for the gathered values. The columns must be
-  /// cached.
-  std::size_t decodedBytes(
+  /// Returns about how many device bytes decoding one slice of 'columns' of
+  /// 'file' takes: each column's decoded size over its slices, which for a
+  /// dictionary-encoded column counts its 4-byte indices twice for the
+  /// gathered values. The columns must be cached.
+  std::size_t decodedSliceBytes(
       std::string_view file,
       const std::vector<std::string>& columns) const;
+
+  /// Returns the rows per slice of a cached column: a column is cached and
+  /// decoded in slices of this many rows (the last may be shorter), so that
+  /// decoding a file takes device memory in proportion to the memory the
+  /// process can use.
+  static cudf::size_type sliceRows();
+
+  /// Makes sliceRows() return 'rows' instead, for tests; zero undoes it.
+  static void testingSetSliceRows(cudf::size_type rows);
+
+  /// Returns the number of slices of the cached column 'name' of 'file'. The
+  /// column must be cached.
+  std::size_t numSlices(std::string_view file, std::string_view name) const;
 
   /// A cached column decoded on the device. 'view' points into memory the
   /// object owns: the decoded packed allocation, or 'column'.
@@ -103,13 +116,14 @@ class FusedForScanCache {
     cudf::column_view view;
   };
 
-  /// Copies the cached column 'name' of 'file' to the device and decodes it
-  /// into memory from 'tempMr', except that a dictionary-encoded column is
-  /// gathered, and a difference-encoded column summed, into a column from
-  /// 'mr'. The column must be cached.
+  /// Copies slice 'slice' of the cached column 'name' of 'file' to the device
+  /// and decodes it into memory from 'tempMr', except that a dictionary-encoded
+  /// column is gathered, and a difference-encoded column summed, into a column
+  /// from 'mr'. The column must be cached.
   DecodedColumn decode(
       std::string_view file,
       std::string_view name,
+      std::size_t slice,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr,
       rmm::device_async_resource_ref tempMr) const;
@@ -128,11 +142,14 @@ class FusedForScanCache {
   };
 
   // A column, the indices of a dictionary-encoded column and its keys, or the
-  // differences between consecutive values of a column ('deltas').
+  // differences between consecutive values of a column ('deltas'), in slices
+  // of sliceRows() rows packed one per payload. The keys are packed whole.
   struct Entry {
-    Payload values;
+    std::vector<Payload> values;
     std::optional<Payload> keys;
     bool deltas{false};
+    // For differences in several slices, the value each slice starts from.
+    std::vector<int64_t> sliceBases;
   };
 
   static std::string key(std::string_view file, std::string_view name);

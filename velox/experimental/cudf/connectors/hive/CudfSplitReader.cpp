@@ -571,7 +571,7 @@ void CudfSplitReader::setupFirstPassChunking() {
     if (fusedForCacheRead_ and not fusedForCacheChunk_.has_value()) {
       const auto available = gpuCapabilities().availableMemoryBytes;
       const auto decodedBytes = static_cast<int64_t>(
-          FusedForScanCache::instance().decodedBytes(
+          FusedForScanCache::instance().decodedSliceBytes(
               split_->filePath, readColumnNames_));
       if (available <= 0 or
           std::max<int64_t>(cudfAllocatedBytes(), 0) + decodedBytes <=
@@ -645,11 +645,18 @@ CudfSplitReader::readFromFusedForCache(rmm::device_async_resource_ref mr) {
     if (not cache.containsAll(split_->filePath, readColumnNames_)) {
       return std::nullopt;
     }
+    // The next slices are read from what this fill cached.
+    fusedForCacheHit_ = true;
   }
   nvtxRangePush("readFromFusedForCache");
   const auto tempMr = get_temp_mr();
+  // The cached columns hold the whole file in slices; each call reads the
+  // next slice.
+  const auto numSlices =
+      cache.numSlices(split_->filePath, readColumnNames_.front());
+  const auto slice = fusedForCacheSlice_;
 
-  // The cached columns hold the whole file; keep the selected row groups.
+  // Keep the selected row groups.
   std::vector<cudf::size_type> bounds;
   std::vector<bool> selected(rowGroupNumRows_.size(), false);
   std::size_t numSelected = 0;
@@ -690,9 +697,35 @@ CudfSplitReader::readFromFusedForCache(rmm::device_async_resource_ref mr) {
   views.reserve(readColumnNames_.size());
   for (const auto& name : readColumnNames_) {
     decoded.push_back(cache.decode(
-        split_->filePath, name, stream_, selectsRows ? tempMr : mr, tempMr));
+        split_->filePath,
+        name,
+        slice,
+        stream_,
+        selectsRows ? tempMr : mr,
+        tempMr));
     views.push_back(decoded.back().view);
   }
+  // The file rows of this slice, and the selected row ranges within it.
+  const auto sliceBegin = fusedForCacheSliceRow_;
+  const auto sliceEnd = sliceBegin + views.front().size();
+  if (numSlices > 1 and not bounds.empty()) {
+    std::vector<cudf::size_type> sliceBounds;
+    for (size_t i = 0; i < bounds.size(); i += 2) {
+      const auto begin = std::max(bounds[i], sliceBegin);
+      const auto end = std::min(bounds[i + 1], sliceEnd);
+      if (begin < end) {
+        sliceBounds.push_back(begin - sliceBegin);
+        sliceBounds.push_back(end - sliceBegin);
+      }
+    }
+    if (sliceBounds.empty()) {
+      // No selected row in this slice: an empty range keeps the columns.
+      sliceBounds = {0, 0};
+    }
+    bounds = std::move(sliceBounds);
+  }
+  fusedForCacheSlice_ = slice + 1;
+  fusedForCacheSliceRow_ = sliceEnd;
   std::unique_ptr<cudf::table> table;
   if (not selectsRows) {
     std::vector<std::unique_ptr<cudf::column>> columns;
@@ -722,9 +755,11 @@ CudfSplitReader::readFromFusedForCache(rmm::device_async_resource_ref mr) {
   }
   decoded.clear();
 
-  // Nothing else of the split is read.
-  releaseCurrentPassData();
-  passState_->currentPass = passState_->passes.size();
+  // After the last slice, nothing else of the split is read.
+  if (fusedForCacheSlice_ == numSlices) {
+    releaseCurrentPassData();
+    passState_->currentPass = passState_->passes.size();
+  }
   if (ioStats_) {
     ioStats_->addCounter("cudfFusedForCacheReads", RuntimeCounter(1));
   }
@@ -760,6 +795,8 @@ void CudfSplitReader::resetSplit() {
   fusedForCacheRead_ = false;
   fusedForCacheHit_ = false;
   fusedForCacheChunk_.reset();
+  fusedForCacheSlice_ = 0;
+  fusedForCacheSliceRow_ = 0;
   rowGroupNumRows_.clear();
 }
 
