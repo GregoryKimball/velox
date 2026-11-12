@@ -89,6 +89,11 @@ void FusedForScanCache::reserveCapacity(uint64_t bytes) {
 }
 
 void FusedForScanCache::reserveDeviceCapacity(uint64_t bytes) {
+  // A tier shrunk for a failed allocation stays at its smaller size: raising
+  // it again would only take the memory back from the operators.
+  if (deviceTierShrunk_.load(std::memory_order_relaxed)) {
+    return;
+  }
   auto current = deviceCapacity_.load(std::memory_order_relaxed);
   while (current < bytes &&
          !deviceCapacity_.compare_exchange_weak(
@@ -332,6 +337,7 @@ void* FusedForScanCache::allocateDevice(std::size_t bytes) {
       // Out of device memory: keep the rest of the cache in host memory.
       (void)cudaGetLastError();
       deviceCapacity_.store(deviceAllocatedBytes_, std::memory_order_relaxed);
+      deviceTierShrunk_.store(true, std::memory_order_relaxed);
       return nullptr;
     }
     if (!releaserRegistered_) {
@@ -385,6 +391,7 @@ bool FusedForScanCache::releaseDeviceBlocks(std::size_t bytes) {
     deviceCursor_ = nullptr;
     deviceRemaining_ = 0;
     deviceCapacity_.store(deviceAllocatedBytes_, std::memory_order_relaxed);
+    deviceTierShrunk_.store(true, std::memory_order_relaxed);
   }
   return freed > 0;
 }

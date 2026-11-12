@@ -178,6 +178,10 @@ class FusedForScanCache {
   std::size_t deviceRemaining_{0};
   std::size_t deviceAllocatedBytes_{0};
   std::atomic<uint64_t> deviceCapacity_{0};
+  // Set once the device tier was capped for lack of device memory (a failed
+  // block allocation or releaseDeviceBlocks()); reserveDeviceCapacity() then
+  // leaves the capacity alone.
+  std::atomic<bool> deviceTierShrunk_{false};
   std::atomic<uint64_t> usedBytes_{0};
   std::atomic<bool> full_{false};
 };
