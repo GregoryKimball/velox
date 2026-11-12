@@ -32,6 +32,7 @@
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 
+#include <cub/block/block_scan.cuh>
 #include <cub/device/device_scan.cuh>
 #include <cuda/buffer>
 #include <cuda_runtime.h>
@@ -63,6 +64,9 @@ enum class EncodingType : uint8_t {
   kVarint = 7,
   kConstant = 9,
   kMainlyConstant = 10,
+  kAlp = 12,
+  kFsst = 19,
+  kDeltaBlock = 21,
 };
 
 enum class DataType : uint8_t {
@@ -157,6 +161,19 @@ struct ByteReader {
     for (int shift = 0; shift < 35; shift += 7) {
       const uint8_t byte = u8();
       value |= static_cast<uint32_t>(byte & 0x7f) << shift;
+      if ((byte & 0x80) == 0) {
+        return value;
+      }
+    }
+    NIMBLE_GPU_CHECK(false, "varint too long");
+    return 0;
+  }
+
+  uint64_t varint64() {
+    uint64_t value = 0;
+    for (int shift = 0; shift < 70; shift += 7) {
+      const uint8_t byte = u8();
+      value |= static_cast<uint64_t>(byte & 0x7f) << shift;
       if ((byte & 0x80) == 0) {
         return value;
       }
@@ -298,6 +315,208 @@ __global__ void varintDecodeKernel(
       value |= static_cast<uint64_t>(bytes[j] & 0x7f) << shift;
     }
     out[index[i]] = static_cast<U>(static_cast<U>(value) + baseline);
+  }
+}
+
+// Powers of ten ALP scales by (kPow10Double in ALPEncoding.h).
+constexpr double kAlpPow10[24] = {
+    1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,  1e10, 1e11,
+    1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22, 1e23};
+
+// value = zigzag^-1(encoded) * 10^factor / 10^exponent, rounded as the CPU
+// decoder rounds, then the exceptions are patched in.
+template <typename F>
+__global__ void alpKernel(
+    const uint64_t* encoded,
+    double factor,
+    double exponent,
+    F* out,
+    int64_t numValues) {
+  for (int64_t i = blockIdx.x * int64_t{blockDim.x} + threadIdx.x;
+       i < numValues;
+       i += int64_t{gridDim.x} * blockDim.x) {
+    const uint64_t zigzag = encoded[i];
+    const auto value =
+        static_cast<int64_t>(zigzag >> 1) ^ -static_cast<int64_t>(zigzag & 1);
+    out[i] = static_cast<F>(
+        __ddiv_rn(__dmul_rn(static_cast<double>(value), factor), exponent));
+  }
+}
+
+template <typename F>
+__global__ void scatterKernel(
+    const int32_t* positions,
+    const F* values,
+    F* out,
+    int64_t numValues) {
+  for (int64_t i = blockIdx.x * int64_t{blockDim.x} + threadIdx.x;
+       i < numValues;
+       i += int64_t{gridDim.x} * blockDim.x) {
+    out[positions[i]] = values[i];
+  }
+}
+
+// One block of a DeltaBlock encoding: its first value, in order-preserving
+// form, and the bit-packed deltas from each row to the next.
+struct DeltaBlock {
+  uint64_t base;
+  uint32_t offset;
+  uint8_t bitWidth;
+};
+
+// Decodes block b of a DeltaBlock encoding in thread block b. `signBit` undoes
+// the order-preserving form of signed types.
+template <typename U>
+__global__ void deltaBlockKernel(
+    const uint8_t* packed,
+    const DeltaBlock* blocks,
+    uint32_t blockSize,
+    uint64_t signBit,
+    U* out,
+    uint32_t numRows) {
+  using Scan = cub::BlockScan<uint64_t, kBlockSize>;
+  __shared__ typename Scan::TempStorage temp;
+  const DeltaBlock block = blocks[blockIdx.x];
+  const uint32_t start = blockIdx.x * blockSize;
+  const uint32_t end = min(start + blockSize, numRows);
+  const uint8_t* data = packed + block.offset;
+  const uint64_t mask = block.bitWidth == 64
+      ? ~uint64_t{0}
+      : (uint64_t{1} << block.bitWidth) - 1;
+  uint64_t carry = block.base;
+  for (uint32_t first = start; first < end; first += kBlockSize) {
+    const uint32_t row = first + threadIdx.x;
+    uint64_t delta = 0;
+    if (row > start && row < end && block.bitWidth > 0) {
+      const uint64_t bit = static_cast<uint64_t>(row - start - 1) * block.bitWidth;
+      const uint8_t* p = data + (bit >> 3);
+      const int shift = bit & 7;
+      uint64_t word = loadUnaligned<uint64_t>(p) >> shift;
+      if (shift + block.bitWidth > 64) {
+        word |= static_cast<uint64_t>(p[8]) << (64 - shift);
+      }
+      delta = word & mask;
+    }
+    uint64_t sum;
+    uint64_t total;
+    Scan(temp).InclusiveSum(delta, sum, total);
+    if (row < end) {
+      out[row] = static_cast<U>((carry + sum) ^ signBit);
+    }
+    carry += total;
+    __syncthreads();
+  }
+}
+
+// An FSST symbol table, laid out as fsst_import (velox/external/fsst) builds
+// it: code c expands to the low len[c] bytes of symbol[c], and the escape code
+// stands for the literal byte that follows it.
+struct FsstTable {
+  uint64_t symbol[255];
+  uint8_t len[255];
+};
+
+constexpr uint8_t kFsstEscape = 255;
+
+// Parses the serialized table: an 8-byte version, a zero-terminated flag, the
+// count of symbols of each length (1-byte symbols counted last) and then the
+// symbol bytes.
+FsstTable fsstTable(std::span<const uint8_t> bytes) {
+  ByteReader reader{bytes};
+  reader.take(8);
+  const bool zeroTerminated = reader.u8() & 1;
+  uint8_t counts[8];
+  for (auto& count : counts) {
+    count = reader.u8();
+  }
+  FsstTable table{};
+  table.len[0] = 1;
+  uint32_t code = zeroTerminated ? 1 : 0;
+  if (zeroTerminated) {
+    NIMBLE_GPU_CHECK(counts[0] > 0, "FSST table has no terminator symbol");
+    --counts[0];
+  }
+  for (uint32_t l = 1; l <= 8; ++l) {
+    const uint32_t length = (l & 7) + 1;
+    for (uint32_t i = 0; i < counts[l & 7]; ++i, ++code) {
+      NIMBLE_GPU_CHECK(code < 255, "FSST table has too many symbols");
+      table.len[code] = length;
+      std::memcpy(&table.symbol[code], reader.take(length).data(), length);
+    }
+  }
+  for (; code < 255; ++code) {
+    table.len[code] = 8;
+  }
+  return table;
+}
+
+__device__ void loadFsstTable(const FsstTable& table, FsstTable& shared) {
+  for (int c = threadIdx.x; c < 255; c += blockDim.x) {
+    shared.symbol[c] = table.symbol[c];
+    shared.len[c] = table.len[c];
+  }
+  __syncthreads();
+}
+
+// The decoded length of each string; offsets are where each string's codes
+// start in the blob.
+__global__ void fsstLengthsKernel(
+    const FsstTable table,
+    const uint8_t* blob,
+    const int32_t* offsets,
+    const int32_t* compressedLengths,
+    int32_t* lengths,
+    int64_t numRows) {
+  __shared__ FsstTable shared;
+  loadFsstTable(table, shared);
+  for (int64_t i = blockIdx.x * int64_t{blockDim.x} + threadIdx.x;
+       i < numRows;
+       i += int64_t{gridDim.x} * blockDim.x) {
+    const uint8_t* p = blob + offsets[i];
+    const uint8_t* end = p + compressedLengths[i];
+    int32_t length = 0;
+    while (p < end) {
+      const uint8_t code = *p++;
+      if (code == kFsstEscape) {
+        ++p;
+        ++length;
+      } else {
+        length += shared.len[code];
+      }
+    }
+    lengths[i] = length;
+  }
+}
+
+__global__ void fsstDecodeKernel(
+    const FsstTable table,
+    const uint8_t* blob,
+    const int32_t* offsets,
+    const int32_t* compressedLengths,
+    const int32_t* charOffsets,
+    char* chars,
+    int64_t numRows) {
+  __shared__ FsstTable shared;
+  loadFsstTable(table, shared);
+  for (int64_t i = blockIdx.x * int64_t{blockDim.x} + threadIdx.x;
+       i < numRows;
+       i += int64_t{gridDim.x} * blockDim.x) {
+    const uint8_t* p = blob + offsets[i];
+    const uint8_t* end = p + compressedLengths[i];
+    char* out = chars + charOffsets[i];
+    while (p < end) {
+      const uint8_t code = *p++;
+      if (code == kFsstEscape) {
+        *out++ = static_cast<char>(*p++);
+        continue;
+      }
+      const uint64_t symbol = shared.symbol[code];
+      const int length = shared.len[code];
+      for (int k = 0; k < length; ++k) {
+        out[k] = static_cast<char>(symbol >> (8 * k));
+      }
+      out += length;
+    }
   }
 }
 
@@ -1067,6 +1286,12 @@ class StripeDecode {
         return nullable(reader, type, numRows);
       case EncodingType::kSparseBool:
         return sparseBool(reader, numRows);
+      case EncodingType::kFsst:
+        return fsst(reader, numRows);
+      case EncodingType::kDeltaBlock:
+        return deltaBlock(reader, dataType, type, numRows);
+      case EncodingType::kAlp:
+        return alp(reader, dataType, type, numRows);
     }
     NIMBLE_GPU_CHECK(
         false,
@@ -1231,6 +1456,197 @@ class StripeDecode {
           cudaMemcpyDeviceToDevice,
           stream_.get()));
     }
+    return cudf::make_strings_column(
+        numRows,
+        std::move(offsets),
+        std::move(chars),
+        0,
+        cuda::device_buffer<std::byte>(stream_, mr_, 0, cuda::no_init));
+  }
+
+  std::unique_ptr<cudf::column> alp(
+      ByteReader& reader,
+      DataType dataType,
+      cudf::data_type type,
+      cudf::size_type numRows) {
+    NIMBLE_GPU_CHECK(
+        dataType == DataType::kDouble || dataType == DataType::kFloat,
+        "ALP needs a floating point type");
+    uint32_t control = reader.u8();
+    control |= reader.u8() << 8;
+    control |= reader.u8() << 16;
+    const int exponent = control & 0x1f;
+    const int factor = (control >> 5) & 0x1f;
+    NIMBLE_GPU_CHECK(exponent < 24 && factor < 24, "ALP exponent or factor");
+    const uint32_t numExceptions = (control & (1u << 16)) ? reader.varint() : 0;
+    auto encoded = decodeEncoding(
+        reader.take(reader.varint()), cudf::data_type{cudf::type_id::UINT64});
+    std::unique_ptr<cudf::column> positions;
+    std::unique_ptr<cudf::column> exceptions;
+    if (numExceptions > 0) {
+      positions = decodeEncoding(
+          reader.take(reader.varint()), cudf::data_type{cudf::type_id::INT32});
+      exceptions = decodeEncoding(reader.take(reader.varint()), type);
+    }
+    if (collecting) {
+      return nullptr;
+    }
+    checkWidth(dataType, type);
+    NIMBLE_GPU_CHECK(encoded->size() == numRows, "ALP encoded row count");
+    auto column = fixedWidth(type, numRows);
+    if (numRows == 0) {
+      return column;
+    }
+    auto decode = [&](auto zero) {
+      using F = decltype(zero);
+      auto* out = column->mutable_view().template head<F>();
+      alpKernel<F><<<gridSize(numRows), kBlockSize, 0, stream_.get()>>>(
+          encoded->view().template head<uint64_t>(),
+          kAlpPow10[factor],
+          kAlpPow10[exponent],
+          out,
+          numRows);
+      if (numExceptions > 0) {
+        NIMBLE_GPU_CHECK(
+            positions->size() == static_cast<cudf::size_type>(numExceptions) &&
+                exceptions->size() == positions->size(),
+            "ALP exception count");
+        scatterKernel<F><<<gridSize(numExceptions), kBlockSize, 0, stream_.get()>>>(
+            positions->view().template head<int32_t>(),
+            exceptions->view().template head<F>(),
+            out,
+            numExceptions);
+      }
+    };
+    if (dataType == DataType::kDouble) {
+      decode(double{});
+    } else {
+      decode(float{});
+    }
+    checkCuda(cudaGetLastError());
+    return column;
+  }
+
+  std::unique_ptr<cudf::column> deltaBlock(
+      ByteReader& reader,
+      DataType dataType,
+      cudf::data_type type,
+      cudf::size_type numRows) {
+    const int width = physicalWidth(dataType);
+    NIMBLE_GPU_CHECK(width > 0, "DeltaBlock needs an integer type");
+    const auto blockSize = reader.varint();
+    const auto numBlocks = reader.varint();
+    NIMBLE_GPU_CHECK(
+        blockSize > 0 &&
+            numBlocks == (static_cast<uint64_t>(numRows) + blockSize - 1) / blockSize,
+        "DeltaBlock block count");
+    std::vector<DeltaBlock> blocks(numBlocks);
+    for (auto& block : blocks) {
+      block.base = reader.varint64();
+    }
+    for (auto& block : blocks) {
+      block.bitWidth = reader.u8();
+      NIMBLE_GPU_CHECK(block.bitWidth <= 64, "DeltaBlock bit width");
+    }
+    for (auto& block : blocks) {
+      block.offset = reader.varint();
+    }
+    const auto packed = payload(Codec::kUncompressed, reader.rest());
+    if (collecting) {
+      return nullptr;
+    }
+    checkWidth(dataType, type);
+    auto column = fixedWidth(type, numRows);
+    if (numRows == 0) {
+      return column;
+    }
+    rmm::device_uvector<DeltaBlock> deviceBlocks(numBlocks, stream_, mr_);
+    checkCuda(cudaMemcpyAsync(
+        deviceBlocks.data(),
+        blocks.data(),
+        numBlocks * sizeof(DeltaBlock),
+        cudaMemcpyHostToDevice,
+        stream_.get()));
+    const bool isSigned = dataType == DataType::kInt8 ||
+        dataType == DataType::kInt16 || dataType == DataType::kInt32 ||
+        dataType == DataType::kInt64;
+    const uint64_t signBit = isSigned ? uint64_t{1} << (8 * width - 1) : 0;
+    dispatchWidth(width, [&](auto zero) {
+      using U = decltype(zero);
+      deltaBlockKernel<U><<<numBlocks, kBlockSize, 0, stream_.get()>>>(
+          packed.data,
+          deviceBlocks.data(),
+          blockSize,
+          signBit,
+          column->mutable_view().template head<U>(),
+          static_cast<uint32_t>(numRows));
+    });
+    checkCuda(cudaGetLastError());
+    return column;
+  }
+
+  std::unique_ptr<cudf::column> fsst(
+      ByteReader& reader,
+      cudf::size_type numRows) {
+    const auto codec = static_cast<Codec>(reader.u8());
+    const auto table = fsstTable(reader.take(reader.varint()));
+    auto lengths = decodeEncoding(
+        reader.take(reader.varint()), cudf::data_type{cudf::type_id::INT32});
+    const auto blob = payload(codec, reader.rest());
+    if (collecting) {
+      return nullptr;
+    }
+    NIMBLE_GPU_CHECK(lengths->size() == numRows, "FSST lengths row count");
+    NIMBLE_GPU_CHECK(
+        blob.size <= static_cast<size_t>(std::numeric_limits<int32_t>::max()),
+        "FSST blob too large");
+    auto offsets = fixedWidth(cudf::data_type{cudf::type_id::INT32}, numRows + 1);
+    auto* offsetsData = offsets->mutable_view().head<int32_t>();
+    checkCuda(cudaMemsetAsync(offsetsData, 0, sizeof(int32_t), stream_.get()));
+    if (numRows == 0) {
+      return cudf::make_strings_column(
+          0,
+          std::move(offsets),
+          rmm::device_buffer(0, stream_, mr_),
+          0,
+          cuda::device_buffer<std::byte>(stream_, mr_, 0, cuda::no_init));
+    }
+    const auto* compressedLengths = lengths->view().head<int32_t>();
+    rmm::device_uvector<int32_t> codeOffsets(numRows, stream_, mr_);
+    checkCuda(cudaMemcpyAsync(
+        codeOffsets.data(),
+        compressedLengths,
+        numRows * sizeof(int32_t),
+        cudaMemcpyDeviceToDevice,
+        stream_.get()));
+    scanInPlace(codeOffsets.data(), numRows, false, stream_, mr_);
+    fsstLengthsKernel<<<gridSize(numRows), kBlockSize, 0, stream_.get()>>>(
+        table,
+        blob.data,
+        codeOffsets.data(),
+        compressedLengths,
+        offsetsData + 1,
+        numRows);
+    checkCuda(cudaGetLastError());
+    scanInPlace(offsetsData + 1, numRows, true, stream_, mr_);
+    int32_t numChars = 0;
+    checkCuda(cudaMemcpyAsync(
+        &numChars,
+        offsetsData + numRows,
+        sizeof(int32_t),
+        cudaMemcpyDeviceToHost,
+        stream_.get()));
+    checkCuda(cudaStreamSynchronize(stream_.get()));
+    rmm::device_buffer chars(numChars, stream_, mr_);
+    fsstDecodeKernel<<<gridSize(numRows), kBlockSize, 0, stream_.get()>>>(
+        table,
+        blob.data,
+        codeOffsets.data(),
+        compressedLengths,
+        offsetsData,
+        static_cast<char*>(chars.data()),
+        numRows);
+    checkCuda(cudaGetLastError());
     return cudf::make_strings_column(
         numRows,
         std::move(offsets),
