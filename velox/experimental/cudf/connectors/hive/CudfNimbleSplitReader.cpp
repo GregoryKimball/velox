@@ -29,9 +29,20 @@
 #include <cudf/table/table.hpp>
 #include <cudf/transform.hpp>
 
+#include <folly/executors/CPUThreadPoolExecutor.h>
+#include <folly/futures/Future.h>
+
 #include <nvtx3/nvtx3.hpp>
 
 namespace facebook::velox::cudf_velox::connector::hive {
+namespace {
+
+folly::Executor* readExecutor() {
+  static auto* executor = new folly::CPUThreadPoolExecutor(16);
+  return executor;
+}
+
+} // namespace
 
 CudfNimbleSplitReader::~CudfNimbleSplitReader() = default;
 
@@ -142,24 +153,34 @@ CudfNimbleSplitReader::readNextChunk() {
   }
 
   // The streams are read straight into the pinned buffer that goes to the
-  // device.
-  auto* host = NimbleGpuDecoder::hostBuffer(batchBytes);
+  // device, in pieces spread over the read threads.
+  NimbleGpuDecoder::PinnedBuffer pinned{batchBytes};
+  auto* host = pinned.data();
   {
     nvtx3::scoped_range range{"CudfNimbleSplitReader::read"};
+    constexpr uint64_t kPieceBytes = uint64_t{4} << 20;
+    std::vector<folly::SemiFuture<folly::Unit>> pieces;
     size_t offset = 0;
     size_t next = 0;
     for (auto& entry : batch) {
       for (size_t i = 0; i < streamIds_.size(); ++i) {
         const auto& read = reads[next++];
-        if (read.size > 0) {
-          readFile_->pread(read.fileOffset, read.size, host + offset);
-          if (ioStatistics_) {
-            ioStatistics_->incRawBytesRead(read.size);
-          }
+        for (uint64_t done = 0; done < read.size; done += kPieceBytes) {
+          const auto size = std::min(kPieceBytes, read.size - done);
+          auto* out = host + offset + done;
+          const auto fileOffset = read.fileOffset + done;
+          pieces.push_back(
+              folly::via(readExecutor(), [this, fileOffset, size, out] {
+                readFile_->pread(fileOffset, size, out);
+              }).semi());
         }
         entry.streams.emplace_back(host + offset, read.size);
         offset += read.size;
       }
+    }
+    folly::collect(std::move(pieces)).get();
+    if (ioStatistics_) {
+      ioStatistics_->incRawBytesRead(batchBytes);
     }
   }
 
