@@ -28,6 +28,7 @@
 #include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/transform.hpp>
+#include <cudf/types.hpp>
 
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/futures/Future.h>
@@ -124,6 +125,12 @@ CudfNimbleSplitReader::startBatch() {
     const char* mb = std::getenv("NIMBLE_GPU_BATCH_MB");
     return size_t{mb != nullptr ? std::stoul(mb) : 512} << 20;
   }();
+  // Well-compressed columns decode to many times their stored size, so the
+  // decoded size is bounded too, like Parquet's chunk read limit.
+  static const size_t kDecodedBytes = [] {
+    const char* mb = std::getenv("NIMBLE_GPU_BATCH_DECODED_MB");
+    return size_t{mb != nullptr ? std::stoul(mb) : 1024} << 20;
+  }();
   constexpr int64_t kBatchRows = int64_t{1} << 28;
   struct Read {
     uint64_t fileOffset;
@@ -132,15 +139,25 @@ CudfNimbleSplitReader::startBatch() {
   std::vector<Read> reads;
   std::vector<NimbleStripeStreams> batch;
   size_t batchBytes = 0;
+  size_t decodedBytes = 0;
   int64_t batchRows = 0;
   while (nextStripe_ < stripes_.size() && batchBytes < kBatchBytes) {
     const auto stripe = stripes_[nextStripe_];
     const auto numRows = static_cast<int64_t>(tablet_->stripeRowCount(stripe));
-    if (!batch.empty() && batchRows + numRows > kBatchRows) {
+    const auto stripeId = tablet_->stripeIdentifier(stripe);
+    size_t stripeDecoded = 0;
+    for (size_t i = 0; i < streamIds_.size(); ++i) {
+      stripeDecoded += cudfTypes_[i].id() == cudf::type_id::STRING
+          ? numRows * sizeof(cudf::size_type) +
+              tablet_->streamLocation(stripeId, streamIds_[i]).size
+          : numRows * cudf::size_of(cudfTypes_[i]);
+    }
+    if (!batch.empty() &&
+        (batchRows + numRows > kBatchRows ||
+         decodedBytes + stripeDecoded > kDecodedBytes)) {
       break;
     }
     ++nextStripe_;
-    const auto stripeId = tablet_->stripeIdentifier(stripe);
     const auto stripeOffset = tablet_->stripeOffset(stripe);
     batch.emplace_back().numRows = static_cast<cudf::size_type>(numRows);
     for (size_t i = 0; i < streamIds_.size(); ++i) {
@@ -149,6 +166,7 @@ CudfNimbleSplitReader::startBatch() {
       batchBytes += location.size;
     }
     batchRows += numRows;
+    decodedBytes += stripeDecoded;
   }
 
   // The streams are read straight into the pinned buffer that goes to the
