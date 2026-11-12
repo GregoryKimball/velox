@@ -34,6 +34,9 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <cstdlib>
+#include <string>
+
 namespace facebook::velox::cudf_velox::connector::hive {
 namespace {
 
@@ -117,7 +120,10 @@ CudfNimbleSplitReader::startBatch() {
   }
   // Stripes are batched up to a stored-byte budget so that one decode sees
   // many compressed frames.
-  constexpr size_t kBatchBytes = size_t{128} << 20;
+  static const size_t kBatchBytes = [] {
+    const char* mb = std::getenv("NIMBLE_GPU_BATCH_MB");
+    return size_t{mb != nullptr ? std::stoul(mb) : 128} << 20;
+  }();
   constexpr int64_t kBatchRows = int64_t{1} << 28;
   struct Read {
     uint64_t fileOffset;
