@@ -18,6 +18,9 @@
 #include "velox/experimental/cudf/exec/CudfPlanRewriter.h"
 
 #include "velox/exec/HashPartitionFunction.h"
+#include "velox/exec/RoundRobinPartitionFunction.h"
+
+#include <algorithm>
 
 namespace facebook::velox::cudf_velox {
 namespace {
@@ -98,6 +101,36 @@ const core::ProjectNode* asPassThroughProject(const PlanNodePtr& node) {
   return project;
 }
 
+// Returns whether 'output' partitions its rows with a connector's function
+// (Hive buckets) rather than one of the engine's: Presto does that only for a
+// materialized exchange, whose rows a later fragment writes to a table.
+bool partitionsForTable(const core::PartitionedOutputNode& output) {
+  const auto* spec = output.partitionFunctionSpecPtr().get();
+  return spec != nullptr &&
+      !dynamic_cast<const exec::HashPartitionFunctionSpec*>(spec) &&
+      !dynamic_cast<const exec::RoundRobinPartitionFunctionSpec*>(spec) &&
+      !dynamic_cast<const core::GatherPartitionFunctionSpec*>(spec);
+}
+
+// Returns whether the aggregation state reaching a FINAL or INTERMEDIATE
+// aggregation through 'node' is read back from a table, the reading end of a
+// materialized exchange.
+bool readsStateFromTable(const PlanNodePtr& node) {
+  if (dynamic_cast<const core::TableScanNode*>(node.get())) {
+    return true;
+  }
+  if (!dynamic_cast<const core::LocalPartitionNode*>(node.get()) &&
+      !dynamic_cast<const core::ProjectNode*>(node.get()) &&
+      !dynamic_cast<const core::FilterNode*>(node.get())) {
+    return false;
+  }
+  const auto& sources = node->sources();
+  return !sources.empty() &&
+      std::all_of(sources.begin(), sources.end(), [](const auto& source) {
+        return readsStateFromTable(source);
+      });
+}
+
 bool hasCompactOutput(const PlanNodePtr& node) {
   if (const auto* aggregation =
           dynamic_cast<const CudfAggregationNode*>(node.get())) {
@@ -117,10 +150,14 @@ bool hasCompactOutput(const PlanNodePtr& node) {
   return false;
 }
 
+// 'keepState': the state of PARTIAL aggregations reaching 'node''s output keeps
+// its VARBINARY type, because it leaves the task through a materialized
+// exchange (partitionsForTable()).
 PlanNodePtr rewriteNode(
     const PlanNodePtr& node,
     const RowTypePtr& expected,
-    bool compactInput = false);
+    bool compactInput = false,
+    bool keepState = false);
 
 // Rewrites a pass-through Project on a source of a local exchange. Compact
 // state passes through it: each output column has the type of the source
@@ -129,7 +166,8 @@ PlanNodePtr rewritePassThroughProject(
     const PlanNodePtr& node,
     const core::ProjectNode& project,
     const RowTypePtr& expected,
-    bool compactInput) {
+    bool compactInput,
+    bool keepState) {
   const auto& source = project.sources()[0];
   const auto& sourceType = source->outputType();
   auto fieldName = [](const core::TypedExprPtr& projection) {
@@ -153,7 +191,7 @@ PlanNodePtr rewritePassThroughProject(
     sourceExpected = ROW(sourceType->names(), std::move(types));
   }
 
-  auto rewritten = rewriteNode(source, sourceExpected, compactInput);
+  auto rewritten = rewriteNode(source, sourceExpected, compactInput, keepState);
   if (rewritten == source) {
     return node;
   }
@@ -174,7 +212,8 @@ PlanNodePtr rewritePassThroughProject(
 PlanNodePtr rewriteNode(
     const PlanNodePtr& node,
     const RowTypePtr& expected,
-    bool compactInput) {
+    bool compactInput,
+    bool keepState) {
   if (compactInput) {
     VELOX_USER_CHECK(
         dynamic_cast<const AggregationNode*>(node.get()) ||
@@ -226,8 +265,20 @@ PlanNodePtr rewriteNode(
     const auto step = aggregation->step();
     const bool rawInput = step == AggregationNode::Step::kPartial ||
         step == AggregationNode::Step::kSingle;
+    // A materialized exchange writes the state into a table through a fragment
+    // that cannot tell state columns from others, so the state crossing it
+    // keeps its VARBINARY type at both ends. An INTERMEDIATE aggregation has
+    // one state type for its input and its output and cannot be one of them.
+    const bool stateFromTable =
+        !rawInput && readsStateFromTable(aggregation->sources()[0]);
+    VELOX_USER_CHECK(
+        step != AggregationNode::Step::kIntermediate ||
+            !(keepState || stateFromTable),
+        "Compact aggregation state cannot cross a materialized exchange at an INTERMEDIATE aggregation: {}",
+        node->id());
     for (size_t i = 0; i < aggregates.size(); ++i) {
-      if (step == AggregationNode::Step::kSingle) {
+      if (step == AggregationNode::Step::kSingle || stateFromTable ||
+          (keepState && step == AggregationNode::Step::kPartial)) {
         continue;
       }
       auto& aggregate = aggregates[i];
@@ -328,8 +379,9 @@ PlanNodePtr rewriteNode(
     for (const auto& source : local->sources()) {
       const auto* project = asPassThroughProject(source);
       auto rewritten = project
-          ? rewritePassThroughProject(source, *project, expected, compactInput)
-          : rewriteNode(source, expected, compactInput);
+          ? rewritePassThroughProject(
+                source, *project, expected, compactInput, keepState)
+          : rewriteNode(source, expected, compactInput, keepState);
       changed |= rewritten != source;
       sources.push_back(std::move(rewritten));
     }
@@ -349,7 +401,8 @@ PlanNodePtr rewriteNode(
 
   if (const auto* output =
           dynamic_cast<const core::PartitionedOutputNode*>(node.get())) {
-    auto source = rewriteNode(output->sources()[0], nullptr);
+    auto source = rewriteNode(
+        output->sources()[0], nullptr, false, partitionsForTable(*output));
     VELOX_USER_CHECK(
         !hasCompactOutput(source) ||
             output->transportKind() == core::TransportKind::kUcx,
@@ -391,8 +444,11 @@ PlanNodePtr rewriteNode(
   // These wrappers may enclose a completed FINAL, but are not state bridges.
   if (const auto* project = dynamic_cast<const core::ProjectNode*>(node.get());
       project && node->name() == "Project") {
-    auto source =
-        rewriteNode(project->sources()[0], project->sources()[0]->outputType());
+    auto source = rewriteNode(
+        project->sources()[0],
+        project->sources()[0]->outputType(),
+        false,
+        keepState);
     VELOX_USER_CHECK(
         !hasCompactOutput(source),
         "Unsupported compact aggregation state source: Project ({})",
@@ -403,8 +459,11 @@ PlanNodePtr rewriteNode(
     return finish(core::ProjectNode::Builder(*project).source(source).build());
   }
   if (const auto* filter = dynamic_cast<const core::FilterNode*>(node.get())) {
-    auto source =
-        rewriteNode(filter->sources()[0], filter->sources()[0]->outputType());
+    auto source = rewriteNode(
+        filter->sources()[0],
+        filter->sources()[0]->outputType(),
+        false,
+        keepState);
     VELOX_USER_CHECK(
         !hasCompactOutput(source),
         "Unsupported compact aggregation state source: Filter ({})",
