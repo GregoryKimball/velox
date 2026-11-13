@@ -102,8 +102,12 @@ const core::ProjectNode* asPassThroughProject(const PlanNodePtr& node) {
 }
 
 // Returns whether 'output' partitions its rows with a connector's function
-// (Hive buckets) rather than one of the engine's: Presto does that only for a
-// materialized exchange, whose rows a later fragment writes to a table.
+// (Hive buckets) rather than one of the engine's. A materialized exchange does,
+// and a later fragment writes its rows to a table; but so does an exchange that
+// Presto aligns with a bucketed table's buckets. State that crosses the latter
+// keeps VARBINARY here while its consumer reads it from an exchange and
+// expects compact state; the compact SUM paths then fail on the input type.
+// TODO: Decide from the query's exchange materialization setting instead.
 bool partitionsForTable(const core::PartitionedOutputNode& output) {
   const auto* spec = output.partitionFunctionSpecPtr().get();
   return spec != nullptr &&
