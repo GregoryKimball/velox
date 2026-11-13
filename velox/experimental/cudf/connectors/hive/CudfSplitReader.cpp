@@ -576,16 +576,17 @@ void CudfSplitReader::setupFirstPassChunking() {
     // A split served from the fused FOR scan cache is read here instead, if
     // its decoded file fits: it stays allocated until the driver reads it.
     // Ahead-of-time decoding hides latency while device memory is ample and
-    // gives way to the operators when it is not (allocated bytes plus the file
-    // over half of what the process can use); the file is then decoded when
-    // read.
+    // gives way to the operators when it is not (allocated bytes, the cache's
+    // device tier and the file over half of what the process can use); the
+    // file is then decoded when read.
     if (fusedForCacheRead_ and not fusedForCacheChunk_.has_value()) {
+      auto& cache = FusedForScanCache::instance();
       const auto available = gpuCapabilities().availableMemoryBytes;
       const auto decodedBytes = static_cast<int64_t>(
-          FusedForScanCache::instance().decodedSliceBytes(
-              split_->filePath, readColumnNames_));
+          cache.decodedSliceBytes(split_->filePath, readColumnNames_));
       if (available <= 0 or
-          std::max<int64_t>(cudfAllocatedBytes(), 0) + decodedBytes <=
+          std::max<int64_t>(cudfAllocatedBytes(), 0) +
+                  static_cast<int64_t>(cache.deviceBytes()) + decodedBytes <=
               available / 2) {
         fusedForCacheChunk_ =
             readFromFusedForCache(determineCudfMemoryResource());

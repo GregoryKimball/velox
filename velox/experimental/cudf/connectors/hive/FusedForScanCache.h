@@ -76,6 +76,10 @@ class FusedForScanCache {
   /// whatever earlier queries shrank it to.
   void limitDeviceCapacity(uint64_t bytes);
 
+  /// Returns the device memory the device tier holds: allocated outside the
+  /// memory resource, so cudfAllocatedBytes() does not count it.
+  std::size_t deviceBytes() const;
+
   /// Returns whether every column in 'columns' of 'file' is cached.
   bool containsAll(
       std::string_view file,

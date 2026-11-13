@@ -131,6 +131,11 @@ void FusedForScanCache::limitDeviceCapacity(uint64_t bytes) {
   deviceTierShrunk_.store(false, std::memory_order_relaxed);
 }
 
+std::size_t FusedForScanCache::deviceBytes() const {
+  std::shared_lock lock(mutex_);
+  return deviceAllocatedBytes_;
+}
+
 std::string FusedForScanCache::key(
     std::string_view file,
     std::string_view name) {
