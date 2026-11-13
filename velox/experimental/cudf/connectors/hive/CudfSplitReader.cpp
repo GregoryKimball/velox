@@ -1044,6 +1044,28 @@ void CudfSplitReader::fileMetaDatas() {
   }
 }
 
+namespace {
+
+// A Parquet read without a configured limit keeps each pass of fetched and
+// decompressed column chunks within 1/kPassShare of the device memory
+// available to the process, and each table it returns within 1/kChunkShare,
+// so that a file too large for a small device is read in pieces. With ample
+// memory the limits exceed the files and reads stay whole.
+constexpr int64_t kPassShare = 16;
+constexpr int64_t kChunkShare = 32;
+
+// Returns 'configured', or when it is 0 (no limit), 1/'share' of the device
+// memory available to the process; 0 when that is unknown.
+std::size_t limitOrShareOfDevice(std::size_t configured, int64_t share) {
+  if (configured > 0) {
+    return configured;
+  }
+  const auto available = gpuCapabilities().availableMemoryBytes;
+  return available > 0 ? static_cast<std::size_t>(available / share) : 0;
+}
+
+} // namespace
+
 void CudfSplitReader::createCudfReader() {
   // Read file metadatas
   fileMetaDatas();
@@ -1069,9 +1091,11 @@ void CudfSplitReader::createCudfReader() {
       "cuDF parquet reader supports a single parquet metadata per split");
 
   const auto* sessionProperties = connectorQueryCtx_->sessionProperties();
-  chunkReadLimit_ =
-      cudfHiveConfig_->maxChunkReadLimitSession(sessionProperties);
-  passReadLimit_ = cudfHiveConfig_->maxPassReadLimitSession(sessionProperties);
+  chunkReadLimit_ = limitOrShareOfDevice(
+      cudfHiveConfig_->maxChunkReadLimitSession(sessionProperties),
+      kChunkShare);
+  passReadLimit_ = limitOrShareOfDevice(
+      cudfHiveConfig_->maxPassReadLimitSession(sessionProperties), kPassShare);
   serializeIoRequests_ =
       cudfHiveConfig_->serializeIoRequestsSession(sessionProperties);
 
