@@ -672,10 +672,12 @@ PackedTableWithStreamPtr UcxExchangeSource::restoreOrFail(
     return restoreExchangePayload(
         std::move(metadata), std::move(data), stream, numRows);
   } catch (const std::exception& e) {
+    // VeloxException::what() also carries the context and stack trace.
+    const auto* veloxError = dynamic_cast<const VeloxException*>(&e);
     const auto errorMsg = fmt::format(
         "Failed to restore exchange data from task {}: {}",
         partitionKey_.toString(),
-        e.what());
+        veloxError != nullptr ? veloxError->message() : e.what());
     VLOG(0) << toString() << " " << errorMsg;
     queue_->setError(errorMsg);
     deliverEndMarker();
