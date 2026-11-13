@@ -337,19 +337,20 @@ FusedForScanCache::Payload FusedForScanCache::store(
 
 std::pair<cudf::packed_columns, cudf::column_view>
 FusedForScanCache::decodePayload(
-    const Payload& payload,
+    Payload& payload,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr,
-    std::size_t& hostReadBytes) const {
+    std::size_t& hostReadBytes) {
   // Allocate before taking the lock: a failed allocation makes the cache
   // release device blocks, which takes the lock exclusively.
   rmm::device_buffer wire(payload.wireBytes, stream, mr);
+  bool onDevice{false};
   {
     // The device copy can be released: copy from it under the lock. Releasing
     // a block synchronizes the device first, so no copy from it is in flight
     // when it is freed.
     std::shared_lock lock(mutex_);
-    const bool onDevice = payload.deviceWire != nullptr;
+    onDevice = payload.deviceWire != nullptr;
     if (not onDevice) {
       hostReadBytes += payload.wireBytes;
     }
@@ -360,6 +361,9 @@ FusedForScanCache::decodePayload(
         onDevice ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice,
         stream.get());
     VELOX_CHECK(status == cudaSuccess, "{}", cudaGetErrorString(status));
+  }
+  if (not onDevice) {
+    keepOnDevice(payload, wire.data(), stream);
   }
 
   cudf::detail::fused_for_packed_columns packed;
@@ -372,14 +376,40 @@ FusedForScanCache::decodePayload(
   return {std::move(columns), view};
 }
 
+void FusedForScanCache::keepOnDevice(
+    Payload& payload,
+    const void* source,
+    cuda::stream_ref stream) {
+  std::unique_lock lock(mutex_);
+  if (payload.deviceWire != nullptr) {
+    return;
+  }
+  void* device = allocateDevice(payload.wireBytes);
+  if (device == nullptr) {
+    return;
+  }
+  const auto status = cudaMemcpyAsync(
+      device,
+      source,
+      payload.wireBytes,
+      cudaMemcpyDeviceToDevice,
+      stream.get());
+  VELOX_CHECK(status == cudaSuccess, "{}", cudaGetErrorString(status));
+  // Readers on other streams copy from the device copy once it is set: wait for
+  // it first. Holding the lock keeps releaseDeviceBlocks() from freeing the
+  // block meanwhile.
+  stream.sync();
+  payload.deviceWire = device;
+}
+
 FusedForScanCache::DecodedColumn FusedForScanCache::decode(
     std::string_view file,
     std::string_view name,
     std::size_t slice,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr,
-    rmm::device_async_resource_ref tempMr) const {
-  const Entry* entry = nullptr;
+    rmm::device_async_resource_ref tempMr) {
+  Entry* entry = nullptr;
   {
     std::shared_lock lock(mutex_);
     auto it = entries_.find(key(file, name));
@@ -392,7 +422,7 @@ FusedForScanCache::DecodedColumn FusedForScanCache::decode(
   }
 
   VELOX_CHECK_LT(slice, entry->slices.size(), "No such slice of {}", name);
-  const auto& cached = entry->slices[slice];
+  auto& cached = entry->slices[slice];
   std::size_t hostReadBytes{0};
   auto [values, valuesView] =
       decodePayload(cached.values, stream, tempMr, hostReadBytes);

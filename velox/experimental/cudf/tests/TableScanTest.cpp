@@ -802,6 +802,66 @@ TEST_F(TableScanTest, fusedForScanCacheReadsSlices) {
   EXPECT_EQ(stats.at("cudfFusedForCacheReads").sum, 3);
 }
 
+TEST_F(TableScanTest, fusedForScanCacheMovesHostReadsToDevice) {
+  // A file cached while the query's limit keeps the device tier empty is read
+  // from host memory. Once a later query's limit leaves room, its reads copy
+  // the payloads into the device tier, and the next query reads none of them
+  // from host memory.
+  constexpr vector_size_t kNumRows = 2'000;
+  auto vectors = {makeRowVector(
+      {"c0", "c1"},
+      {
+          makeFlatVector<int64_t>(
+              kNumRows, [](auto row) { return 1'000'000'000'000 + row * 3; }),
+          makeFlatVector<double>(kNumRows, [](auto row) { return row * 0.5; }),
+      })};
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), *vectors.begin());
+  createDuckDbTable({*vectors.begin()});
+
+  using cudf_velox::connector::hive::CudfHiveConfig;
+  resetCudfHiveConnector(std::make_shared<config::ConfigBase>(
+      std::unordered_map<std::string, std::string>{
+          {CudfHiveConfig::kFusedForScanCacheBytes, "1073741824"},
+          {CudfHiveConfig::kFusedForScanCacheDeviceBytes, "2147483648"},
+      }));
+
+  const auto rowType = asRowType((*vectors.begin())->type());
+  auto plan = PlanBuilder(pool_.get())
+                  .startTableScan()
+                  .outputType(rowType)
+                  .tableHandle(
+                      makeTableHandle("parquet_table", rowType, {}, nullptr))
+                  .assignments(
+                      HiveConnectorTestBase::allRegularColumns(rowType))
+                  .endTableScan()
+                  .planNode();
+  auto scan = [&](const std::string& deviceLimitMb) {
+    auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+                    .connectorSessionProperty(
+                        kCudfHiveConnectorId,
+                        CudfHiveConfig::kScanCacheDeviceLimitMbSession,
+                        deviceLimitMb)
+                    .splits(makeCudfHiveConnectorSplits({filePath}))
+                    .assertResults("SELECT * FROM tmp");
+    return getTableScanRuntimeStats(task);
+  };
+  auto hostReadBytes = [](const auto& stats) -> int64_t {
+    auto it = stats.find("cudfFusedForCacheHostReadBytes");
+    return it == stats.end() ? 0 : it->second.sum;
+  };
+
+  // 1 MiB is less than a device block: the fill caches in host memory only.
+  auto stats = scan("1");
+  ASSERT_EQ(stats.at("cudfFusedForCacheFills").sum, 1);
+  EXPECT_GT(hostReadBytes(stats), 0);
+  stats = scan("2048");
+  EXPECT_GT(hostReadBytes(stats), 0);
+  stats = scan("2048");
+  EXPECT_EQ(stats.at("cudfFusedForCacheReads").sum, 1);
+  EXPECT_EQ(hostReadBytes(stats), 0);
+}
+
 TEST_F(TableScanTest, fusedForScanCacheFillTakesASlice) {
   // A file of 20 row groups: filling the cache one row group at a time takes
   // a fraction of the device memory that filling it whole does.

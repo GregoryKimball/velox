@@ -56,7 +56,9 @@ namespace facebook::velox::cudf_velox::connector::hive {
 /// host-to-device copy. When a device allocation fails, the cache frees its
 /// newest device blocks (see releaseDeviceMemory() in GpuResources.h) and reads
 /// their payloads from host memory, and the device tier stays at the smaller
-/// size.
+/// size. A payload read from host memory is copied back into the device tier
+/// when the tier has room for it again (a later query's limit, see
+/// limitDeviceCapacity()), so that the tier refills with what queries read.
 class FusedForScanCache {
  public:
   static FusedForScanCache& instance();
@@ -180,14 +182,15 @@ class FusedForScanCache {
   /// Copies slice 'slice' of the cached column 'name' of 'file' to the device
   /// and decodes it into memory from 'tempMr', except that a dictionary-encoded
   /// column is gathered, and a difference-encoded column summed, into a column
-  /// from 'mr'. The column must be cached.
+  /// from 'mr'. A payload copied from host memory is also kept in the device
+  /// tier while the tier has room for it. The column must be cached.
   DecodedColumn decode(
       std::string_view file,
       std::string_view name,
       std::size_t slice,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr,
-      rmm::device_async_resource_ref tempMr) const;
+      rmm::device_async_resource_ref tempMr);
 
  private:
   // One fused FOR payload: the packed-table metadata and the encoded bytes in
@@ -222,10 +225,17 @@ class FusedForScanCache {
   // packed allocation from 'mr', returned with a view of the column. Adds the
   // bytes copied from host memory to 'hostReadBytes'.
   std::pair<cudf::packed_columns, cudf::column_view> decodePayload(
-      const Payload& payload,
+      Payload& payload,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr,
-      std::size_t& hostReadBytes) const;
+      std::size_t& hostReadBytes);
+
+  // Copies 'payload', whose encoded bytes are at 'source' in device memory,
+  // into the device tier if the tier has room for it and holds no copy yet.
+  void keepOnDevice(
+      Payload& payload,
+      const void* source,
+      cuda::stream_ref stream);
 
   // Frees the newest device blocks, dropping the device copies they hold,
   // until at least 'bytes' are freed or none is left. Returns whether any was
