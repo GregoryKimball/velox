@@ -801,6 +801,10 @@ CudfSplitReader::readFromFusedForCache(rmm::device_async_resource_ref mr) {
   }
   fusedForCacheSlice_ = slice + 1;
   fusedForCacheSliceRow_ = sliceEnd;
+  std::size_t hostReadBytes{0};
+  for (const auto& column : decoded) {
+    hostReadBytes += column.hostReadBytes;
+  }
   std::unique_ptr<cudf::table> table;
   if (not selectsRows) {
     std::vector<std::unique_ptr<cudf::column>> columns;
@@ -837,6 +841,13 @@ CudfSplitReader::readFromFusedForCache(rmm::device_async_resource_ref mr) {
   }
   if (ioStats_) {
     ioStats_->addCounter("cudfFusedForCacheReads", RuntimeCounter(1));
+    if (hostReadBytes > 0) {
+      ioStats_->addCounter(
+          "cudfFusedForCacheHostReadBytes",
+          RuntimeCounter(
+              static_cast<int64_t>(hostReadBytes),
+              RuntimeCounter::Unit::kBytes));
+    }
   }
   nvtxRangePop();
 

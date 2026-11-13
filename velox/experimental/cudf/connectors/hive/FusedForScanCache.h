@@ -167,11 +167,14 @@ class FusedForScanCache {
   std::size_t numSlices(std::string_view file, std::string_view name) const;
 
   /// A cached column decoded on the device. 'view' points into memory the
-  /// object owns: the decoded packed allocation, or 'column'.
+  /// object owns: the decoded packed allocation, or 'column'. 'hostReadBytes'
+  /// counts the encoded bytes copied from host memory, zero when the device
+  /// tier held every payload.
   struct DecodedColumn {
     cudf::packed_columns packed;
     std::unique_ptr<cudf::column> column;
     cudf::column_view view;
+    std::size_t hostReadBytes{0};
   };
 
   /// Copies slice 'slice' of the cached column 'name' of 'file' to the device
@@ -216,11 +219,13 @@ class FusedForScanCache {
   static std::string key(std::string_view file, std::string_view name);
 
   // Copies a payload to the device and decodes its single column into a
-  // packed allocation from 'mr', returned with a view of the column.
+  // packed allocation from 'mr', returned with a view of the column. Adds the
+  // bytes copied from host memory to 'hostReadBytes'.
   std::pair<cudf::packed_columns, cudf::column_view> decodePayload(
       const Payload& payload,
       cuda::stream_ref stream,
-      rmm::device_async_resource_ref mr) const;
+      rmm::device_async_resource_ref mr,
+      std::size_t& hostReadBytes) const;
 
   // Frees the newest device blocks, dropping the device copies they hold,
   // until at least 'bytes' are freed or none is left. Returns whether any was

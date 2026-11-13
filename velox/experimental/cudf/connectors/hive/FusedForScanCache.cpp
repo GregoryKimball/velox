@@ -339,7 +339,8 @@ std::pair<cudf::packed_columns, cudf::column_view>
 FusedForScanCache::decodePayload(
     const Payload& payload,
     cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr) const {
+    rmm::device_async_resource_ref mr,
+    std::size_t& hostReadBytes) const {
   // Allocate before taking the lock: a failed allocation makes the cache
   // release device blocks, which takes the lock exclusively.
   rmm::device_buffer wire(payload.wireBytes, stream, mr);
@@ -349,6 +350,9 @@ FusedForScanCache::decodePayload(
     // when it is freed.
     std::shared_lock lock(mutex_);
     const bool onDevice = payload.deviceWire != nullptr;
+    if (not onDevice) {
+      hostReadBytes += payload.wireBytes;
+    }
     const auto status = cudaMemcpyAsync(
         wire.data(),
         onDevice ? payload.deviceWire : payload.wire,
@@ -389,7 +393,9 @@ FusedForScanCache::DecodedColumn FusedForScanCache::decode(
 
   VELOX_CHECK_LT(slice, entry->slices.size(), "No such slice of {}", name);
   const auto& cached = entry->slices[slice];
-  auto [values, valuesView] = decodePayload(cached.values, stream, tempMr);
+  std::size_t hostReadBytes{0};
+  auto [values, valuesView] =
+      decodePayload(cached.values, stream, tempMr, hostReadBytes);
   if (cached.deltas) {
     auto column = decodeFusedForEncoding(
         FusedForEncoding::kDeltas,
@@ -400,16 +406,17 @@ FusedForScanCache::DecodedColumn FusedForScanCache::decode(
         mr,
         tempMr);
     const auto view = column->view();
-    return DecodedColumn{{}, std::move(column), view};
+    return DecodedColumn{{}, std::move(column), view, hostReadBytes};
   }
   if (!cached.keys.has_value()) {
-    return DecodedColumn{std::move(values), nullptr, valuesView};
+    return DecodedColumn{std::move(values), nullptr, valuesView, hostReadBytes};
   }
-  const auto [keys, keysView] = decodePayload(*cached.keys, stream, tempMr);
+  const auto [keys, keysView] =
+      decodePayload(*cached.keys, stream, tempMr, hostReadBytes);
   auto column = decodeFusedForEncoding(
       FusedForEncoding::kDictionary, valuesView, keysView, 0, stream, mr, tempMr);
   const auto view = column->view();
-  return DecodedColumn{{}, std::move(column), view};
+  return DecodedColumn{{}, std::move(column), view, hostReadBytes};
 }
 
 void* FusedForScanCache::allocateDevice(std::size_t bytes) {
