@@ -116,12 +116,13 @@ class UcxExchangeSource
   static constexpr int32_t kBackpressureHighWaterMark = 32;
   static constexpr int32_t kBackpressureLowWaterMark = 16;
 
-  /// True when 'queue' holds more than kBackpressureHighWaterMark tables or,
-  /// if CudfConfig::exchangeMaxQueuedBytes is set, more than that many bytes.
+  /// True when 'queue' holds more than kBackpressureHighWaterMark tables or
+  /// more bytes than its bound: CudfConfig::exchangeMaxQueuedBytes when set,
+  /// within a share of the device memory available to the process.
   static bool aboveBackpressureHighWaterMark(const UcxExchangeQueue& queue);
 
-  /// True when 'queue' holds at most kBackpressureLowWaterMark tables and, if
-  /// CudfConfig::exchangeMaxQueuedBytes is set, at most half of it in bytes.
+  /// True when 'queue' holds at most kBackpressureLowWaterMark tables and at
+  /// most half of its byte bound.
   static bool atOrBelowBackpressureLowWaterMark(const UcxExchangeQueue& queue);
 
   // Returns runtime statistics. ExchangeSource is expected to report

@@ -20,6 +20,7 @@
 #include <folly/String.h>
 #include <folly/Uri.h>
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/GpuCapabilities.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/ucx-exchange/ExchangeCompression.h"
@@ -252,18 +253,38 @@ void UcxExchangeSource::close() {
   communicator_->addToWorkQueue(getSelfPtr());
 }
 
+namespace {
+
+// A queue holds received tables on the device until its consumer takes them:
+// at most 1/kQueuedBytesShare of the device memory available to the process,
+// within CudfConfig::exchangeMaxQueuedBytes when that is set, so that a bound
+// sized for ample memory does not set a memory floor on a smaller device.
+// Returns 0 (no byte bound) when neither is known.
+constexpr int64_t kQueuedBytesShare = 16;
+
+int64_t maxQueuedBytes() {
+  const auto configured =
+      cudf_velox::CudfConfig::getInstance().exchangeMaxQueuedBytes;
+  const auto available = cudf_velox::gpuCapabilities().availableMemoryBytes;
+  if (available <= 0) {
+    return configured;
+  }
+  const auto share = std::max<int64_t>(available / kQueuedBytesShare, 1);
+  return configured > 0 ? std::min(configured, share) : share;
+}
+
+} // namespace
+
 bool UcxExchangeSource::aboveBackpressureHighWaterMark(
     const UcxExchangeQueue& queue) {
-  const auto maxBytes =
-      cudf_velox::CudfConfig::getInstance().exchangeMaxQueuedBytes;
+  const auto maxBytes = maxQueuedBytes();
   return queue.size() > kBackpressureHighWaterMark ||
       (maxBytes > 0 && queue.totalBytes() > maxBytes);
 }
 
 bool UcxExchangeSource::atOrBelowBackpressureLowWaterMark(
     const UcxExchangeQueue& queue) {
-  const auto maxBytes =
-      cudf_velox::CudfConfig::getInstance().exchangeMaxQueuedBytes;
+  const auto maxBytes = maxQueuedBytes();
   return queue.size() <= kBackpressureLowWaterMark &&
       (maxBytes == 0 || queue.totalBytes() <= maxBytes / 2);
 }

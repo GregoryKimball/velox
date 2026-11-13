@@ -180,8 +180,15 @@ class UcxPartitionedOutput : public exec::Operator,
   std::vector<cudf_velox::CudfVectorPtr> pendingInputs_;
   /// Total rows across pendingInputs_.
   int64_t pendingRows_{0};
+  // Estimated device bytes across pendingInputs_.
+  uint64_t pendingBytes_{0};
   /// Configured row threshold for flushing (from QueryConfig).
   const int64_t targetRowsPerChunk_;
+  // Flushes also once pendingBytes_ reaches this share of the device memory
+  // available to the process (0 when unknown), so that a row target sized for
+  // ample memory does not set a memory floor on a smaller device: a flush
+  // holds the inputs, their concatenation and its partitions at once.
+  const uint64_t availableMemoryShareBytes_;
   // Flush every batch regardless of targetRowsPerChunk_; see the constructor.
   const bool eagerFlush_;
 

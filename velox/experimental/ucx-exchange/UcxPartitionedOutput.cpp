@@ -23,6 +23,7 @@
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/GpuCapabilities.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
@@ -46,6 +47,15 @@
 using namespace facebook::velox::cudf_velox;
 using facebook::velox::exec::Task;
 namespace facebook::velox::ucx_exchange {
+
+namespace {
+
+// A flush holds its inputs, their concatenation and its partitions at once, in
+// every driver of every partitioned output; the same share as a cuDF batch
+// concatenation buffer (CudfBatchConcat).
+constexpr int64_t kAvailableMemoryShare = 64;
+
+} // namespace
 
 // Computes a mapping from names in n2 to names in n1
 // and returns that mapping in remap.
@@ -90,6 +100,9 @@ UcxPartitionedOutput::UcxPartitionedOutput(
       targetRowsPerChunk_(ctx->queryConfig().get<int64_t>(
           CudfConfig::kUcxPartitionedOutputBatchRows,
           CudfConfig::getInstance().partitionedOutputBatchRows)),
+      availableMemoryShareBytes_(static_cast<uint64_t>(std::max<int64_t>(
+          gpuCapabilities().availableMemoryBytes / kAvailableMemoryShare,
+          0))),
       eagerFlush_(
           eagerFlush || ctx->queryConfig().partitionedOutputEagerFlush()),
       compression_(parseExchangeCompression(ctx->queryConfig().get<std::string>(
@@ -162,18 +175,22 @@ void UcxPartitionedOutput::addInput(RowVectorPtr input) {
       "addInput with outstanding future!");
 
   // Record stats per-input (before buffering).
+  const auto inputBytes = input->estimateFlatSize();
   {
     auto lockedStats = stats_.wlock();
-    lockedStats->addOutputVector(input->estimateFlatSize(), input->size());
+    lockedStats->addOutputVector(inputBytes, input->size());
   }
 
   // CudfVector::size(), not the table view: a table with no columns derives
   // num_rows() from them and so reports 0 however many rows it holds.
   pendingRows_ += cudfVector->size();
+  pendingBytes_ += inputBytes;
   pendingInputs_.push_back(std::move(cudfVector));
 
   if (eagerFlush_ || targetRowsPerChunk_ <= 0 ||
-      pendingRows_ >= targetRowsPerChunk_) {
+      pendingRows_ >= targetRowsPerChunk_ ||
+      (availableMemoryShareBytes_ > 0 &&
+       pendingBytes_ >= availableMemoryShareBytes_)) {
     flushPending();
   }
 }
@@ -284,6 +301,7 @@ void UcxPartitionedOutput::flushPending() {
 
     pendingInputs_.clear();
     pendingRows_ = 0;
+    pendingBytes_ = 0;
 
   } catch (const rmm::bad_alloc& e) {
     VLOG(1)
@@ -291,6 +309,7 @@ void UcxPartitionedOutput::flushPending() {
         << " caught memory alloc error, removing all memory in output queues";
     pendingInputs_.clear();
     pendingRows_ = 0;
+    pendingBytes_ = 0;
     for (int i = 0; i < numPartitions_; i++) {
       sharedQueueManager()->deleteResults(this->taskId(), i);
     }
