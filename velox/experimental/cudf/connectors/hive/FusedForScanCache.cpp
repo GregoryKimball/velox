@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <atomic>
 #include <limits>
+#include <cstring>
 #include <mutex>
 
 namespace facebook::velox::cudf_velox::connector::hive {
@@ -160,14 +161,15 @@ std::size_t FusedForScanCache::decodedSliceBytes(
   for (const auto& name : columns) {
     const auto it = entries_.find(key(file, name));
     VELOX_CHECK(it != entries_.end(), "Column is not cached: {}", name);
-    const auto& entry = it->second;
-    std::size_t values = 0;
-    for (const auto& slice : entry.values) {
-      values = std::max(values, slice.logicalDataSize);
+    std::size_t columnBytes = 0;
+    for (const auto& slice : it->second.slices) {
+      const auto values = slice.values.logicalDataSize;
+      columnBytes = std::max(
+          columnBytes,
+          slice.keys.has_value() ? 2 * values + slice.keys->logicalDataSize
+                                 : values);
     }
-    bytes += entry.keys.has_value()
-        ? 2 * values + entry.keys->logicalDataSize
-        : values;
+    bytes += columnBytes;
   }
   return bytes;
 }
@@ -197,7 +199,7 @@ std::size_t FusedForScanCache::numSlices(
   std::shared_lock lock(mutex_);
   const auto it = entries_.find(key(file, name));
   VELOX_CHECK(it != entries_.end(), "Column is not cached: {}", name);
-  return it->second.values.size();
+  return it->second.slices.size();
 }
 
 bool FusedForScanCache::mayCache(
@@ -215,129 +217,121 @@ bool FusedForScanCache::mayCache(
   return true;
 }
 
+namespace {
+
+// Copies 'packed' to host memory. The copy is complete once 'stream' is
+// synchronized.
+FusedForScanCache::ColumnSlices::HostPayload copyToHost(
+    cudf::detail::fused_for_packed_columns&& packed,
+    cuda::stream_ref stream) {
+  FusedForScanCache::ColumnSlices::HostPayload payload;
+  payload.wire.resize(packed.wire_data->size());
+  const auto status = cudaMemcpyAsync(
+      payload.wire.data(),
+      packed.wire_data->data(),
+      payload.wire.size(),
+      cudaMemcpyDeviceToHost,
+      stream.get());
+  VELOX_CHECK(status == cudaSuccess, "{}", cudaGetErrorString(status));
+  payload.metadata = std::move(*packed.metadata);
+  payload.segmentCount = packed.segment_count;
+  payload.logicalDataSize = packed.logical_data_size;
+  return payload;
+}
+
+std::size_t payloadBytes(
+    const FusedForScanCache::ColumnSlices::HostPayload& payload) {
+  return payload.wire.size() + payload.metadata.size();
+}
+
+} // namespace
+
+void FusedForScanCache::ColumnSlices::add(
+    cudf::column_view slice,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref tempMr) {
+  if (!cacheable_) {
+    return;
+  }
+  auto encoded = encodeForFusedFor(slice, {}, stream, tempMr);
+  if (!encoded.packedValues.has_value()) {
+    // A string column with many distinct values: fused FOR would not compress
+    // it.
+    cacheable_ = false;
+    slices_.clear();
+    bytes_ = 0;
+    return;
+  }
+  HostSlice hostSlice;
+  hostSlice.values = copyToHost(std::move(*encoded.packedValues), stream);
+  if (encoded.packedKeys.has_value()) {
+    hostSlice.keys = copyToHost(std::move(*encoded.packedKeys), stream);
+  }
+  hostSlice.deltas = encoded.encoding == FusedForEncoding::kDeltas;
+  stream.sync();
+  bytes_ += payloadBytes(hostSlice.values) +
+      (hostSlice.keys.has_value() ? payloadBytes(*hostSlice.keys) : 0);
+  slices_.push_back(std::move(hostSlice));
+}
+
 bool FusedForScanCache::insert(
     std::string_view file,
     std::string_view name,
-    cudf::column_view column,
-    cuda::stream_ref stream,
-    rmm::device_async_resource_ref tempMr) {
+    ColumnSlices&& column,
+    cuda::stream_ref stream) {
   auto entryKey = key(file, name);
-  {
-    std::shared_lock lock(mutex_);
-    if (entries_.contains(entryKey)) {
-      return true;
-    }
-    if (uncacheable_.contains(entryKey)) {
-      return false;
-    }
-  }
-  if (full_.load(std::memory_order_relaxed)) {
-    return false;
-  }
-
-  // Rows at which slices start, when the column takes more than one.
-  std::vector<cudf::size_type> sliceStarts;
-  const auto rowsPerSlice = sliceRows();
-  if (column.size() > rowsPerSlice) {
-    for (cudf::size_type start = 0; start < column.size();
-         start += std::min(rowsPerSlice, column.size() - start)) {
-      sliceStarts.push_back(start);
-    }
-  }
-  auto encodedColumn = encodeForFusedFor(column, sliceStarts, stream, tempMr);
-  if (!encodedColumn.packedValues.has_value()) {
-    // A string column with many distinct values: fused FOR would not compress
-    // it.
-    std::unique_lock lock(mutex_);
+  std::unique_lock lock(mutex_);
+  if (!column.cacheable()) {
     uncacheable_.insert(std::move(entryKey));
     return false;
   }
-  // The encoding is chosen on the whole column; with several slices, the
-  // encoded values are packed again, one payload per slice.
-  std::vector<cudf::detail::fused_for_packed_columns> values;
-  if (sliceStarts.size() > 1) {
-    const auto source = encodedColumn.encoded != nullptr
-        ? encodedColumn.encoded->view()
-        : withoutEmptyNullMask(column);
-    cudf::detail::fused_for_options options;
-    options.layout = cudf::detail::fused_for_layout::bitpacked;
-    values = cudf::detail::contiguous_split_fused_for(
-        cudf::table_view{{source}},
-        std::vector<cudf::size_type>(sliceStarts.begin() + 1, sliceStarts.end()),
-        stream,
-        tempMr,
-        options);
-  } else {
-    values.push_back(std::move(*encodedColumn.packedValues));
-  }
-  auto& keys = encodedColumn.packedKeys;
-  const bool deltas = encodedColumn.encoding == FusedForEncoding::kDeltas;
-  const auto payloadBytes =
-      [](const cudf::detail::fused_for_packed_columns& packed) {
-        return packed.wire_data->size() + packed.metadata->size();
-      };
-  auto bytes = keys.has_value() ? payloadBytes(*keys) : 0;
-  for (const auto& slice : values) {
-    bytes += payloadBytes(slice);
-  }
-
-  std::unique_lock lock(mutex_);
   if (entries_.contains(entryKey)) {
     return true;
   }
-  if (usedBytes_.load(std::memory_order_relaxed) + bytes >
+  if (usedBytes_.load(std::memory_order_relaxed) + column.bytes() >
       capacity_.load(std::memory_order_relaxed)) {
     full_.store(true, std::memory_order_relaxed);
     return false;
   }
   Entry entry;
-  entry.values.reserve(values.size());
-  for (auto& slice : values) {
-    entry.values.push_back(store(std::move(slice), stream));
-  }
-  if (keys.has_value()) {
-    entry.keys = store(std::move(*keys), stream);
-  }
-  entry.deltas = deltas;
-  if (deltas && sliceStarts.size() > 1) {
-    entry.sliceBases = std::move(encodedColumn.segmentBases);
+  entry.slices.reserve(column.slices().size());
+  for (auto& hostSlice : column.slices()) {
+    Slice slice;
+    slice.values = store(std::move(hostSlice.values), stream);
+    if (hostSlice.keys.has_value()) {
+      slice.keys = store(std::move(*hostSlice.keys), stream);
+    }
+    slice.deltas = hostSlice.deltas;
+    entry.slices.push_back(std::move(slice));
   }
   stream.sync();
   entries_.emplace(std::move(entryKey), std::move(entry));
-  usedBytes_.fetch_add(bytes, std::memory_order_relaxed);
+  usedBytes_.fetch_add(column.bytes(), std::memory_order_relaxed);
   return true;
 }
 
 FusedForScanCache::Payload FusedForScanCache::store(
-    cudf::detail::fused_for_packed_columns&& packed,
+    ColumnSlices::HostPayload&& hostPayload,
     cuda::stream_ref stream) {
   Payload payload;
-  payload.wireBytes = packed.wire_data->size();
+  payload.wireBytes = hostPayload.wire.size();
   void* host = allocatePinned(payload.wireBytes);
-  auto status = cudaMemcpyAsync(
-      host,
-      packed.wire_data->data(),
-      payload.wireBytes,
-      cudaMemcpyDeviceToHost,
-      stream.get());
-  VELOX_CHECK(status == cudaSuccess, "{}", cudaGetErrorString(status));
+  std::memcpy(host, hostPayload.wire.data(), payload.wireBytes);
   payload.wire = host;
   // The host copy stays, so that releasing the device copy needs no copy back.
   if (void* device = allocateDevice(payload.wireBytes)) {
-    status = cudaMemcpyAsync(
+    const auto status = cudaMemcpyAsync(
         device,
-        packed.wire_data->data(),
+        host,
         payload.wireBytes,
-        cudaMemcpyDeviceToDevice,
+        cudaMemcpyHostToDevice,
         stream.get());
     VELOX_CHECK(status == cudaSuccess, "{}", cudaGetErrorString(status));
     payload.deviceWire = device;
   }
-  payload.metadata = std::move(*packed.metadata);
-  payload.segmentCount = packed.segment_count;
-  payload.logicalDataSize = packed.logical_data_size;
-  // The device buffer is released on 'stream' after the copies above.
-  packed.wire_data.reset();
+  payload.metadata = std::move(hostPayload.metadata);
+  payload.segmentCount = hostPayload.segmentCount;
+  payload.logicalDataSize = hostPayload.logicalDataSize;
   return payload;
 }
 
@@ -393,25 +387,25 @@ FusedForScanCache::DecodedColumn FusedForScanCache::decode(
     entry = &it->second;
   }
 
-  VELOX_CHECK_LT(slice, entry->values.size(), "No such slice of {}", name);
-  auto [values, valuesView] =
-      decodePayload(entry->values[slice], stream, tempMr);
-  if (entry->deltas) {
+  VELOX_CHECK_LT(slice, entry->slices.size(), "No such slice of {}", name);
+  const auto& cached = entry->slices[slice];
+  auto [values, valuesView] = decodePayload(cached.values, stream, tempMr);
+  if (cached.deltas) {
     auto column = decodeFusedForEncoding(
         FusedForEncoding::kDeltas,
         valuesView,
         std::nullopt,
-        entry->sliceBases.empty() ? 0 : entry->sliceBases[slice],
+        0,
         stream,
         mr,
         tempMr);
     const auto view = column->view();
     return DecodedColumn{{}, std::move(column), view};
   }
-  if (!entry->keys.has_value()) {
+  if (!cached.keys.has_value()) {
     return DecodedColumn{std::move(values), nullptr, valuesView};
   }
-  const auto [keys, keysView] = decodePayload(*entry->keys, stream, tempMr);
+  const auto [keys, keysView] = decodePayload(*cached.keys, stream, tempMr);
   auto column = decodeFusedForEncoding(
       FusedForEncoding::kDictionary, valuesView, keysView, 0, stream, mr, tempMr);
   const auto view = column->view();
@@ -466,11 +460,11 @@ bool FusedForScanCache::releaseDeviceBlocks(std::size_t bytes) {
       }
     };
     for (auto& [name, entry] : entries_) {
-      for (auto& slice : entry.values) {
-        dropIfInBlock(slice);
-      }
-      if (entry.keys.has_value()) {
-        dropIfInBlock(*entry.keys);
+      for (auto& slice : entry.slices) {
+        dropIfInBlock(slice.values);
+        if (slice.keys.has_value()) {
+          dropIfInBlock(*slice.keys);
+        }
       }
     }
     // Copies from the block were enqueued under the lock: wait for them.

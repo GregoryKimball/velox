@@ -630,19 +630,36 @@ void CudfSplitReader::fillFusedForCache() {
           .case_sensitive_names(not caseInsensitiveColumnNames_)
           .build();
   const auto tempMr = get_temp_mr();
-  auto result = cudf::io::read_parquet(options, stream_, tempMr);
+  // The file is read and encoded one slice at a time, so that filling takes
+  // device memory for a slice: the reads of a file that does not fit would
+  // otherwise fail every time and never fill the cache. The split covers the
+  // whole file (fusedForCacheEligible()).
+  const auto numFileRows = static_cast<int64_t>(splitRowCount_);
+  const int64_t rowsPerSlice = FusedForScanCache::sliceRows();
+  std::vector<FusedForScanCache::ColumnSlices> columns(readColumnNames_.size());
+  int64_t numSlices = 0;
+  for (int64_t sliceBegin = 0; numSlices == 0 or sliceBegin < numFileRows;
+       sliceBegin += rowsPerSlice, ++numSlices) {
+    if (numFileRows > rowsPerSlice) {
+      options.set_skip_rows(sliceBegin);
+      options.set_num_rows(static_cast<cudf::size_type>(
+          std::min(rowsPerSlice, numFileRows - sliceBegin)));
+    }
+    auto result = cudf::io::read_parquet(options, stream_, tempMr);
+    for (size_t i = 0; i < columns.size(); ++i) {
+      columns[i].add(result.tbl->view().column(i), stream_, tempMr);
+    }
+  }
   auto& cache = FusedForScanCache::instance();
   // A column that is not cacheable does not keep the others out.
-  for (size_t i = 0; i < readColumnNames_.size(); ++i) {
+  for (size_t i = 0; i < columns.size(); ++i) {
     cache.insert(
-        split_->filePath,
-        readColumnNames_[i],
-        result.tbl->view().column(i),
-        stream_,
-        tempMr);
+        split_->filePath, readColumnNames_[i], std::move(columns[i]), stream_);
   }
   if (ioStats_) {
     ioStats_->addCounter("cudfFusedForCacheFills", RuntimeCounter(1));
+    ioStats_->addCounter(
+        "cudfFusedForCacheFillSlices", RuntimeCounter(numSlices));
   }
   nvtxRangePop();
 }

@@ -731,8 +731,8 @@ TEST_F(TableScanTest, directBufferInputRawInputBytes) {
 }
 
 TEST_F(TableScanTest, fusedForScanCacheReadsSlices) {
-  // A file of three slices: differences restart in each slice, dictionary
-  // keys are shared by all of them.
+  // A file of three slices, each read from Parquet and encoded on its own:
+  // differences restart in each slice, each slice has its own dictionary.
   constexpr vector_size_t kNumRows = 2'000;
   constexpr cudf::size_type kSliceRows = 700;
   auto vectors = {makeRowVector(
@@ -779,9 +779,10 @@ TEST_F(TableScanTest, fusedForScanCacheReadsSlices) {
                     .assertResults(sql);
     return getTableScanRuntimeStats(task);
   };
-  // The first scan reads Parquet and fills the cache.
+  // The first scan fills the cache one slice at a time.
   auto stats = scan({}, "SELECT * FROM tmp");
   ASSERT_EQ(stats.at("cudfFusedForCacheFills").sum, 1);
+  EXPECT_EQ(stats.at("cudfFusedForCacheFillSlices").sum, 3);
   // Later scans decode one slice per chunk.
   stats = scan({}, "SELECT * FROM tmp");
   EXPECT_EQ(stats.count("cudfFusedForCacheFills"), 0);

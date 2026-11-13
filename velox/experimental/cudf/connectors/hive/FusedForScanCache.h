@@ -39,8 +39,9 @@ namespace facebook::velox::cudf_velox::connector::hive {
 
 /// Process-wide warm cache of Parquet file columns re-encoded with cuDF's
 /// fused frame-of-reference codec (the exchange's fused-for-bitpacked layout)
-/// and held in pinned host memory. A column is filled once per file from a
-/// full, unfiltered read and then served by copying its encoded bytes to the
+/// and held in pinned host memory. A column is filled once per file from
+/// unfiltered reads of the whole file, one slice of rows at a time, each slice
+/// encoded on its own, and then served by copying its encoded bytes to the
 /// device and decoding them, in place of fetching, decompressing and decoding
 /// the Parquet column chunks. String columns with few distinct values are
 /// stored as frame-of-reference coded dictionary indices plus their keys and
@@ -83,15 +84,66 @@ class FusedForScanCache {
   bool mayCache(std::string_view file, const std::vector<std::string>& columns)
       const;
 
-  /// Encodes 'column' and caches it as column 'name' of 'file'. Returns false
-  /// when the column is not cacheable or the cache is full. A column that is
-  /// already cached is kept.
+  /// A column of a file encoded one slice at a time into host memory, so that
+  /// filling the cache takes device memory for one slice rather than for the
+  /// file. insert() adds it to the cache.
+  class ColumnSlices {
+   public:
+    /// One fused FOR payload in host memory: the packed-table metadata and
+    /// the encoded bytes.
+    struct HostPayload {
+      std::vector<uint8_t> metadata;
+      std::vector<uint8_t> wire;
+      std::size_t segmentCount{0};
+      std::size_t logicalDataSize{0};
+    };
+
+    /// One slice: the values, the indices of a dictionary and its keys, or
+    /// the differences between consecutive values ('deltas').
+    struct HostSlice {
+      HostPayload values;
+      std::optional<HostPayload> keys;
+      bool deltas{false};
+    };
+
+    /// Encodes 'slice', the next rows of the column, on its own (see
+    /// encodeForFusedFor()) and keeps the result in host memory. Does nothing
+    /// once the column is not cacheable.
+    void add(
+        cudf::column_view slice,
+        cuda::stream_ref stream,
+        rmm::device_async_resource_ref tempMr);
+
+    /// Returns false once a slice was a string column with too many distinct
+    /// values for fused FOR to compress.
+    bool cacheable() const {
+      return cacheable_;
+    }
+
+    /// Returns the encoded slices in row order.
+    std::vector<HostSlice>& slices() {
+      return slices_;
+    }
+
+    /// Returns the encoded bytes of all slices.
+    std::size_t bytes() const {
+      return bytes_;
+    }
+
+   private:
+    std::vector<HostSlice> slices_;
+    std::size_t bytes_{0};
+    bool cacheable_{true};
+  };
+
+  /// Caches 'column' as column 'name' of 'file'. Returns false when the column
+  /// is not cacheable or the cache is full. A column that is already cached is
+  /// kept.
   bool insert(
       std::string_view file,
       std::string_view name,
-      cudf::column_view column,
-      cuda::stream_ref stream,
-      rmm::device_async_resource_ref tempMr);
+      ColumnSlices&& column,
+      cuda::stream_ref stream);
 
   /// Returns about how many device bytes decoding one slice of 'columns' of
   /// 'file' takes: each column's decoded size over its slices, which for a
@@ -147,15 +199,18 @@ class FusedForScanCache {
     std::size_t logicalDataSize{0};
   };
 
-  // A column, the indices of a dictionary-encoded column and its keys, or the
-  // differences between consecutive values of a column ('deltas'), in slices
-  // of sliceRows() rows packed one per payload. The keys are packed whole.
-  struct Entry {
-    std::vector<Payload> values;
+  // A slice of a column, encoded on its own: the values, the indices of a
+  // dictionary and its keys, or the differences between consecutive values
+  // ('deltas'), each packed in one payload.
+  struct Slice {
+    Payload values;
     std::optional<Payload> keys;
     bool deltas{false};
-    // For differences in several slices, the value each slice starts from.
-    std::vector<int64_t> sliceBases;
+  };
+
+  // A column in slices of sliceRows() rows (the last may be shorter).
+  struct Entry {
+    std::vector<Slice> slices;
   };
 
   static std::string key(std::string_view file, std::string_view name);
@@ -174,9 +229,7 @@ class FusedForScanCache {
 
   // Copies an encoded payload to pinned memory and, while the device capacity
   // allows, to device memory. Called with 'mutex_' held exclusively.
-  Payload store(
-      cudf::detail::fused_for_packed_columns&& packed,
-      cuda::stream_ref stream);
+  Payload store(ColumnSlices::HostPayload&& payload, cuda::stream_ref stream);
 
   // Returns pinned host memory for 'bytes', from the current block or a new
   // one. Called with 'mutex_' held exclusively.
