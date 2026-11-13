@@ -42,6 +42,7 @@
 #include <sstream>
 #include <utility>
 #include <vector>
+#include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/memory/MemoryPool.h"
 #include "velox/core/QueryConfig.h"
 #include "velox/exec/ExchangeTransportRegistry.h"
@@ -58,6 +59,7 @@
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
+#include "velox/experimental/ucx-exchange/ExchangeCompressionWire.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 #include "velox/experimental/ucx-exchange/UcxPartitionedOutput.h"
@@ -1363,6 +1365,83 @@ TEST_F(UcxExchangeFocusedTest, intraNodeTaskRemovalLivelock) {
            << "IntraNodeTransferRegistry for cancelled task";
   }
   // If we get here, the source correctly detected the cancelled task.
+}
+
+// Restoring a received payload can fail, for instance when decoding compressed
+// data runs out of device memory. Both receive paths restore on the
+// Communicator thread, so the failure must reach the consuming operator as an
+// error instead of escaping that thread and terminating the process. A payload
+// whose compression header is cut short fails to restore the same way.
+TEST_F(UcxExchangeFocusedTest, unrestorablePayloadFailsTheConsumer) {
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const bool origIntraNode = config.intraNodeExchange;
+  SCOPE_EXIT {
+    config.intraNodeExchange = origIntraNode;
+  };
+  for (const bool intraNode : {true, false}) {
+    SCOPED_TRACE(intraNode ? "intra-node" : "remote");
+    config.intraNodeExchange = intraNode;
+    const std::string taskPrefix = getUniqueTaskPrefix();
+    const std::string srcTaskId = taskPrefix + "unrestorableSrc";
+    const auto rowType = UcxTestData::kTestRowType;
+
+    auto srcTask = createSourceTask(srcTaskId, pool_, rowType);
+    queueManager()->initializeTask(
+        srcTask,
+        core::PartitionedOutputNode::Kind::kPartitioned,
+        /*numPartitions=*/1,
+        /*numDrivers=*/1);
+    auto metadata = wrapExchangePayloadMetadata(
+        std::make_unique<std::vector<uint8_t>>(),
+        ExchangePayloadCodec::kCascaded,
+        /*logicalDataSize=*/8,
+        /*auxiliaryCount=*/0);
+    metadata->pop_back();
+    auto stream = cuda::stream_ref{cudaStream_t{cudaStreamDefault}};
+    auto data = std::make_unique<rmm::device_buffer>(8, stream);
+    stream.sync();
+    queueManager()->enqueue(
+        srcTaskId,
+        /*destination=*/0,
+        std::make_unique<cudf::packed_columns>(
+            std::move(metadata), std::move(data)),
+        /*numRows=*/1);
+    queueManager()->noMoreData(srcTaskId);
+
+    core::PlanNodeId exchangeNodeId;
+    auto sinkTask = createExchangeTask(
+        taskPrefix + "unrestorableSink",
+        rowType,
+        /*partitionId=*/0,
+        exchangeNodeId);
+    auto exchangeClient = std::make_shared<UcxExchangeClient>(
+        sinkTask->taskId(), sinkTask->destination(), /*numberOfConsumers=*/1);
+    auto split = remoteSplit(srcTaskId, /*partitionId=*/0);
+    exchangeClient->addRemoteTaskId(
+        std::dynamic_pointer_cast<exec::RemoteConnectorSplit>(
+            split.connectorSplit)
+            ->taskId);
+    exchangeClient->noMoreRemoteTasks();
+    auto driverCtx = std::make_shared<DriverCtx>(
+        sinkTask, 0, /*pipelineId=*/0, kUngroupedGroupId, /*partition=*/0);
+    UcxExchange exchange(
+        0, driverCtx.get(), sinkTask->planFragment().planNode, exchangeClient);
+
+    const auto drain = [&]() {
+      while (!exchange.isFinished()) {
+        ContinueFuture future;
+        if (exchange.isBlocked(&future) != BlockingReason::kNotBlocked) {
+          future.wait();
+          continue;
+        }
+        exchange.getOutput();
+      }
+    };
+    VELOX_ASSERT_THROW(
+        drain(), "Truncated exchange compression metadata envelope");
+    exchange.close();
+    queueManager()->removeTask(srcTaskId);
+  }
 }
 
 // Regression test for broadcast + intra-node SIGSEGV.

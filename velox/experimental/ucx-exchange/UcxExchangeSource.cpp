@@ -629,16 +629,38 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
 
     // Reconstruct the table on the stream used for the receive. Retain the
     // producer's row count because a table with no columns cannot report it.
-    auto data = restoreExchangePayload(
+    auto data = restoreOrFail(
         std::move(ptr->metadata.cudfMetadata),
         std::move(ptr->dataBuf),
         ptr->stream,
         ptr->metadata.numRows);
-
-    enqueue(std::move(data));
-    setStateIf(ReceiverState::WaitingForData, ReceiverState::ReadyToReceive);
+    if (data) {
+      enqueue(std::move(data));
+      setStateIf(ReceiverState::WaitingForData, ReceiverState::ReadyToReceive);
+    }
   }
   communicator_->addToWorkQueue(getSelfPtr());
+}
+
+PackedTableWithStreamPtr UcxExchangeSource::restoreOrFail(
+    std::unique_ptr<std::vector<uint8_t>> metadata,
+    std::unique_ptr<rmm::device_buffer> data,
+    cuda::stream_ref stream,
+    vector_size_t numRows) {
+  try {
+    return restoreExchangePayload(
+        std::move(metadata), std::move(data), stream, numRows);
+  } catch (const std::exception& e) {
+    const auto errorMsg = fmt::format(
+        "Failed to restore exchange data from task {}: {}",
+        partitionKey_.toString(),
+        e.what());
+    VLOG(0) << toString() << " " << errorMsg;
+    queue_->setError(errorMsg);
+    deliverEndMarker();
+    setState(ReceiverState::Done);
+    return nullptr;
+  }
 }
 
 void UcxExchangeSource::receiveHandshakeResponse() {
@@ -794,11 +816,15 @@ void UcxExchangeSource::onIntraNodeData(
   // so the received data is ready. The inter-node receive path likewise keeps
   // its receive stream with the table.
   auto consumerStream = cudf_velox::cudfGlobalStreamPool().get_stream();
-  auto tableWithStream = restoreExchangePayload(
+  auto tableWithStream = restoreOrFail(
       std::move(data->metadata),
       std::move(data->gpu_data),
       consumerStream,
       numRows);
+  if (!tableWithStream) {
+    communicator_->addToWorkQueue(getSelfPtr());
+    return;
+  }
 
   enqueue(std::move(tableWithStream));
 

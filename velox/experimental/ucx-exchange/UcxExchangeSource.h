@@ -228,6 +228,16 @@ class UcxExchangeSource
       vector_size_t numRows,
       bool atEnd);
 
+  // Restores a received payload (restoreExchangePayload()). Both receive paths
+  // run on the Communicator thread, where an exception would terminate the
+  // process, so a failure (a decode that runs out of device memory, for one)
+  // fails the queue and ends this source instead, and returns nullptr.
+  PackedTableWithStreamPtr restoreOrFail(
+      std::unique_ptr<std::vector<uint8_t>> metadata,
+      std::unique_ptr<rmm::device_buffer> data,
+      cuda::stream_ref stream,
+      vector_size_t numRows);
+
   /// @brief Sets the new state of this exchange source using
   /// sequential consistency. Logs transitions at VLOG(2).
   /// @param newState the new state of the UcxExchangeSource.
