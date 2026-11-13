@@ -21,6 +21,7 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <folly/ScopeGuard.h>
+#include <folly/executors/CPUThreadPoolExecutor.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <rmm/device_buffer.hpp>
@@ -30,6 +31,7 @@
 #include <vector>
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/memory/MemoryPool.h"
+#include "velox/connectors/hive/HiveConnector.h"
 #include "velox/core/QueryConfig.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/OutputTransportRegistry.h"
@@ -596,6 +598,68 @@ TEST_F(UcxPartitionedOutputTest, replicatesNullsAcrossPartitionKeys) {
   }
   EXPECT_EQ(
       totalRows, kNumPartitions * kNumNullRows + (kNumRows - kNumNullRows));
+}
+
+// A Hive partition function (a materialized exchange, or one aligned with a
+// bucketed table) sends each row to the partition of its bucket, as the CPU
+// operator does: the bucket is the Hive hash of the key, which for an INTEGER
+// is the value itself, modulo the bucket count. Every row of a bucket must
+// reach the one task that writes or reads that bucket.
+TEST_F(UcxPartitionedOutputTest, routesRowsByHiveBucket) {
+  cuda::stream_ref stream{cudaStream_t{cudaStreamDefault}};
+  constexpr int kNumBuckets = 6;
+  const std::vector<int> bucketToPartition{2, 0, 1, 2, 0, 1};
+  const std::vector<int32_t> keyValues{7, 8, 9, 10, 11, 13};
+
+  // A template task, whose node gets the Hive spec; its own id keeps the
+  // memory pools of the two tasks apart.
+  auto hashTask = createPartitionedOutputTask(
+      taskId_ + "-template",
+      pool_,
+      UcxTestData::kTestRowType,
+      kNumPartitions,
+      {"c0"});
+  auto hashNode = std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
+      hashTask->planFragment().planNode);
+  auto hiveNode =
+      core::PartitionedOutputNode::Builder(*hashNode)
+          .partitionFunctionSpec(
+              std::make_shared<connector::hive::HivePartitionFunctionSpec>(
+                  kNumBuckets,
+                  bucketToPartition,
+                  std::vector<column_index_t>{0},
+                  std::vector<VectorPtr>{}))
+          .build();
+  // The template's query context points at an executor its helper owned.
+  auto executor = std::make_shared<folly::CPUThreadPoolExecutor>(1);
+  auto task = Task::create(
+      taskId_,
+      core::PlanFragment{hiveNode},
+      0,
+      core::QueryCtx::create(
+          executor.get(),
+          core::QueryConfig(
+              {{core::QueryConfig::kMaxOutputBufferSize,
+                std::to_string(FOUR_GBYTES)}})),
+      Task::ExecutionMode::kParallel);
+  queueManager_->initializeTask(
+      task,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      kNumPartitions,
+      /*numDrivers=*/1);
+
+  runPartitionedOutput(task, makeKeyColumn(keyValues, {}, stream), stream);
+
+  std::vector<std::vector<int32_t>> expected(kNumPartitions);
+  for (const auto key : keyValues) {
+    expected[bucketToPartition[key % kNumBuckets]].push_back(key);
+  }
+  for (int destination = 0; destination < kNumPartitions; ++destination) {
+    auto keys = drainKeyColumn(destination);
+    std::sort(keys.begin(), keys.end());
+    EXPECT_THAT(keys, testing::ElementsAreArray(expected[destination]))
+        << "destination " << destination;
+  }
 }
 
 // Negative control for the replication tests: with the flag off, the operator

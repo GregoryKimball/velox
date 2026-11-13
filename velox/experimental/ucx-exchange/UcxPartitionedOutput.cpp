@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <iterator>
 #include <limits>
+#include "velox/connectors/hive/HiveConnector.h"
 #include "velox/core/PlanNode.h"
 #include "velox/core/QueryConfig.h"
 #include "velox/exec/Driver.h"
@@ -26,6 +27,7 @@
 #include "velox/experimental/cudf/exec/GpuCapabilities.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 #include "velox/experimental/ucx-exchange/ExchangeCompression.h"
 #include "velox/vector/VectorStream.h"
@@ -49,6 +51,46 @@ using facebook::velox::exec::Task;
 namespace facebook::velox::ucx_exchange {
 
 namespace {
+
+// The GPU form of a Hive partition function for 'node': the bucket count, the
+// bucket-to-partition map, which HivePartitionFunctionSpec::create() fills as
+// bucket % partitions for a remote exchange when the spec has none, and the key
+// channels of the node's input located in its output, which is what the
+// operator partitions.
+CudfHivePartitionFunction makeHivePartitionFunction(
+    const connector::hive::HivePartitionFunctionSpec& spec,
+    const core::PartitionedOutputNode& node) {
+  const auto serialized = spec.serialize();
+  VELOX_CHECK(
+      serialized["constants"].empty(),
+      "Hive bucketing on constant keys is not supported on the GPU");
+  const auto numBuckets = static_cast<int>(serialized["numBuckets"].asInt());
+  auto bucketToPartition = ISerializable::deserialize<std::vector<int>>(
+      serialized["bucketToPartition"]);
+  if (bucketToPartition.empty()) {
+    for (int bucket = 0; bucket < numBuckets; ++bucket) {
+      bucketToPartition.push_back(bucket % node.numPartitions());
+    }
+  }
+  const auto& inputType = node.inputType();
+  const auto& outputType = node.outputType();
+  std::vector<cudf::size_type> keyColumns;
+  for (const auto channel :
+       ISerializable::deserialize<std::vector<column_index_t>>(
+           serialized["keys"])) {
+    const auto& name = inputType->nameOf(channel);
+    const auto column = outputType->getChildIdx(name);
+    VELOX_CHECK(
+        CudfHivePartitionFunction::supports(
+            veloxToCudfDataType(outputType->childAt(column))),
+        "The GPU cannot compute the Hive bucket of key {} of type {}",
+        name,
+        outputType->childAt(column)->toString());
+    keyColumns.push_back(static_cast<cudf::size_type>(column));
+  }
+  return CudfHivePartitionFunction(
+      numBuckets, std::move(bucketToPartition), std::move(keyColumns));
+}
 
 // A flush holds its inputs, their concatenation and its partitions at once, in
 // every driver of every partitioned output; the same share as a cuDF batch
@@ -369,6 +411,12 @@ void UcxPartitionedOutput::initPartitionKeys(
 
   // Get partition function specification string
   spec_ = planNode->partitionFunctionSpec().toString();
+  if (const auto* hive =
+          dynamic_cast<const connector::hive::HivePartitionFunctionSpec*>(
+              planNode->partitionFunctionSpecPtr().get())) {
+    hivePartitionFunction_.emplace(makeHivePartitionFunction(*hive, *planNode));
+    return;
+  }
 
   // Only parse keys if it's a hash function
   if (spec_.find("HASH(") != std::string::npos) {
@@ -415,7 +463,9 @@ void UcxPartitionedOutput::partitionAndEnqueue(
     equalPartitionRowCountOnly(tableView, numRows, stream);
     return;
   }
-  if (partitionKeyIndices_.size() > 0 || spec_ == "gather") {
+  if (hivePartitionFunction_.has_value()) {
+    hivePartition(tableView, stream);
+  } else if (partitionKeyIndices_.size() > 0 || spec_ == "gather") {
     hashPartition(tableView, stream);
   } else {
     equalPartition(tableView, stream);
@@ -623,6 +673,23 @@ void UcxPartitionedOutput::hashPartition(
   VELOX_CHECK_EQ(partitionOffsets[0], 0);
 
   // Erase first element since it's always 0 and we don't need it.
+  partitionOffsets.erase(partitionOffsets.begin());
+  partitionOffsets.pop_back();
+
+  splitAndEnqueue(partitionedTable->view(), partitionOffsets, stream);
+}
+
+void UcxPartitionedOutput::hivePartition(
+    cudf::table_view tableView,
+    cuda::stream_ref stream) {
+  auto partitionMap =
+      hivePartitionFunction_->partitions(tableView, stream, get_temp_mr());
+  auto [partitionedTable, partitionOffsets] = cudf::partition(
+      tableView, partitionMap->view(), numPartitions_, stream, get_temp_mr());
+
+  VELOX_CHECK_EQ(partitionOffsets.size(), numPartitions_ + 1);
+  VELOX_CHECK_EQ(partitionOffsets[0], 0);
+  // splitAndEnqueue() takes the boundaries between partitions.
   partitionOffsets.erase(partitionOffsets.begin());
   partitionOffsets.pop_back();
 

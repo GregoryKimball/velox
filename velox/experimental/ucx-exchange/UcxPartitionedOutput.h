@@ -16,10 +16,12 @@
 #pragma once
 
 #include "velox/exec/Operator.h"
+#include "velox/experimental/cudf/exec/CudfHivePartitionFunction.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 
+#include <optional>
 #include <cuda/stream>
 
 namespace facebook::velox::ucx_exchange {
@@ -89,6 +91,10 @@ class UcxPartitionedOutput : public exec::Operator,
   // function using the given stream.
   void hashPartition(cudf::table_view tableView, cuda::stream_ref stream);
 
+  // Sends each row to the partition of its Hive bucket
+  // (hivePartitionFunction_).
+  void hivePartition(cudf::table_view tableView, cuda::stream_ref stream);
+
   // Splits the cudf table view into equal sizes. This is used when
   // RoundRobin partitioning is requested but round robin on a
   // row-by-row basis is not meaningful for UCX exchange.
@@ -148,6 +154,10 @@ class UcxPartitionedOutput : public exec::Operator,
 
   const std::weak_ptr<UcxOutputQueueManager> queueManager_;
   std::vector<column_index_t> partitionKeyIndices_;
+  // Set when the plan partitions by Hive buckets (a materialized exchange, or
+  // one aligned with a bucketed table): rows must reach the task that owns
+  // their bucket, as the CPU operator sends them.
+  std::optional<cudf_velox::CudfHivePartitionFunction> hivePartitionFunction_;
   const size_t numPartitions_;
 
   // True when rows with a null partition key, plus one arbitrary row, must
