@@ -518,9 +518,10 @@ std::optional<CudfSplitReader::TableChunk> CudfSplitReader::readNextChunk() {
 }
 
 void CudfSplitReader::startColumnChunkFetch() {
-  // Return if the split is served from the fused FOR scan cache, there's no
-  // passes, or the fetch is already started or the chunking is already setup.
-  if (fusedForCacheHit_ or passState_ == nullptr or
+  // Return if the split is read from the fused FOR scan cache (after filling
+  // it, which reads the file itself), there's no passes, or the fetch is
+  // already started or the chunking is already setup.
+  if (fusedForCacheHit_ or fusedForCacheRead_ or passState_ == nullptr or
       passState_->currentPass >= passState_->passes.size() or
       passState_->fetch.pending.valid() or passState_->isChunkingSetup) {
     return;
@@ -592,6 +593,11 @@ void CudfSplitReader::setupFirstPassChunking() {
     }
     return;
   }
+  if (fusedForCacheRead_) {
+    // The split fills the cache when read; Parquet is read only if the fill
+    // does not cache it.
+    return;
+  }
   setupChunkingForCurrentPass(determineCudfMemoryResource());
 }
 
@@ -611,6 +617,28 @@ bool CudfSplitReader::fusedForCacheEligible() const {
   }
   return true;
 }
+
+namespace {
+
+// A Parquet read without a configured limit keeps each pass of fetched and
+// decompressed column chunks within 1/kPassShare of the device memory
+// available to the process, and each table it returns within 1/kChunkShare,
+// so that a file too large for a small device is read in pieces. With ample
+// memory the limits exceed the files and reads stay whole.
+constexpr int64_t kPassShare = 16;
+constexpr int64_t kChunkShare = 32;
+
+// Returns 'configured', or when it is 0 (no limit), 1/'share' of the device
+// memory available to the process; 0 when that is unknown.
+std::size_t limitOrShareOfDevice(std::size_t configured, int64_t share) {
+  if (configured > 0) {
+    return configured;
+  }
+  const auto available = gpuCapabilities().availableMemoryBytes;
+  return available > 0 ? static_cast<std::size_t>(available / share) : 0;
+}
+
+} // namespace
 
 void CudfSplitReader::fillFusedForCache() {
   nvtxRangePush("fillFusedForCache");
@@ -636,18 +664,38 @@ void CudfSplitReader::fillFusedForCache() {
   // whole file (fusedForCacheEligible()).
   const auto numFileRows = static_cast<int64_t>(splitRowCount_);
   const int64_t rowsPerSlice = FusedForScanCache::sliceRows();
+  const auto passLimit = limitOrShareOfDevice(
+      cudfHiveConfig_->maxPassReadLimitSession(sessionProperties), kPassShare);
   std::vector<FusedForScanCache::ColumnSlices> columns(readColumnNames_.size());
   int64_t numSlices = 0;
   for (int64_t sliceBegin = 0; numSlices == 0 or sliceBegin < numFileRows;
        sliceBegin += rowsPerSlice, ++numSlices) {
     if (numFileRows > rowsPerSlice) {
       options.set_skip_rows(sliceBegin);
-      options.set_num_rows(static_cast<cudf::size_type>(
-          std::min(rowsPerSlice, numFileRows - sliceBegin)));
+      options.set_num_rows(std::min(rowsPerSlice, numFileRows - sliceBegin));
     }
-    auto result = cudf::io::read_parquet(options, stream_, tempMr);
+    // A row group longer than the slice is decompressed in pieces too, as
+    // for a Parquet read.
+    cudf::io::chunked_parquet_reader reader(
+        0, passLimit, options, stream_, tempMr);
+    std::vector<std::unique_ptr<cudf::table>> pieces;
+    do {
+      pieces.push_back(reader.read_chunk().tbl);
+    } while (reader.has_next());
+    std::unique_ptr<cudf::table> slice;
+    if (pieces.size() == 1) {
+      slice = std::move(pieces.front());
+    } else {
+      std::vector<cudf::table_view> views;
+      views.reserve(pieces.size());
+      for (const auto& piece : pieces) {
+        views.push_back(piece->view());
+      }
+      slice = cudf::concatenate(views, stream_, tempMr);
+    }
+    pieces.clear();
     for (size_t i = 0; i < columns.size(); ++i) {
-      columns[i].add(result.tbl->view().column(i), stream_, tempMr);
+      columns[i].add(slice->view().column(i), stream_, tempMr);
     }
   }
   auto& cache = FusedForScanCache::instance();
@@ -1043,28 +1091,6 @@ void CudfSplitReader::fileMetaDatas() {
     hasSplitSpecificPushdownFilter_ = true;
   }
 }
-
-namespace {
-
-// A Parquet read without a configured limit keeps each pass of fetched and
-// decompressed column chunks within 1/kPassShare of the device memory
-// available to the process, and each table it returns within 1/kChunkShare,
-// so that a file too large for a small device is read in pieces. With ample
-// memory the limits exceed the files and reads stay whole.
-constexpr int64_t kPassShare = 16;
-constexpr int64_t kChunkShare = 32;
-
-// Returns 'configured', or when it is 0 (no limit), 1/'share' of the device
-// memory available to the process; 0 when that is unknown.
-std::size_t limitOrShareOfDevice(std::size_t configured, int64_t share) {
-  if (configured > 0) {
-    return configured;
-  }
-  const auto available = gpuCapabilities().availableMemoryBytes;
-  return available > 0 ? static_cast<std::size_t>(available / share) : 0;
-}
-
-} // namespace
 
 void CudfSplitReader::createCudfReader() {
   // Read file metadatas

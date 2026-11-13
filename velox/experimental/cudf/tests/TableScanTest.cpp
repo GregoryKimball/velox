@@ -20,6 +20,7 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSource.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveTableHandle.h"
 #include "velox/experimental/cudf/connectors/hive/FusedForScanCache.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/expression/SubfieldFiltersToAst.h"
 #include "velox/experimental/cudf/tests/utils/CudfHiveConnectorTestBase.h"
 
@@ -50,6 +51,7 @@
 #include "velox/type/tests/SubfieldFiltersBuilder.h"
 
 #include <cudf/io/parquet.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <fmt/ranges.h>
 #include <folly/ScopeGuard.h>
@@ -798,6 +800,94 @@ TEST_F(TableScanTest, fusedForScanCacheReadsSlices) {
           .build(),
       "SELECT * FROM tmp WHERE c0 >= 1000000001500");
   EXPECT_EQ(stats.at("cudfFusedForCacheReads").sum, 3);
+}
+
+TEST_F(TableScanTest, fusedForScanCacheFillTakesASlice) {
+  // A file of 20 row groups: filling the cache one row group at a time takes
+  // a fraction of the device memory that filling it whole does.
+  constexpr vector_size_t kRowsPerGroup = 50'000;
+  constexpr int kNumGroups = 20;
+  std::vector<RowVectorPtr> vectors;
+  for (int group = 0; group < kNumGroups; ++group) {
+    const int64_t first = int64_t{group} * kRowsPerGroup;
+    vectors.push_back(makeRowVector(
+        {"c0", "c1"},
+        {
+            // Values without a pattern, which no encoding shrinks.
+            makeFlatVector<int64_t>(
+                kRowsPerGroup,
+                [&](auto row) {
+                  return static_cast<int64_t>(
+                      (static_cast<uint64_t>(first + row) *
+                       0x9E37'79B9'7F4A'7C15ULL) >>
+                      4);
+                }),
+            makeFlatVector<double>(
+                kRowsPerGroup, [&](auto row) { return (first + row) * 0.25; }),
+        }));
+  }
+  createDuckDbTable(vectors);
+  resetCudfHiveConnector(std::make_shared<config::ConfigBase>(
+      std::unordered_map<std::string, std::string>{
+          {cudf_velox::connector::hive::CudfHiveConfig::kFusedForScanCacheBytes,
+           "1073741824"},
+      }));
+  SCOPE_EXIT {
+    cudf_velox::connector::hive::FusedForScanCache::testingSetSliceRows(0);
+  };
+
+  const auto rowType = asRowType(vectors.front()->type());
+  // The scan's device allocations are counted by an adaptor of the test's
+  // own, as the worker's peak window is taken when a task completes. It
+  // outlives the buffers it allocated.
+  std::vector<rmm::mr::statistics_resource_adaptor> counters;
+  counters.reserve(2);
+  // Writes the file anew, so that the scan fills the cache in slices of
+  // 'sliceRows' rows, and returns the most device bytes the scan allocated.
+  auto fillPeakBytes = [&](cudf::size_type sliceRows) {
+    auto filePath = TempFilePath::create();
+    writeToFile(filePath->getPath(), vectors);
+    cudf_velox::connector::hive::FusedForScanCache::testingSetSliceRows(
+        sliceRows);
+    auto plan =
+        PlanBuilder(pool_.get())
+            .startTableScan()
+            .outputType(rowType)
+            .tableHandle(makeTableHandle(
+                "parquet_table", rowType, common::SubfieldFilters{}, nullptr))
+            .assignments(HiveConnectorTestBase::allRegularColumns(rowType))
+            .endTableScan()
+            .planNode();
+    auto& counting = counters.emplace_back(cudf_velox::mr_.value());
+    auto previous = cudf::set_current_device_resource(counting);
+    auto previousOutput = cudf_velox::output_mr_;
+    cudf_velox::output_mr_ = counting;
+    std::shared_ptr<facebook::velox::exec::Task> task;
+    {
+      SCOPE_EXIT {
+        cudf::set_current_device_resource(std::move(previous));
+        cudf_velox::output_mr_ = std::move(previousOutput);
+      };
+      task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+                 .splits(makeCudfHiveConnectorSplits({filePath}))
+                 .assertResults("SELECT * FROM tmp");
+    }
+    const auto peakBytes =
+        static_cast<int64_t>(counting.get_bytes_counter().peak);
+    const auto stats = getTableScanRuntimeStats(task);
+    EXPECT_EQ(stats.at("cudfFusedForCacheFills").sum, 1);
+    EXPECT_EQ(
+        stats.at("cudfFusedForCacheFillSlices").sum,
+        kNumGroups * kRowsPerGroup / sliceRows);
+    return peakBytes;
+  };
+  const auto wholeFileBytes = fillPeakBytes(kNumGroups * kRowsPerGroup);
+  const auto rowGroupBytes = fillPeakBytes(kRowsPerGroup);
+  VLOG(1) << "Peak device bytes of a fill: whole file " << wholeFileBytes
+          << ", one row group at a time " << rowGroupBytes;
+  // The decoded file takes 16 bytes per row.
+  EXPECT_GE(wholeFileBytes, int64_t{kNumGroups} * kRowsPerGroup * 16);
+  EXPECT_LT(rowGroupBytes * 4, wholeFileBytes);
 }
 
 TEST_F(TableScanTest, columnAliases) {
