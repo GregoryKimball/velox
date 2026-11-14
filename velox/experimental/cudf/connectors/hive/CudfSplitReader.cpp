@@ -174,11 +174,16 @@ cuda::stream_ref highPriorityStreamForCurrentThread() {
         static_cast<int>(
             cudaDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority)),
         "Failed to get the CUDA stream priority range");
+    // A failed creation (out of device memory) leaves its output undefined:
+    // cache only a created stream, so that the next split tries again instead
+    // of reusing an invalid handle.
+    cudaStream_t created{nullptr};
     VELOX_CHECK_EQ(
         static_cast<int>(cudaSuccess),
         static_cast<int>(cudaStreamCreateWithPriority(
-            &stream, cudaStreamNonBlocking, greatestPriority)),
+            &created, cudaStreamNonBlocking, greatestPriority)),
         "Failed to create a high-priority CUDA stream");
+    stream = created;
   }
   return cuda::stream_ref{stream};
 }
