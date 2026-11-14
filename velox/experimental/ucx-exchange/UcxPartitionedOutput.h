@@ -37,6 +37,14 @@ struct PackedExchangePayload;
 class UcxPartitionedOutput : public exec::Operator,
                              public cudf_velox::NvtxHelper {
  public:
+  /// The fewest rows a bucket of a batch needs on average for a Hive-bucket
+  /// output to send the batch as one payload per bucket. A grouped producer
+  /// with many lifespans sends many small batches, and a payload per bucket of
+  /// each would multiply the UCX messages and the stored payloads by the
+  /// bucket count; those batches go as one payload per partition, which the
+  /// receiving writer collects with others (UcxExchangeSource::receive()).
+  static constexpr cudf::size_type kMinRowsPerBucketPayload{32'768};
+
   // Default minimum rows to accumulate before flushing. Matches HTTP
   // PartitionedOutput's ~10,000 row target. The process-wide default comes from
   // CudfConfig::partitionedOutputBatchRows and may be overridden per query
@@ -92,8 +100,9 @@ class UcxPartitionedOutput : public exec::Operator,
   void hashPartition(cudf::table_view tableView, cuda::stream_ref stream);
 
   // Sends each row to the partition of its Hive bucket
-  // (hivePartitionFunction_), one payload per bucket tagged with the bucket
-  // (tagPayloadBucket()), so that a receiver that writes the rows to a
+  // (hivePartitionFunction_). A batch with large buckets
+  // (kMinRowsPerBucketPayload) goes as one payload per bucket tagged with the
+  // bucket (tagPayloadBucket()), so that a receiver that writes the rows to a
   // temporary table in the exchange store keeps the payload as it is.
   void hivePartition(cudf::table_view tableView, cuda::stream_ref stream);
 

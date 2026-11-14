@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <cuda/stream>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -302,6 +303,80 @@ class UcxPartitionedOutputTest : public testing::Test {
   static int countValue(const std::vector<int32_t>& keys, int32_t value) {
     return static_cast<int>(std::count(keys.begin(), keys.end(), value));
   }
+
+  // Runs a partitioned output with a Hive partition function of kHiveBuckets
+  // buckets over 'keyValues' and expects each key at the partition of its
+  // bucket, in payloads tagged with their bucket when 'perBucket'.
+  void expectHiveRouting(
+      const std::vector<int32_t>& keyValues,
+      bool perBucket) {
+    cuda::stream_ref stream{cudaStream_t{cudaStreamDefault}};
+    constexpr int kNumBuckets = kHiveBuckets;
+    const std::vector<int> bucketToPartition{2, 0, 1, 2, 0, 1};
+    // A template task, whose node gets the Hive spec; its own id keeps the
+    // memory pools of the two tasks apart.
+    auto hashTask = createPartitionedOutputTask(
+        taskId_ + "-template",
+        pool_,
+        UcxTestData::kTestRowType,
+        kNumPartitions,
+        {"c0"});
+    auto hashNode =
+        std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
+            hashTask->planFragment().planNode);
+    auto hiveNode =
+        core::PartitionedOutputNode::Builder(*hashNode)
+            .partitionFunctionSpec(
+                std::make_shared<connector::hive::HivePartitionFunctionSpec>(
+                    kNumBuckets,
+                    bucketToPartition,
+                    std::vector<column_index_t>{0},
+                    std::vector<VectorPtr>{}))
+            .build();
+    // The template's query context points at an executor its helper owned.
+    auto executor = std::make_shared<folly::CPUThreadPoolExecutor>(1);
+    auto task = Task::create(
+        taskId_,
+        core::PlanFragment{hiveNode},
+        0,
+        core::QueryCtx::create(
+            executor.get(),
+            core::QueryConfig(
+                {{core::QueryConfig::kMaxOutputBufferSize,
+                  std::to_string(FOUR_GBYTES)}})),
+        Task::ExecutionMode::kParallel);
+    queueManager_->initializeTask(
+        task,
+        core::PartitionedOutputNode::Kind::kPartitioned,
+        kNumPartitions,
+        /*numDrivers=*/1);
+
+    runPartitionedOutput(task, makeKeyColumn(keyValues, {}, stream), stream);
+
+    std::vector<std::vector<int32_t>> expected(kNumPartitions);
+    for (const auto key : keyValues) {
+      expected[bucketToPartition[key % kNumBuckets]].push_back(key);
+    }
+    for (int destination = 0; destination < kNumPartitions; ++destination) {
+      SCOPED_TRACE(fmt::format("destination {}", destination));
+      std::vector<int32_t> keys;
+      for (const auto& [bucket, packetKeys] :
+           drainBucketPackets(destination)) {
+        ASSERT_EQ(bucket.has_value(), perBucket);
+        if (bucket.has_value()) {
+          EXPECT_EQ(bucketToPartition[*bucket], destination);
+          for (const auto key : packetKeys) {
+            ASSERT_EQ(key % kNumBuckets, *bucket) << "key " << key;
+          }
+        }
+        keys.insert(keys.end(), packetKeys.begin(), packetKeys.end());
+      }
+      std::sort(keys.begin(), keys.end());
+      EXPECT_EQ(keys, expected[destination]);
+    }
+  }
+
+  static constexpr int kHiveBuckets = 6;
 
   const std::string taskId_{"ucx-partitioned-output-test"};
   std::shared_ptr<memory::MemoryPool> pool_;
@@ -622,72 +697,20 @@ TEST_F(UcxPartitionedOutputTest, replicatesNullsAcrossPartitionKeys) {
 // bucketed table) sends each row to the partition of its bucket, as the CPU
 // operator does: the bucket is the Hive hash of the key, which for an INTEGER
 // is the value itself, modulo the bucket count. Every row of a bucket must
-// reach the one task that writes or reads that bucket.
-TEST_F(UcxPartitionedOutputTest, routesRowsByHiveBucket) {
-  cuda::stream_ref stream{cudaStream_t{cudaStreamDefault}};
-  constexpr int kNumBuckets = 6;
-  const std::vector<int> bucketToPartition{2, 0, 1, 2, 0, 1};
-  const std::vector<int32_t> keyValues{7, 8, 9, 10, 11, 13};
+// reach the one task that writes or reads that bucket. A batch whose buckets
+// are large goes as one payload per bucket, tagged with the bucket, so that a
+// receiver writing a temporary table into the exchange store can keep it as
+// it is; a small batch goes as one untagged payload per partition, which the
+// receiving writer collects with others.
+TEST_F(UcxPartitionedOutputTest, routesSmallBatchesByHiveBucketPerPartition) {
+  expectHiveRouting({7, 8, 9, 10, 11, 13}, /*perBucket=*/false);
+}
 
-  // A template task, whose node gets the Hive spec; its own id keeps the
-  // memory pools of the two tasks apart.
-  auto hashTask = createPartitionedOutputTask(
-      taskId_ + "-template",
-      pool_,
-      UcxTestData::kTestRowType,
-      kNumPartitions,
-      {"c0"});
-  auto hashNode = std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
-      hashTask->planFragment().planNode);
-  auto hiveNode =
-      core::PartitionedOutputNode::Builder(*hashNode)
-          .partitionFunctionSpec(
-              std::make_shared<connector::hive::HivePartitionFunctionSpec>(
-                  kNumBuckets,
-                  bucketToPartition,
-                  std::vector<column_index_t>{0},
-                  std::vector<VectorPtr>{}))
-          .build();
-  // The template's query context points at an executor its helper owned.
-  auto executor = std::make_shared<folly::CPUThreadPoolExecutor>(1);
-  auto task = Task::create(
-      taskId_,
-      core::PlanFragment{hiveNode},
-      0,
-      core::QueryCtx::create(
-          executor.get(),
-          core::QueryConfig(
-              {{core::QueryConfig::kMaxOutputBufferSize,
-                std::to_string(FOUR_GBYTES)}})),
-      Task::ExecutionMode::kParallel);
-  queueManager_->initializeTask(
-      task,
-      core::PartitionedOutputNode::Kind::kPartitioned,
-      kNumPartitions,
-      /*numDrivers=*/1);
-
-  runPartitionedOutput(task, makeKeyColumn(keyValues, {}, stream), stream);
-
-  // Each payload holds one bucket and is tagged with it, so that a receiver
-  // writing a temporary table into the exchange store can keep it as it is.
-  std::vector<std::vector<int32_t>> expected(kNumPartitions);
-  for (const auto key : keyValues) {
-    expected[bucketToPartition[key % kNumBuckets]].push_back(key);
-  }
-  for (int destination = 0; destination < kNumPartitions; ++destination) {
-    SCOPED_TRACE(fmt::format("destination {}", destination));
-    std::vector<int32_t> keys;
-    for (const auto& [bucket, packetKeys] : drainBucketPackets(destination)) {
-      ASSERT_TRUE(bucket.has_value());
-      EXPECT_EQ(bucketToPartition[*bucket], destination);
-      for (const auto key : packetKeys) {
-        EXPECT_EQ(key % kNumBuckets, *bucket) << "key " << key;
-      }
-      keys.insert(keys.end(), packetKeys.begin(), packetKeys.end());
-    }
-    std::sort(keys.begin(), keys.end());
-    EXPECT_THAT(keys, testing::ElementsAreArray(expected[destination]));
-  }
+TEST_F(UcxPartitionedOutputTest, routesLargeBatchesOnePayloadPerHiveBucket) {
+  std::vector<int32_t> keyValues(
+      UcxPartitionedOutput::kMinRowsPerBucketPayload * kHiveBuckets);
+  std::iota(keyValues.begin(), keyValues.end(), 0);
+  expectHiveRouting(keyValues, /*perBucket=*/true);
 }
 
 // Negative control for the replication tests: with the flag off, the operator

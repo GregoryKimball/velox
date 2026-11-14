@@ -649,6 +649,17 @@ void UcxPartitionedOutput::hivePartition(
     cudf::table_view tableView,
     cuda::stream_ref stream) {
   const auto numBuckets = hiveBucketFunction_->numBuckets();
+  if (tableView.num_rows() <
+      static_cast<int64_t>(kMinRowsPerBucketPayload) * numBuckets) {
+    auto [partitionedTable, partitionOffsets] =
+        hivePartitionFunction_->partition(
+            tableView, numPartitions_, stream, get_temp_mr());
+    // splitAndEnqueue() takes the boundaries between partitions.
+    partitionOffsets.erase(partitionOffsets.begin());
+    partitionOffsets.pop_back();
+    splitAndEnqueue(partitionedTable->view(), partitionOffsets, stream);
+    return;
+  }
   auto [grouped, offsets] = hiveBucketFunction_->partition(
       tableView, numBuckets, stream, get_temp_mr());
   VELOX_CHECK_EQ(offsets.size(), numBuckets + 1);
