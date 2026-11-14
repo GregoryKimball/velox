@@ -142,15 +142,16 @@ class ExchangeStore {
   /// wakes the readers of each table that is now complete.
   void endWrites(std::string_view taskId);
 
-  /// Removes the payloads of 'file' of 'table' added so far, like take(), so
+  /// Removes the payloads of 'files' of 'table' added so far, like take(), so
   /// that a reader can consume a table while it is being written. Returns them
   /// when there are any; an empty vector when there are none and the table is
-  /// complete (the file got no rows or was taken already); and std::nullopt
+  /// complete (the files got no rows or were taken already); and std::nullopt
   /// with 'future' set when there are none yet: it completes on the table's
-  /// next payload or when the table completes.
+  /// next payload or when the table completes. Several readers may read the
+  /// same files: each payload goes to one of them.
   std::optional<std::vector<TakenPayload>> takeOrWait(
       std::string_view table,
-      std::string_view file,
+      const std::vector<std::string>& files,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr,
       ContinueFuture& future,

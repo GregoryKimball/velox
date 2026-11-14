@@ -41,4 +41,15 @@ void unregisterExchangeStoreTables();
 /// the rest of the file name.
 std::pair<std::string, std::string> storeKey(std::string_view path);
 
+/// Keys of a temporary table split's custom split info. A coordinator that
+/// reads a bucketed table as fewer buckets than it has, each the union of the
+/// table buckets with the same remainder (Hive's read bucket count), sets both
+/// on the splits of a table that is read while it is written. The split of a
+/// table bucket then reads its whole read bucket: the first split of a read
+/// bucket streams every table bucket of it, and the others find theirs read.
+inline constexpr std::string_view kReadBucketCountSplitInfo{
+    "read_bucket_count"};
+inline constexpr std::string_view kTableBucketCountSplitInfo{
+    "table_bucket_count"};
+
 } // namespace facebook::velox::ucx_exchange

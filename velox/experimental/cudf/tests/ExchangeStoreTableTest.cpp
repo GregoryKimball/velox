@@ -31,6 +31,7 @@
 #include <fmt/format.h>
 #include <gtest/gtest.h>
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -230,6 +231,73 @@ TEST_P(ExchangeStoreTableTest, readsEachBucketFromItsFile) {
   // Each file was read once, which takes its data out of the store.
   EXPECT_EQ(store.stats().payloads, 0);
   EXPECT_EQ(store.stats().deviceBytes + store.stats().hostBytes, 0);
+}
+
+TEST_P(ExchangeStoreTableTest, readsEveryTableBucketOfAReadBucketFromOneSplit) {
+  const auto input = makeInput();
+  const auto tableType = asRowType(input[0]->type());
+  auto directory = common::testutil::TempDirectoryPath::create();
+  const auto tableDirectory = directory->getPath() + "/" + kTable;
+  AssertQueryBuilder(PlanBuilder()
+                         .values(input)
+                         .tableWrite(
+                             tableDirectory,
+                             {},
+                             kNumBuckets,
+                             {"key"},
+                             {},
+                             dwio::common::FileFormat::PARQUET,
+                             {},
+                             kCudfHiveConnectorId)
+                         .planNode())
+      .config(CudfFromVelox::kGpuBatchSizeRows, std::to_string(kBatchRows))
+      .copyResults(pool());
+
+  // The coordinator reads the table as 2 buckets, each the union of the table
+  // buckets with its remainder, and lists one split per table bucket.
+  constexpr int kReadBucketCount = 2;
+  const auto split = [&](int bucket) {
+    return facebook::velox::connector::hive::HiveConnectorSplitBuilder(
+               fmt::format("{}/{:06d}_0_query", tableDirectory, bucket))
+        .connectorId(kCudfHiveConnectorId)
+        .fileFormat(dwio::common::FileFormat::PARQUET)
+        .tableBucketNumber(bucket)
+        .customSplitInfo(
+            {{std::string{ucx_exchange::kReadBucketCountSplitInfo},
+              std::to_string(kReadBucketCount)},
+             {std::string{ucx_exchange::kTableBucketCountSplitInfo},
+              std::to_string(kNumBuckets)}})
+        .build();
+  };
+  facebook::velox::connector::hive::HivePartitionFunction bucketFunction(
+      kNumBuckets, std::vector<column_index_t>{0});
+  const auto scan = scanPlan(tableType, tableType);
+  std::vector<RowVectorPtr> output;
+  for (int readBucket = 0; readBucket < kReadBucketCount; ++readBucket) {
+    SCOPED_TRACE(fmt::format("read bucket {}", readBucket));
+    // The first split of the read bucket reads all of it.
+    const auto rows =
+        AssertQueryBuilder(scan).split(split(readBucket)).copyResults(pool());
+    std::vector<uint32_t> buckets;
+    bucketFunction.partition(*rows, buckets);
+    std::set<uint32_t> bucketsRead(buckets.begin(), buckets.end());
+    // gmock is not available to this test (gtest comes from the dependencies).
+    EXPECT_EQ(
+        bucketsRead,
+        (std::set<uint32_t>{
+            static_cast<uint32_t>(readBucket),
+            static_cast<uint32_t>(readBucket + kReadBucketCount)}));
+    output.push_back(rows);
+    // The read bucket's other split finds its table bucket read already.
+    EXPECT_EQ(
+        AssertQueryBuilder(scan)
+            .split(split(readBucket + kReadBucketCount))
+            .copyResults(pool())
+            ->size(),
+        0);
+  }
+  facebook::velox::exec::test::assertEqualResults(input, output);
+  EXPECT_EQ(ucx_exchange::ExchangeStore::instance().stats().payloads, 0);
 }
 
 TEST_P(ExchangeStoreTableTest, readsTheScanColumnsInTheScanOrder) {

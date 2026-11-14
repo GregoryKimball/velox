@@ -804,6 +804,44 @@ const std::string& filePath(const connector::ConnectorSplit& split) {
   return hiveSplit->filePath;
 }
 
+// Returns the files of its table, as storeKey() names them, that 'split' of
+// the file 'file' reads: that file, or, when the coordinator reads the table as
+// read buckets (kReadBucketCountSplitInfo), every bucket file of its read
+// bucket.
+std::vector<std::string> splitFiles(
+    const connector::ConnectorSplit& split,
+    const std::string& file) {
+  auto hiveSplit = dynamic_cast<const HiveConnectorSplit*>(&split);
+  if (hiveSplit == nullptr) {
+    return {file};
+  }
+  const auto& info = hiveSplit->customSplitInfo;
+  const auto readBucketCountIt =
+      info.find(std::string{kReadBucketCountSplitInfo});
+  const auto tableBucketCountIt =
+      info.find(std::string{kTableBucketCountSplitInfo});
+  if (readBucketCountIt == info.end() || tableBucketCountIt == info.end()) {
+    return {file};
+  }
+  const auto readBucketCount = folly::to<int32_t>(readBucketCountIt->second);
+  const auto tableBucketCount = folly::to<int32_t>(tableBucketCountIt->second);
+  const auto bucket = folly::to<int32_t>(file);
+  VELOX_CHECK(
+      readBucketCount > 0 && tableBucketCount % readBucketCount == 0 &&
+          bucket < tableBucketCount,
+      "A table bucket must belong to one read bucket: {} {} {}",
+      bucket,
+      readBucketCount,
+      tableBucketCount);
+  std::vector<std::string> files;
+  for (auto tableBucket = bucket % readBucketCount;
+       tableBucket < tableBucketCount;
+       tableBucket += readBucketCount) {
+    files.push_back(std::to_string(tableBucket));
+  }
+  return files;
+}
+
 // A payload taken from the store and ready to read: the columns that were
 // encoded are decoded into columns of their own, the others stay in the
 // payload's storage.
@@ -893,12 +931,14 @@ class ExchangeStoreDataSource : public connector::DataSource {
     allColumns_ = columns_ == allColumns;
   }
 
-  // Takes the payloads of the split's file written so far. A file that is still
-  // being written (its table is read while the producer runs) is read further
-  // in next(), which waits for the rest.
+  // Takes the payloads of the split's files written so far. A file that is
+  // still being written (its table is read while the producer runs) is read
+  // further in next(), which waits for the rest.
   void addSplit(std::shared_ptr<connector::ConnectorSplit> split) override {
     VELOX_CHECK_EQ(next_, payloads_.size(), "The previous split is not done");
-    std::tie(table_, file_) = storeKey(filePath(*split));
+    std::string file;
+    std::tie(table_, file) = storeKey(filePath(*split));
+    files_ = splitFiles(*split, file);
     stream_ = cudf_velox::cudfGlobalStreamPool().get_stream();
     payloads_.clear();
     next_ = 0;
@@ -964,7 +1004,7 @@ class ExchangeStoreDataSource : public connector::DataSource {
     VELOX_CHECK_EQ(next_, payloads_.size(), "The previous split is not done");
     stream_ = preloaded->stream_;
     table_ = std::move(preloaded->table_);
-    file_ = std::move(preloaded->file_);
+    files_ = std::move(preloaded->files_);
     splitDone_ = preloaded->splitDone_;
     payloads_ = std::move(preloaded->payloads_);
     next_ = preloaded->next_;
@@ -1074,7 +1114,7 @@ class ExchangeStoreDataSource : public connector::DataSource {
   // written; sets splitDone_ when it has none and is complete.
   bool takeMore(ContinueFuture& future) {
     auto taken = ExchangeStore::instance().takeOrWait(
-        table_, file_, stream_, cudf_velox::get_output_mr(), future, &takeStats_);
+        table_, files_, stream_, cudf_velox::get_output_mr(), future, &takeStats_);
     if (!taken.has_value()) {
       return false;
     }
@@ -1094,10 +1134,12 @@ class ExchangeStoreDataSource : public connector::DataSource {
   // Whether the output is every column of the table in order.
   bool allColumns_{false};
   cuda::stream_ref stream_{cudaStream_t{cudaStreamDefault}};
-  // The split's temporary table and file (storeKey()).
+  // The split's temporary table (storeKey()) and the files it reads
+  // (splitFiles()).
   std::string table_;
-  std::string file_;
-  // Set once the split's file has no more payloads and its table is complete.
+  std::vector<std::string> files_;
+  // Set once the split's files have no more payloads and its table is
+  // complete.
   bool splitDone_{true};
   std::vector<ExchangeStore::TakenPayload> payloads_;
   size_t next_{0};

@@ -466,7 +466,7 @@ TEST_F(ExchangeStoreTest, takeOrWaitStreamsATableWhileItIsWritten) {
   // Nothing written yet: the reader waits.
   auto future = ContinueFuture::makeEmpty();
   EXPECT_FALSE(
-      store.takeOrWait("table", "0", stream_, memoryResource(), future)
+      store.takeOrWait("table", {"0"}, stream_, memoryResource(), future)
           .has_value());
   ASSERT_TRUE(future.valid());
   EXPECT_FALSE(future.isReady());
@@ -476,20 +476,20 @@ TEST_F(ExchangeStoreTest, takeOrWaitStreamsATableWhileItIsWritten) {
   EXPECT_TRUE(future.isReady());
   future = ContinueFuture::makeEmpty();
   auto taken =
-      store.takeOrWait("table", "0", stream_, memoryResource(), future);
+      store.takeOrWait("table", {"0"}, stream_, memoryResource(), future);
   ASSERT_TRUE(taken.has_value());
   EXPECT_EQ(taken->size(), 1);
 
   // Nothing new and the writer is still open: wait again, until the writer's
   // task finishes and completes the table.
   EXPECT_FALSE(
-      store.takeOrWait("table", "0", stream_, memoryResource(), future)
+      store.takeOrWait("table", {"0"}, stream_, memoryResource(), future)
           .has_value());
   ASSERT_TRUE(future.valid());
   store.endWrites("query.1.0.0.0");
   EXPECT_TRUE(future.isReady());
   future = ContinueFuture::makeEmpty();
-  auto done = store.takeOrWait("table", "0", stream_, memoryResource(), future);
+  auto done = store.takeOrWait("table", {"0"}, stream_, memoryResource(), future);
   ASSERT_TRUE(done.has_value());
   EXPECT_THAT(*done, testing::IsEmpty());
   EXPECT_FALSE(future.valid());
@@ -505,17 +505,58 @@ TEST_F(ExchangeStoreTest, takeOrWaitReadsAFileNeverWrittenAsDoneOnceComplete) {
   store.endWrites("query.1.0.0.0");
   auto future = ContinueFuture::makeEmpty();
   ASSERT_EQ(
-      store.takeOrWait("table", "0", stream_, memoryResource(), future)
+      store.takeOrWait("table", {"0"}, stream_, memoryResource(), future)
           ->size(),
       1);
 
   // The table was taken entirely and is gone, but a bucket that got no rows
   // still reads as done instead of waiting for a writer that has finished.
   auto empty =
-      store.takeOrWait("table", "1", stream_, memoryResource(), future);
+      store.takeOrWait("table", {"1"}, stream_, memoryResource(), future);
   ASSERT_TRUE(empty.has_value());
   EXPECT_THAT(*empty, testing::IsEmpty());
   EXPECT_FALSE(future.valid());
+}
+
+TEST_F(ExchangeStoreTest, takeOrWaitTakesAnyFileOfASet) {
+  const auto input = makeInput();
+  auto payloads = pack(input, {300, 700}, compressions().back());
+  ExchangeStore store;
+  store.setDeviceCapacity(kUnlimited);
+  store.beginWrite("table", "query.1.0.0.0");
+  const std::vector<std::string> files{"1", "3"};
+  auto future = ContinueFuture::makeEmpty();
+  ASSERT_FALSE(
+      store.takeOrWait("table", files, stream_, memoryResource(), future)
+          .has_value());
+
+  // A write to a file outside the set wakes the reader, which finds nothing
+  // and waits again.
+  store.add("table", "2", std::move(payloads[0]), 300, {}, stream_);
+  EXPECT_TRUE(future.isReady());
+  future = ContinueFuture::makeEmpty();
+  ASSERT_FALSE(
+      store.takeOrWait("table", files, stream_, memoryResource(), future)
+          .has_value());
+  EXPECT_TRUE(future.valid());
+
+  // One call takes what every file of the set got.
+  store.add("table", "1", std::move(payloads[1]), 400, {}, stream_);
+  store.add("table", "3", std::move(payloads[2]), kNumRows - 700, {}, stream_);
+  future = ContinueFuture::makeEmpty();
+  auto taken =
+      store.takeOrWait("table", files, stream_, memoryResource(), future);
+  ASSERT_TRUE(taken.has_value());
+  EXPECT_EQ(taken->size(), 2);
+
+  // Once the table is complete the set reads as done, and the file outside it
+  // keeps its payload.
+  store.endWrites("query.1.0.0.0");
+  auto done =
+      store.takeOrWait("table", files, stream_, memoryResource(), future);
+  ASSERT_TRUE(done.has_value());
+  EXPECT_THAT(*done, testing::IsEmpty());
+  EXPECT_EQ(store.stats().payloads, 1);
 }
 
 TEST_F(ExchangeStoreTest, dropWakesReadersWaitingForTheTable) {
@@ -524,12 +565,12 @@ TEST_F(ExchangeStoreTest, dropWakesReadersWaitingForTheTable) {
   store.beginWrite("query1_table", "query1.1.0.0.0");
   auto first = ContinueFuture::makeEmpty();
   ASSERT_FALSE(
-      store.takeOrWait("query1_table", "0", stream_, memoryResource(), first)
+      store.takeOrWait("query1_table", {"0"}, stream_, memoryResource(), first)
           .has_value());
   store.beginWrite("query1_other", "query1.2.0.0.0");
   auto second = ContinueFuture::makeEmpty();
   ASSERT_FALSE(
-      store.takeOrWait("query1_other", "0", stream_, memoryResource(), second)
+      store.takeOrWait("query1_other", {"0"}, stream_, memoryResource(), second)
           .has_value());
 
   // A failed task drops its query's tables. The readers wake up instead of

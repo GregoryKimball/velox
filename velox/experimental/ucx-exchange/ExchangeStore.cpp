@@ -20,6 +20,7 @@
 #include <glog/logging.h>
 
 #include <chrono>
+#include <iterator>
 
 #include <cudf/utilities/error.hpp>
 #include <rmm/aligned.hpp>
@@ -392,35 +393,50 @@ void ExchangeStore::complete(const std::string& name) {
 std::optional<std::vector<ExchangeStore::TakenPayload>>
 ExchangeStore::takeOrWait(
     std::string_view table,
-    std::string_view file,
+    const std::vector<std::string>& files,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr,
     ContinueFuture& future,
     TakeStats* stats) {
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto tableIt = tables_.find(table);
-    const bool hasPayloads = tableIt != tables_.end() &&
-        tableIt->second.files.find(file) != tableIt->second.files.end();
-    if (!hasPayloads) {
-      const bool written = completedTables_.count(std::string{table}) > 0 &&
-          (tableIt == tables_.end() || tableIt->second.writers.empty());
-      if (written) {
-        return std::vector<TakenPayload>{};
+  for (;;) {
+    std::vector<std::string_view> written;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto tableIt = tables_.find(table);
+      if (tableIt != tables_.end()) {
+        for (const auto& file : files) {
+          if (tableIt->second.files.contains(file)) {
+            written.push_back(file);
+          }
+        }
       }
-      // A reader may come before the table's first writer: the entry it
-      // creates holds its promise until a payload or the completion.
-      auto& entry = tableIt != tables_.end() ? tableIt->second
-                                             : tables_[std::string{table}];
-      auto [promise, semiFuture] =
-          makeVeloxContinuePromiseContract("ExchangeStore::takeOrWait");
-      entry.waiters.push_back(std::move(promise));
-      future = std::move(semiFuture);
-      return std::nullopt;
+      if (written.empty()) {
+        const bool complete = completedTables_.count(std::string{table}) > 0 &&
+            (tableIt == tables_.end() || tableIt->second.writers.empty());
+        if (complete) {
+          return std::vector<TakenPayload>{};
+        }
+        // A reader may come before the table's first writer: the entry it
+        // creates holds its promise until a payload or the completion.
+        auto& entry = tableIt != tables_.end() ? tableIt->second
+                                               : tables_[std::string{table}];
+        auto [promise, semiFuture] =
+            makeVeloxContinuePromiseContract("ExchangeStore::takeOrWait");
+        entry.waiters.push_back(std::move(promise));
+        future = std::move(semiFuture);
+        return std::nullopt;
+      }
+    }
+    std::vector<TakenPayload> result;
+    for (const auto file : written) {
+      auto taken = take(table, file, stream, mr, stats);
+      std::move(taken.begin(), taken.end(), std::back_inserter(result));
+    }
+    // Another reader of the same files may have taken them in between.
+    if (!result.empty()) {
+      return result;
     }
   }
-  // One split reads each file, so nobody takes it in between.
-  return take(table, file, stream, mr, stats);
 }
 
 void ExchangeStore::drop(std::string_view table) {
