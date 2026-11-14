@@ -25,6 +25,8 @@
 #include "velox/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
 #include "velox/parse/TypeResolver.h"
 
+#include <folly/ScopeGuard.h>
+
 namespace facebook::velox::cudf_velox {
 namespace {
 
@@ -141,6 +143,63 @@ TEST_F(CudfPlanRewriterTest, keepsVarbinaryStateAcrossMaterializedExchange) {
                   std::string{core::TransportKind::kUcx})
               .planNode()),
       "materialized exchange");
+}
+
+TEST_F(CudfPlanRewriterTest, sendsCompactStateThroughTheExchangeStore) {
+  // The exchange store keeps the GPU columns written to a temporary table and
+  // returns them as they were, so the compact state crosses a materialized
+  // exchange as it crosses a UCX exchange: the producer partitioned into Hive
+  // buckets sends it, and the table scan feeding the FINAL aggregation returns
+  // it.
+  CudfConfig::getInstance().exchangeStore = true;
+  SCOPE_EXIT {
+    CudfConfig::getInstance().exchangeStore = false;
+  };
+  auto input = makeRowVector(
+      {"k", "d"},
+      {makeFlatVector<int32_t>({1}),
+       makeFlatVector<int64_t>({100}, DECIMAL(12, 2))});
+  auto ids = std::make_shared<core::PlanNodeIdGenerator>();
+  auto bucketed = std::make_shared<connector::hive::HivePartitionFunctionSpec>(
+      2, std::vector<column_index_t>{0}, std::vector<VectorPtr>{});
+  auto partial = exec::test::PlanBuilder(ids)
+                     .values({input})
+                     .partialAggregation({"k"}, {"sum(d) AS s"})
+                     .planNode();
+  auto output = exec::test::PlanBuilder(partial, ids)
+                    .partitionedOutput(
+                        {"k"},
+                        2,
+                        false,
+                        {},
+                        "Presto",
+                        std::string{core::TransportKind::kUcx})
+                    .planNode();
+  auto producer =
+      core::PartitionedOutputNode::Builder(
+          *std::dynamic_pointer_cast<const core::PartitionedOutputNode>(output))
+          .partitionFunctionSpec(bucketed)
+          .build();
+  auto gpuProducer = std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
+      CudfPlanRewriter::rewrite(producer));
+  ASSERT_NE(gpuProducer, nullptr);
+  EXPECT_EQ(*gpuProducer->outputType()->childAt(1), *DECIMAL(38, 2));
+  EXPECT_EQ(
+      gpuProducer->partitionFunctionSpec().toString(), bucketed->toString());
+
+  const auto stateType = asRowType(partial->outputType());
+  auto consumer = exec::test::PlanBuilder(ids)
+                      .tableScan(stateType)
+                      .localPartition({"k"})
+                      .finalAggregation({"k"}, {"sum(s) AS s"}, {{DECIMAL(12, 2)}})
+                      .planNode();
+  auto gpuConsumer = CudfPlanRewriter::rewrite(consumer);
+  EXPECT_EQ(*gpuConsumer->outputType(), *consumer->outputType());
+  EXPECT_NE(
+      dynamic_cast<const CudfAggregationNode*>(gpuConsumer.get()), nullptr);
+  const auto& scan = gpuConsumer->sources()[0]->sources()[0];
+  ASSERT_NE(dynamic_cast<const core::TableScanNode*>(scan.get()), nullptr);
+  EXPECT_EQ(*scan->outputType()->findChild("s"), *DECIMAL(38, 2));
 }
 
 } // namespace

@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/exec/CudfAggregationNode.h"
 #include "velox/experimental/cudf/exec/CudfPlanRewriter.h"
 
+#include "velox/connectors/hive/HiveConnector.h"
 #include "velox/exec/HashPartitionFunction.h"
 #include "velox/exec/RoundRobinPartitionFunction.h"
 
@@ -40,8 +41,17 @@ void checkType(const RowTypePtr& actual, const RowTypePtr& expected) {
       expected->toString());
 }
 
+// Returns whether a materialized exchange holds aggregation state in the
+// plan's VARBINARY type. A temporary table in files does. The exchange store
+// keeps the GPU columns written to a temporary table and returns them as they
+// were, so compact state crosses it as it crosses a UCX exchange.
+bool materializedStateIsVarbinary() {
+  return !CudfConfig::getInstance().exchangeStore;
+}
+
 // HashPartitionFunctionSpec has no schema/key accessors. Rebuild its schema
-// through its serde, rejecting state-column keys and constant-key specs.
+// through its serde, rejecting state-column keys and constant-key specs. A
+// Hive bucket spec (a materialized exchange) holds no schema and is kept.
 core::PartitionFunctionSpecPtr rebindPartition(
     const core::PartitionFunctionSpec& spec,
     const RowTypePtr& oldType,
@@ -49,15 +59,18 @@ core::PartitionFunctionSpecPtr rebindPartition(
   if (dynamic_cast<const core::GatherPartitionFunctionSpec*>(&spec)) {
     return std::make_shared<core::GatherPartitionFunctionSpec>();
   }
+  const auto* hive =
+      dynamic_cast<const connector::hive::HivePartitionFunctionSpec*>(&spec);
   VELOX_USER_CHECK(
-      dynamic_cast<const exec::HashPartitionFunctionSpec*>(&spec),
+      dynamic_cast<const exec::HashPartitionFunctionSpec*>(&spec) ||
+          (hive && !materializedStateIsVarbinary()),
       "Compact aggregation requires hash or gather partitioning");
   auto serialized = spec.serialize();
   VELOX_USER_CHECK(
       serialized["constants"].empty(),
       "Compact aggregation does not support constant partition keys");
   std::vector<column_index_t> channels;
-  for (const auto& key : serialized["keyChannels"]) {
+  for (const auto& key : serialized[hive ? "keys" : "keyChannels"]) {
     const auto channel = key.asInt();
     VELOX_USER_CHECK_GE(channel, 0);
     VELOX_USER_CHECK_LT(channel, oldType->size());
@@ -65,6 +78,9 @@ core::PartitionFunctionSpecPtr rebindPartition(
         *oldType->childAt(channel) == *newType->childAt(channel),
         "Cannot partition on a compact aggregation state column");
     channels.push_back(channel);
+  }
+  if (hive) {
+    return std::make_shared<connector::hive::HivePartitionFunctionSpec>(*hive);
   }
   return std::make_shared<exec::HashPartitionFunctionSpec>(
       newType, std::move(channels));
@@ -102,26 +118,28 @@ const core::ProjectNode* asPassThroughProject(const PlanNodePtr& node) {
 }
 
 // Returns whether 'output' partitions its rows with a connector's function
-// (Hive buckets) rather than one of the engine's. A materialized exchange does,
-// and a later fragment writes its rows to a table; but so does an exchange that
-// Presto aligns with a bucketed table's buckets. State that crosses the latter
-// keeps VARBINARY here while its consumer reads it from an exchange and
-// expects compact state; the compact SUM paths then fail on the input type.
+// (Hive buckets) rather than one of the engine's, toward a temporary table that
+// holds VARBINARY state (materializedStateIsVarbinary()). A materialized
+// exchange does, and a later fragment writes its rows to a table; but so does
+// an exchange that Presto aligns with a bucketed table's buckets. State that
+// crosses the latter keeps VARBINARY here while its consumer reads it from an
+// exchange and expects compact state; the compact SUM paths then fail on the
+// input type.
 // TODO: Decide from the query's exchange materialization setting instead.
 bool partitionsForTable(const core::PartitionedOutputNode& output) {
   const auto* spec = output.partitionFunctionSpecPtr().get();
-  return spec != nullptr &&
+  return spec != nullptr && materializedStateIsVarbinary() &&
       !dynamic_cast<const exec::HashPartitionFunctionSpec*>(spec) &&
       !dynamic_cast<const exec::RoundRobinPartitionFunctionSpec*>(spec) &&
       !dynamic_cast<const core::GatherPartitionFunctionSpec*>(spec);
 }
 
 // Returns whether the aggregation state reaching a FINAL or INTERMEDIATE
-// aggregation through 'node' is read back from a table, the reading end of a
-// materialized exchange.
+// aggregation through 'node' is read back as VARBINARY from a table, the
+// reading end of a materialized exchange (materializedStateIsVarbinary()).
 bool readsStateFromTable(const PlanNodePtr& node) {
   if (dynamic_cast<const core::TableScanNode*>(node.get())) {
-    return true;
+    return materializedStateIsVarbinary();
   }
   if (!dynamic_cast<const core::LocalPartitionNode*>(node.get()) &&
       !dynamic_cast<const core::ProjectNode*>(node.get()) &&
@@ -222,7 +240,9 @@ PlanNodePtr rewriteNode(
     VELOX_USER_CHECK(
         dynamic_cast<const AggregationNode*>(node.get()) ||
             dynamic_cast<const core::LocalPartitionNode*>(node.get()) ||
-            dynamic_cast<const core::ExchangeNode*>(node.get()),
+            dynamic_cast<const core::ExchangeNode*>(node.get()) ||
+            (dynamic_cast<const core::TableScanNode*>(node.get()) &&
+             !materializedStateIsVarbinary()),
         "Unsupported compact aggregation state source: {} ({})",
         node->name(),
         node->id());
@@ -374,6 +394,14 @@ PlanNodePtr rewriteNode(
       return node;
     }
     return core::ExchangeNode::Builder(*exchange).outputType(expected).build();
+  }
+
+  // A temporary table in the exchange store returns the state as written.
+  if (const auto* scan = dynamic_cast<const core::TableScanNode*>(node.get())) {
+    if (!expected || sameType(node->outputType(), expected)) {
+      return node;
+    }
+    return core::TableScanNode::Builder(*scan).outputType(expected).build();
   }
 
   if (const auto* local =
