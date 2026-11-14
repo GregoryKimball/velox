@@ -518,6 +518,30 @@ TEST_F(ExchangeStoreTest, takeOrWaitReadsAFileNeverWrittenAsDoneOnceComplete) {
   EXPECT_FALSE(future.valid());
 }
 
+TEST_F(ExchangeStoreTest, dropWakesReadersWaitingForTheTable) {
+  ExchangeStore store;
+  store.setDeviceCapacity(kUnlimited);
+  store.beginWrite("query1_table", "query1.1.0.0.0");
+  auto first = ContinueFuture::makeEmpty();
+  ASSERT_FALSE(
+      store.takeOrWait("query1_table", "0", stream_, memoryResource(), first)
+          .has_value());
+  store.beginWrite("query1_other", "query1.2.0.0.0");
+  auto second = ContinueFuture::makeEmpty();
+  ASSERT_FALSE(
+      store.takeOrWait("query1_other", "0", stream_, memoryResource(), second)
+          .has_value());
+
+  // A failed task drops its query's tables. The readers wake up instead of
+  // failing with a broken promise, which would hide the task's error.
+  store.drop("query1_table");
+  ASSERT_TRUE(first.isReady());
+  EXPECT_TRUE(first.hasValue());
+  store.dropQuery("query1");
+  ASSERT_TRUE(second.isReady());
+  EXPECT_TRUE(second.hasValue());
+}
+
 TEST_F(ExchangeStoreTest, failsWhenHostTierIsFull) {
   const auto input = makeInput();
   auto payloads = pack(input, {500}, ExchangeCompression::kNone);

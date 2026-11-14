@@ -436,7 +436,12 @@ void ExchangeStore::drop(std::string_view table) {
     forget(dropped);
     restoreDeviceCapacityIfEmpty();
   }
-  // 'dropped' frees both tiers' memory outside the lock.
+  // 'dropped' frees both tiers' memory outside the lock. Its readers wake up:
+  // a broken promise would fail their tasks with an error that hides the one
+  // that dropped the table.
+  for (auto& waiter : dropped.waiters) {
+    waiter.setValue();
+  }
 }
 
 void ExchangeStore::dropQuery(std::string_view queryId) {
@@ -454,7 +459,13 @@ void ExchangeStore::dropQuery(std::string_view queryId) {
     }
     restoreDeviceCapacityIfEmpty();
   }
-  // 'dropped' frees both tiers' memory outside the lock.
+  // 'dropped' frees both tiers' memory outside the lock. Its readers wake up,
+  // as in drop().
+  for (auto& table : dropped) {
+    for (auto& waiter : table.waiters) {
+      waiter.setValue();
+    }
+  }
 }
 
 std::size_t ExchangeStore::demote(std::size_t bytes) {
