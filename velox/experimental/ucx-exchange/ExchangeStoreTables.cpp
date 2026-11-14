@@ -1344,7 +1344,8 @@ std::optional<std::string> receivingTableInStore(
   const auto* session = queryCtx.connectorSessionProperties(
       writer->insertTableHandle()->connectorId());
   if (session == nullptr ||
-      !session->get<bool>("stream_temporary_tables", false)) {
+      !(session->get<bool>("stream_temporary_tables", false) ||
+        session->get<bool>("list_temporary_tables_by_bucket", false))) {
     return std::nullopt;
   }
   return storeKey(directory + "/file").first;

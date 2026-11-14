@@ -330,20 +330,29 @@ TEST_P(ExchangeStoreTableTest, namesTheTableAnExchangeWritesUnchanged) {
             kCudfHiveConnectorId)
         .planNode();
   };
-  const auto queryCtx = [](bool readByBucket) {
+  const auto queryCtx = [](bool readByBucket,
+                           std::string_view property =
+                               "stream_temporary_tables") {
     std::unordered_map<std::string, std::shared_ptr<config::ConfigBase>>
         sessions;
     sessions.emplace(
         kCudfHiveConnectorId,
         std::make_shared<config::ConfigBase>(
             std::unordered_map<std::string, std::string>{
-                {"stream_temporary_tables", readByBucket ? "true" : "false"}}));
+                {std::string{property}, readByBucket ? "true" : "false"}}));
     return core::QueryCtx::create(nullptr, core::QueryConfig{{}}, sessions);
   };
 
   const auto renamed = writerPlan({"k AS key", "v AS value"}, directory);
   EXPECT_EQ(
       ucx_exchange::receivingTableInStore(*renamed, exchangeId, *queryCtx(true)),
+      std::optional<std::string>{kTable});
+  // Listing by bucket without streaming needs no file per bucket either.
+  EXPECT_EQ(
+      ucx_exchange::receivingTableInStore(
+          *renamed,
+          exchangeId,
+          *queryCtx(true, "list_temporary_tables_by_bucket")),
       std::optional<std::string>{kTable});
   // Without reading by bucket, every bucket needs its file from the writer.
   EXPECT_EQ(

@@ -50,8 +50,9 @@ std::pair<std::string, std::string> storeKey(std::string_view path);
 /// Returns the store key of the temporary table whose writer, in 'root',
 /// receives the rows of the UCX exchange 'exchangeId' unchanged, when the
 /// exchange store holds temporary tables and the query reads them by bucket
-/// (Hive session property stream_temporary_tables, so that a bucket needs no
-/// file): the writer writes every column it reads, in order, through Projects
+/// (Hive session property stream_temporary_tables or
+/// list_temporary_tables_by_bucket, so that a bucket needs no file): the
+/// writer writes every column it reads, in order, through Projects
 /// that keep each column in its position and local exchanges. The exchange's
 /// sources then keep each bucket's payload in the store as it arrives
 /// (UcxExchangeQueue::setStoreTable()), and the writer gets no rows.
