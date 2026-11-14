@@ -646,10 +646,8 @@ void UcxPartitionedOutput::hashPartition(
 void UcxPartitionedOutput::hivePartition(
     cudf::table_view tableView,
     cuda::stream_ref stream) {
-  auto partitionMap =
-      hivePartitionFunction_->partitions(tableView, stream, get_temp_mr());
-  auto [partitionedTable, partitionOffsets] = cudf::partition(
-      tableView, partitionMap->view(), numPartitions_, stream, get_temp_mr());
+  auto [partitionedTable, partitionOffsets] = hivePartitionFunction_->partition(
+      tableView, numPartitions_, stream, get_temp_mr());
 
   VELOX_CHECK_EQ(partitionOffsets.size(), numPartitions_ + 1);
   VELOX_CHECK_EQ(partitionOffsets[0], 0);

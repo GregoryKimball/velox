@@ -249,14 +249,8 @@ void CudfLocalPartition::doAddInput(RowVectorPtr input) {
             stream,
             get_temp_mr());
       } else if (partitionFunctionType_ == PartitionFunctionType::kHive) {
-        auto partitions = hivePartitionFunction_->partitions(
-            tableView, stream, get_temp_mr());
-        return cudf::partition(
-            tableView,
-            partitions->view(),
-            static_cast<cudf::size_type>(numPartitions_),
-            stream,
-            get_temp_mr());
+        return hivePartitionFunction_->partition(
+            tableView, static_cast<int>(numPartitions_), stream, get_temp_mr());
       } else if (
           partitionFunctionType_ == PartitionFunctionType::kRoundRobinRow) {
         auto result = cudf::round_robin_partition(

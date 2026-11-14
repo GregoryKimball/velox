@@ -164,6 +164,48 @@ TEST_F(CudfHivePartitionFunctionTest, matchesCpuForExtremeKeys) {
   expectSamePartitions(input, 3, {}, {1, 0});
 }
 
+TEST_F(CudfHivePartitionFunctionTest, partitionGroupsRowsByPartition) {
+  auto fuzzer = makeFuzzer();
+  const auto keys = fuzzer.fuzzFlat(BIGINT());
+  const auto input = makeRowVector(
+      {keys,
+       makeFlatVector<int32_t>(keys->size(), [](auto row) { return row; })});
+  auto table =
+      with_arrow::toCudfTable(input, pool(), stream_, memoryResource());
+  constexpr int kNumBuckets = 16;
+  // cuDF partitions by a mask for a power of two partitions, by a remainder
+  // otherwise.
+  for (const int numPartitions : {4, 3}) {
+    SCOPED_TRACE(numPartitions);
+    const auto bucketToPartition = scatteredBuckets(kNumBuckets, numPartitions);
+    connector::hive::HivePartitionFunction cpuFunction(
+        kNumBuckets, bucketToPartition, {0});
+    std::vector<uint32_t> expected;
+    cpuFunction.partition(*input, expected);
+    const CudfHivePartitionFunction gpuFunction(
+        kNumBuckets, bucketToPartition, {0});
+    auto [grouped, offsets] = gpuFunction.partition(
+        table->view(), numPartitions, stream_, memoryResource());
+    ASSERT_EQ(offsets.size(), numPartitions + 1);
+    ASSERT_EQ(offsets.front(), 0);
+    ASSERT_EQ(offsets.back(), input->size());
+    ASSERT_EQ(grouped->num_columns(), 2);
+    std::vector<int32_t> rows(input->size());
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        rows.data(),
+        grouped->view().column(1).data<int32_t>(),
+        rows.size() * sizeof(int32_t),
+        cudaMemcpyDeviceToHost,
+        stream_.value()));
+    stream_.synchronize();
+    for (int partition = 0; partition < numPartitions; ++partition) {
+      for (auto i = offsets[partition]; i < offsets[partition + 1]; ++i) {
+        ASSERT_EQ(expected[rows[i]], partition) << "grouped row " << i;
+      }
+    }
+  }
+}
+
 TEST_F(CudfHivePartitionFunctionTest, fromSpecMatchesTheFunctionTheSpecCreates) {
   auto fuzzer = makeFuzzer();
   // The operator's output drops a column and reorders the others: the keys,

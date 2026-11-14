@@ -18,6 +18,8 @@
 
 #include "velox/connectors/hive/HiveConnector.h"
 
+#include <cudf/partitioning.hpp>
+
 #include <algorithm>
 #include <random>
 
@@ -78,6 +80,33 @@ CudfHivePartitionFunction CudfHivePartitionFunction::fromSpec(
   }
   return CudfHivePartitionFunction(
       numBuckets, std::move(bucketToPartition), std::move(keyColumns));
+}
+
+std::pair<std::unique_ptr<cudf::table>, std::vector<cudf::size_type>>
+CudfHivePartitionFunction::partition(
+    cudf::table_view input,
+    int numPartitions,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) const {
+  const auto partitionNumbers = partitions(input, stream, mr);
+  // The identity hash of a partition number below 'numPartitions' is its
+  // partition, so cuDF's hash partitioner, which copies rows block by block,
+  // groups the rows faster than cudf::partition() scatters them.
+  std::vector<cudf::column_view> columns(input.begin(), input.end());
+  columns.push_back(partitionNumbers->view());
+  auto [grouped, offsets] = cudf::hash_partition(
+      cudf::table_view(columns),
+      {static_cast<cudf::size_type>(input.num_columns())},
+      numPartitions,
+      cudf::hash_id::HASH_IDENTITY,
+      cudf::DEFAULT_HASH_SEED,
+      stream,
+      mr);
+  auto groupedColumns = grouped->release();
+  groupedColumns.pop_back();
+  return {
+      std::make_unique<cudf::table>(std::move(groupedColumns)),
+      std::move(offsets)};
 }
 
 } // namespace facebook::velox::cudf_velox

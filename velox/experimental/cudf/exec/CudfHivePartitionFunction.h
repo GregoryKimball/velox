@@ -16,6 +16,7 @@
 #pragma once
 
 #include <cudf/column/column.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 
@@ -24,6 +25,7 @@
 #include <cuda/stream>
 
 #include <memory>
+#include <utility>
 #include <vector>
 
 // Declared here because this header is compiled by nvcc, which cannot compile
@@ -79,6 +81,17 @@ class CudfHivePartitionFunction {
   /// nulls. Every key column must be supported.
   std::unique_ptr<cudf::column> partitions(
       cudf::table_view input,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) const;
+
+  /// Returns the rows of 'input' grouped by partition, partitions 0 to
+  /// 'numPartitions' - 1 in order, with the 'numPartitions' + 1 offsets of the
+  /// partitions in them. Every partition of a row must be below
+  /// 'numPartitions'.
+  std::pair<std::unique_ptr<cudf::table>, std::vector<cudf::size_type>>
+  partition(
+      cudf::table_view input,
+      int numPartitions,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) const;
 
