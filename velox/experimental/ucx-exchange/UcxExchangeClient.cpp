@@ -15,6 +15,8 @@
  */
 #include "velox/experimental/ucx-exchange/UcxExchangeClient.h"
 
+#include <atomic>
+
 #include "velox/common/base/Counters.h"
 #include "velox/common/base/StatsReporter.h"
 
@@ -162,6 +164,12 @@ UcxExchangeClient::next(int consumerId, bool* atEnd, ContinueFuture* future) {
   }
 
   // Outside of lock: resume backpressured sources and fulfill stale promise.
+  if (!sourcesToResume.empty()) {
+    // Pairs with the fence in UcxExchangeSource::process() after pausing:
+    // either the pausing source sees this dequeue or the resume below sees
+    // its flag.
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+  }
   for (auto& source : sourcesToResume) {
     source->resumeFromBackpressure();
   }

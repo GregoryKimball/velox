@@ -145,9 +145,10 @@ void UcxExchangeSource::process() {
       break;
     case ReceiverState::ReadyToReceive: {
       // Backpressure: don't post the next receive if the consumer queue is
-      // overloaded. The source goes dormant (not in work queue) and will be
-      // woken by UcxExchangeClient::next() calling resumeFromBackpressure()
-      // when the queue drains below the low water mark.
+      // overloaded. The source goes dormant (not in work queue) and is woken
+      // by resumeFromBackpressure() once the queue drains to the low water
+      // mark: from UcxExchangeClient::next() after a dequeue, or below when
+      // the queue drained while the source was pausing.
       //
       // This creates natural backpressure: the server's tagSend for data
       // will block at rendezvous until we post a matching tagRecv. For
@@ -159,8 +160,18 @@ void UcxExchangeSource::process() {
                   << " queueBytes=" << queue_->totalBytes()
                   << " highWater=" << kBackpressureHighWaterMark;
         }
+        // The consumer resumes only a source whose flag is set, so a drain
+        // between the check above and setting the flag leaves no later
+        // dequeue to resume this source. Re-check the queue now that the flag
+        // is set. The fence pairs with the one in UcxExchangeClient::next():
+        // either this load sees the drained queue or the consumer sees the
+        // flag.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (atOrBelowBackpressureLowWaterMark(*queue_)) {
+          resumeFromBackpressure();
+        }
         // Go dormant — do NOT re-enqueue into work queue.
-        // UcxExchangeClient::next() will call resumeFromBackpressure().
+        // resumeFromBackpressure() puts the source back.
         break;
       }
 
