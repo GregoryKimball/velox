@@ -433,6 +433,29 @@ TEST_F(ExchangeStoreTest, demotesDeviceTierToHostAndStaysSmaller) {
   EXPECT_EQ(store.demote(1), 0);
 }
 
+TEST_F(ExchangeStoreTest, restoresDeviceTierOnceItHoldsNoTables) {
+  const auto input = makeInput();
+  auto payloads = pack(input, {500}, compressions().back());
+  const auto secondBytes = bytesOf(payloads[1]);
+  ExchangeStore store;
+  store.setDeviceCapacity(kUnlimited);
+  store.add("query1_table", "0", std::move(payloads[0]), 500, {}, stream_);
+  ASSERT_GT(store.demote(1), 0);
+  store.drop("query1_table");
+
+  // The shrink answered one query's lack of memory: once the store holds no
+  // tables, the next payload gets the configured device tier again.
+  EXPECT_FALSE(store.add(
+      "query2_table",
+      "0",
+      std::move(payloads[1]),
+      kNumRows - 500,
+      {},
+      stream_));
+  EXPECT_EQ(store.stats().deviceBytes, secondBytes);
+  EXPECT_EQ(store.stats().hostBytes, 0);
+}
+
 TEST_F(ExchangeStoreTest, failsWhenHostTierIsFull) {
   const auto input = makeInput();
   auto payloads = pack(input, {500}, ExchangeCompression::kNone);

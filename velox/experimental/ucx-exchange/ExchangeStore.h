@@ -136,9 +136,10 @@ class ExchangeStore {
 
   /// Moves device-tier payloads to the host tier until at least 'bytes' are
   /// moved or none is left, and lowers the device tier's capacity to what it
-  /// then holds. Keys are not moved: they are small, and payloads in several
-  /// files may be copying from them. Returns the bytes moved. Called when a
-  /// device allocation fails (see releaseDeviceMemory() in GpuResources.h).
+  /// then holds, until the store holds no tables again. Keys are not moved:
+  /// they are small, and payloads in several files may be copying from them.
+  /// Returns the bytes moved. Called when a device allocation fails (see
+  /// releaseDeviceMemory() in GpuResources.h).
   std::size_t demote(std::size_t bytes);
 
   struct Stats {
@@ -225,12 +226,21 @@ class ExchangeStore {
   void forget(const StoredPayload& payload);
   void forget(const Table& table);
 
+  // Restores the device tier's capacity to the configured one once 'tables_'
+  // is empty: a demote() answered one query's lack of memory, and keeping the
+  // smaller tier would send later queries' payloads to host memory although
+  // the device has room again. Called with 'mutex_' held.
+  void restoreDeviceCapacityIfEmpty();
+
   mutable std::mutex mutex_;
   // Declared before 'tables_' so that it outlives the host buffers.
   std::unique_ptr<HostPool> hostPool_;
   folly::F14FastMap<std::string, Table> tables_;
   uint64_t nextKeysId_{0};
   uint64_t deviceCapacity_{0};
+  // The capacity setDeviceCapacity() gave; demote() lowers deviceCapacity_
+  // below it until the store is empty again.
+  uint64_t configuredDeviceCapacity_{0};
   uint64_t hostCapacity_{std::numeric_limits<uint64_t>::max()};
   // Bytes in each tier, including payloads being added.
   uint64_t deviceBytes_{0};

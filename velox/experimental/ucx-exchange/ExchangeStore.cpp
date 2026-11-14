@@ -97,6 +97,13 @@ ExchangeStore& ExchangeStore::instance() {
 void ExchangeStore::setDeviceCapacity(uint64_t bytes) {
   std::lock_guard<std::mutex> lock(mutex_);
   deviceCapacity_ = bytes;
+  configuredDeviceCapacity_ = bytes;
+}
+
+void ExchangeStore::restoreDeviceCapacityIfEmpty() {
+  if (tables_.empty()) {
+    deviceCapacity_ = configuredDeviceCapacity_;
+  }
 }
 
 void ExchangeStore::setHostCapacity(uint64_t bytes) {
@@ -240,6 +247,7 @@ std::vector<ExchangeStore::TakenPayload> ExchangeStore::take(
     if (files.empty()) {
       forget(tableIt->second);
       tables_.erase(tableIt);
+      restoreDeviceCapacityIfEmpty();
     }
   }
 
@@ -334,6 +342,7 @@ void ExchangeStore::drop(std::string_view table) {
     dropped = std::move(it->second);
     tables_.erase(it);
     forget(dropped);
+    restoreDeviceCapacityIfEmpty();
   }
   // 'dropped' frees both tiers' memory outside the lock.
 }
@@ -351,6 +360,7 @@ void ExchangeStore::dropQuery(std::string_view queryId) {
       dropped.push_back(std::move(it->second));
       it = tables_.erase(it);
     }
+    restoreDeviceCapacityIfEmpty();
   }
   // 'dropped' frees both tiers' memory outside the lock.
 }
