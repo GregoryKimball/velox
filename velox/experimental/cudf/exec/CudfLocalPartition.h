@@ -15,11 +15,14 @@
  */
 #pragma once
 
+#include "velox/experimental/cudf/exec/CudfHivePartitionFunction.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/exec/LocalPartition.h"
 #include "velox/exec/Operator.h"
+
+#include <optional>
 
 namespace facebook::velox::cudf_velox {
 
@@ -27,6 +30,7 @@ enum class PartitionFunctionType {
   kHash,
   kRoundRobin,
   kRoundRobinRow,
+  kHive,
 };
 
 class CudfLocalPartition : public CudfOperatorBase {
@@ -82,6 +86,10 @@ class CudfLocalPartition : public CudfOperatorBase {
   std::vector<ContinueFuture> futures_;
 
   std::vector<column_index_t> partitionKeyIndices_;
+
+  // Set for kHive: the Hive bucket function of a bucketed table's writers,
+  // whose local exchange gives each bucket to one writer driver.
+  std::optional<CudfHivePartitionFunction> hivePartitionFunction_;
 };
 
 } // namespace facebook::velox::cudf_velox

@@ -15,10 +15,13 @@
  */
 #include "velox/experimental/cudf/exec/CudfHivePartitionFunction.h"
 
+#include "velox/connectors/hive/HiveConnector.h"
 #include "velox/connectors/hive/HivePartitionFunction.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/vector/fuzzer/VectorFuzzer.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
+
+#include <fmt/format.h>
 
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -159,6 +162,56 @@ TEST_F(CudfHivePartitionFunctionTest, matchesCpuForExtremeKeys) {
   expectSamePartitions(input, 256, {}, {0});
   expectSamePartitions(input, 256, {}, {1});
   expectSamePartitions(input, 3, {}, {1, 0});
+}
+
+TEST_F(CudfHivePartitionFunctionTest, fromSpecMatchesTheFunctionTheSpecCreates) {
+  auto fuzzer = makeFuzzer();
+  // The operator's output drops a column and reorders the others: the keys,
+  // channels of the input, are located in the output by name.
+  const auto inputType =
+      ROW({"a", "dropped", "b"}, {BIGINT(), DOUBLE(), VARCHAR()});
+  const auto outputType = ROW({"b", "a"}, {VARCHAR(), BIGINT()});
+  const auto input = makeRowVector(
+      {"a", "dropped", "b"},
+      {fuzzer.fuzzFlat(BIGINT()),
+       fuzzer.fuzzFlat(DOUBLE()),
+       fuzzer.fuzzFlat(VARCHAR())});
+  const auto output =
+      makeRowVector({"b", "a"}, {input->childAt(2), input->childAt(0)});
+  auto table =
+      with_arrow::toCudfTable(output, pool(), stream_, memoryResource());
+  const std::vector<column_index_t> keys{2, 0};
+  constexpr int kNumBuckets = 16;
+  constexpr int kNumPartitions = 3;
+  const connector::hive::HivePartitionFunctionSpec withoutMap(
+      kNumBuckets, keys, {});
+  const connector::hive::HivePartitionFunctionSpec withMap(
+      kNumBuckets, scatteredBuckets(kNumBuckets, kNumPartitions), keys, {});
+  for (const auto* spec : {&withoutMap, &withMap}) {
+    for (const bool localExchange : {false, true}) {
+      SCOPED_TRACE(
+          fmt::format("{}, local {}", spec->toString(), localExchange));
+      std::vector<uint32_t> expected;
+      spec->create(kNumPartitions, localExchange)->partition(*input, expected);
+      const auto gpuFunction = CudfHivePartitionFunction::fromSpec(
+          *spec, kNumPartitions, localExchange, inputType, outputType);
+      auto partitions =
+          gpuFunction.partitions(table->view(), stream_, memoryResource());
+      std::vector<int32_t> actual(input->size());
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          actual.data(),
+          partitions->view().data<int32_t>(),
+          actual.size() * sizeof(int32_t),
+          cudaMemcpyDeviceToHost,
+          stream_.value()));
+      stream_.synchronize();
+      EXPECT_EQ(std::vector<uint32_t>(actual.begin(), actual.end()), expected);
+    }
+  }
+  EXPECT_TRUE(CudfHivePartitionFunction::supports(withMap, inputType));
+  EXPECT_FALSE(CudfHivePartitionFunction::supports(
+      connector::hive::HivePartitionFunctionSpec(kNumBuckets, {1}, {}),
+      ROW({"a", "b"}, {BIGINT(), TIMESTAMP()})));
 }
 
 TEST_F(CudfHivePartitionFunctionTest, rejectsUnsupportedKeyType) {

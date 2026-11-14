@@ -27,7 +27,6 @@
 #include "velox/experimental/cudf/exec/GpuCapabilities.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
-#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 #include "velox/experimental/ucx-exchange/ExchangeCompression.h"
 #include "velox/vector/VectorStream.h"
@@ -51,46 +50,6 @@ using facebook::velox::exec::Task;
 namespace facebook::velox::ucx_exchange {
 
 namespace {
-
-// The GPU form of a Hive partition function for 'node': the bucket count, the
-// bucket-to-partition map, which HivePartitionFunctionSpec::create() fills as
-// bucket % partitions for a remote exchange when the spec has none, and the key
-// channels of the node's input located in its output, which is what the
-// operator partitions.
-CudfHivePartitionFunction makeHivePartitionFunction(
-    const connector::hive::HivePartitionFunctionSpec& spec,
-    const core::PartitionedOutputNode& node) {
-  const auto serialized = spec.serialize();
-  VELOX_CHECK(
-      serialized["constants"].empty(),
-      "Hive bucketing on constant keys is not supported on the GPU");
-  const auto numBuckets = static_cast<int>(serialized["numBuckets"].asInt());
-  auto bucketToPartition = ISerializable::deserialize<std::vector<int>>(
-      serialized["bucketToPartition"]);
-  if (bucketToPartition.empty()) {
-    for (int bucket = 0; bucket < numBuckets; ++bucket) {
-      bucketToPartition.push_back(bucket % node.numPartitions());
-    }
-  }
-  const auto& inputType = node.inputType();
-  const auto& outputType = node.outputType();
-  std::vector<cudf::size_type> keyColumns;
-  for (const auto channel :
-       ISerializable::deserialize<std::vector<column_index_t>>(
-           serialized["keys"])) {
-    const auto& name = inputType->nameOf(channel);
-    const auto column = outputType->getChildIdx(name);
-    VELOX_CHECK(
-        CudfHivePartitionFunction::supports(
-            veloxToCudfDataType(outputType->childAt(column))),
-        "The GPU cannot compute the Hive bucket of key {} of type {}",
-        name,
-        outputType->childAt(column)->toString());
-    keyColumns.push_back(static_cast<cudf::size_type>(column));
-  }
-  return CudfHivePartitionFunction(
-      numBuckets, std::move(bucketToPartition), std::move(keyColumns));
-}
 
 // A flush holds its inputs, their concatenation and its partitions at once, in
 // every driver of every partitioned output; the same share as a cuDF batch
@@ -414,7 +373,12 @@ void UcxPartitionedOutput::initPartitionKeys(
   if (const auto* hive =
           dynamic_cast<const connector::hive::HivePartitionFunctionSpec*>(
               planNode->partitionFunctionSpecPtr().get())) {
-    hivePartitionFunction_.emplace(makeHivePartitionFunction(*hive, *planNode));
+    hivePartitionFunction_.emplace(CudfHivePartitionFunction::fromSpec(
+        *hive,
+        planNode->numPartitions(),
+        /*localExchange=*/false,
+        planNode->inputType(),
+        planNode->outputType()));
     return;
   }
 

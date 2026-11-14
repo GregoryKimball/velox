@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
+#include "velox/connectors/hive/HiveConnector.h"
 #include "velox/core/PlanNode.h"
 #include "velox/exec/HashPartitionFunction.h"
 #include "velox/exec/RoundRobinPartitionFunction.h"
@@ -62,6 +63,11 @@ bool CudfLocalPartition::shouldReplace(
           core::GatherPartitionFunctionSpec>(
           &planNode->partitionFunctionSpec())) {
     return true;
+  }
+  if (const auto* hive =
+          dynamic_cast<const velox::connector::hive::HivePartitionFunctionSpec*>(
+              &planNode->partitionFunctionSpec())) {
+    return CudfHivePartitionFunction::supports(*hive, planNode->outputType());
   }
   std::string spec = planNode->partitionFunctionSpec().toString();
   if (spec.find("ROUND ROBIN ROW") != std::string::npos) {
@@ -144,11 +150,26 @@ CudfLocalPartition::CudfLocalPartition(
   } else if (
       numPartitions_ > 1 && spec.find("ROUND ROBIN ROW") != std::string::npos) {
     partitionFunctionType_ = PartitionFunctionType::kRoundRobinRow;
+  } else if (
+      const auto* hive =
+          dynamic_cast<const velox::connector::hive::HivePartitionFunctionSpec*>(
+              &planNode->partitionFunctionSpec());
+      hive != nullptr && numPartitions_ > 1) {
+    // The partitions LocalPartition's own function would give
+    // (HivePartitionFunctionSpec::create() for a local exchange).
+    hivePartitionFunction_.emplace(CudfHivePartitionFunction::fromSpec(
+        *hive,
+        static_cast<int>(numPartitions_),
+        /*localExchange=*/true,
+        planNode->outputType(),
+        planNode->outputType()));
+    partitionFunctionType_ = PartitionFunctionType::kHive;
   }
   VELOX_CHECK(
       numPartitions_ == 1 || partitionKeyIndices_.size() > 0 ||
       partitionFunctionType_ == PartitionFunctionType::kRoundRobin ||
-      partitionFunctionType_ == PartitionFunctionType::kRoundRobinRow);
+      partitionFunctionType_ == PartitionFunctionType::kRoundRobinRow ||
+      partitionFunctionType_ == PartitionFunctionType::kHive);
 
   // Since we're replacing the LocalPartition with CudfLocalPartition, the
   // number of producers is already set. Adding producer only adds to a counter
@@ -225,6 +246,15 @@ void CudfLocalPartition::doAddInput(RowVectorPtr input) {
             numPartitions_,
             cudf::hash_id::HASH_MURMUR3,
             kLocalExchangeHashSeed,
+            stream,
+            get_temp_mr());
+      } else if (partitionFunctionType_ == PartitionFunctionType::kHive) {
+        auto partitions = hivePartitionFunction_->partitions(
+            tableView, stream, get_temp_mr());
+        return cudf::partition(
+            tableView,
+            partitions->view(),
+            static_cast<cudf::size_type>(numPartitions_),
             stream,
             get_temp_mr());
       } else if (

@@ -262,9 +262,9 @@ TEST_F(LocalPartitionTest, hashAfterRemoteHashUsesAllLocalDrivers) {
   }
 }
 
-// The hive partition function spec is not one that
-// CudfLocalPartition::shouldReplace accepts, so the LocalPartition stays on
-// CPU and enqueues host RowVectors. The consuming LocalExchange must report
+// A Hive partition function spec on a key the GPU cannot hash (TIMESTAMP) is
+// not one that CudfLocalPartition::shouldReplace accepts, so the
+// LocalPartition stays on CPU and enqueues host RowVectors. The consuming LocalExchange must report
 // host output so that CudfFromVelox is inserted ahead of the GPU TopN.
 // Otherwise CudfTopN::doAddInput receives a host RowVector and fails the
 // CudfVector cast with INVALID_STATE. This is the mixed GPU/CPU pipeline
@@ -279,10 +279,17 @@ TEST_F(LocalPartitionTest, unsupportedPartitionSpecIntoTopN) {
     cudf_velox::registerCudf();
   };
 
+  const auto withTimestamps = [&](int32_t start) {
+    return makeRowVector(
+        {makeFlatSequence<int32_t>(start, 100),
+         makeFlatVector<Timestamp>(100, [start](auto row) {
+           return Timestamp(start + row, 0);
+         })});
+  };
   std::vector<RowVectorPtr> vectors = {
-      makeRowVector({makeFlatSequence<int32_t>(0, 100)}),
-      makeRowVector({makeFlatSequence<int32_t>(53, 100)}),
-      makeRowVector({makeFlatSequence<int32_t>(-71, 100)}),
+      withTimestamps(0),
+      withTimestamps(53),
+      withTimestamps(-71),
   };
 
   createDuckDbTable(vectors);
@@ -291,13 +298,45 @@ TEST_F(LocalPartitionTest, unsupportedPartitionSpecIntoTopN) {
 
   auto op = PlanBuilder(planNodeIdGenerator)
                 .values(vectors)
-                .localPartition(4, {0}, {})
+                .localPartition(4, {1}, {})
                 .topN({"c0 DESC NULLS LAST"}, 10, false)
                 .planNode();
 
   AssertQueryBuilder queryBuilder(op, duckDbQueryRunner_);
   queryBuilder.maxDrivers(2);
-  queryBuilder.assertResults("SELECT c0 FROM tmp ORDER BY c0 DESC LIMIT 10");
+  queryBuilder.assertResults(
+      "SELECT c0, c1 FROM tmp ORDER BY c0 DESC LIMIT 10");
+}
+
+TEST_F(LocalPartitionTest, hiveBucketsPartitionOnTheGpu) {
+  // A bucketed table writer with several drivers gets its rows through a local
+  // exchange on the table's Hive bucket function, so that each bucket has one
+  // writer. CPU fallback is off: the exchange must run on the GPU.
+  std::vector<RowVectorPtr> vectors = {
+      makeRowVector({makeFlatSequence<int64_t>(0, 1'000, 3'000)}),
+      makeRowVector({makeFlatSequence<int64_t>(500, 1'000, 3'000)}),
+  };
+  createDuckDbTable(vectors);
+  core::PlanNodeId localId;
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .localPartition(16, {0}, {})
+                  .capturePlanNodeId(localId)
+                  .singleAggregation({"c0"}, {"count(1)"})
+                  .planNode();
+  auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+                  .maxDrivers(4)
+                  .config(core::QueryConfig::kMaxLocalExchangePartitionCount, "4")
+                  .assertResults("SELECT c0, count(1) FROM tmp GROUP BY 1");
+  bool sawLocalPartition = false;
+  for (const auto& pipeline : task->taskStats().pipelineStats) {
+    for (const auto& op : pipeline.operatorStats) {
+      sawLocalPartition |= op.planNodeId == localId &&
+          op.operatorType == "CudfLocalPartition" &&
+          op.inputPositions == 6'000;
+    }
+  }
+  EXPECT_TRUE(sawLocalPartition);
 }
 
 TEST_F(LocalPartitionTest, unionAllLocalExchange) {

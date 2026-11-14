@@ -26,6 +26,16 @@
 #include <memory>
 #include <vector>
 
+// Declared here because this header is compiled by nvcc, which cannot compile
+// velox/type/Type.h.
+namespace facebook::velox {
+class RowType;
+} // namespace facebook::velox
+
+namespace facebook::velox::connector::hive {
+class HivePartitionFunctionSpec;
+} // namespace facebook::velox::connector::hive
+
 namespace facebook::velox::cudf_velox {
 
 /// Assigns rows to partitions on the GPU exactly as
@@ -46,6 +56,24 @@ class CudfHivePartitionFunction {
   /// integer, boolean, floating point, DATE (TIMESTAMP_DAYS), short decimal
   /// (DECIMAL64) and string types.
   static bool supports(cudf::data_type type);
+
+  /// Returns whether the GPU can compute the partitions of 'spec' over rows of
+  /// 'inputType': it has no constant keys and every key can be hashed.
+  static bool supports(
+      const velox::connector::hive::HivePartitionFunctionSpec& spec,
+      const std::shared_ptr<const RowType>& inputType);
+
+  /// Returns the GPU form of the function 'spec' creates for 'numPartitions'
+  /// partitions of a remote or a local exchange
+  /// (HivePartitionFunctionSpec::create()), for an operator that partitions
+  /// rows of 'outputType'. The keys of 'spec', channels of 'inputType', are
+  /// located in 'outputType' by name. 'spec' must be supported.
+  static CudfHivePartitionFunction fromSpec(
+      const velox::connector::hive::HivePartitionFunctionSpec& spec,
+      int numPartitions,
+      bool localExchange,
+      const std::shared_ptr<const RowType>& inputType,
+      const std::shared_ptr<const RowType>& outputType);
 
   /// Returns the partition of each row of 'input' as an INT32 column without
   /// nulls. Every key column must be supported.
