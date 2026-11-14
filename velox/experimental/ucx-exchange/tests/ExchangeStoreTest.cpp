@@ -538,7 +538,7 @@ TEST_F(ExchangeStoreTest, failsWhenHostTierIsFull) {
 
 TEST(ExchangeStoreTablesTest, keysFilesByTableDirectoryAndFileName) {
   const std::pair<std::string, std::string> expected{
-      "__presto_temporary_table_PARQUET_q_1", "000003_0_q"};
+      "__presto_temporary_table_PARQUET_q_1", "3"};
   // The writer's path and a split's path, which carries a scheme.
   EXPECT_EQ(
       storeKey("/data/hive/__presto_temporary_table_PARQUET_q_1/000003_0_q"),
@@ -553,6 +553,26 @@ TEST(ExchangeStoreTablesTest, keysFilesByTableDirectoryAndFileName) {
   VELOX_ASSERT_THROW(
       storeKey("/data/__presto_temporary_table_PARQUET_q_1/"),
       "Not a path to a temporary table");
+}
+
+TEST(ExchangeStoreTablesTest, keysBucketFilesByBucketNumber) {
+  // A bucket's file is found by its bucket number whatever the padding and the
+  // rest of the name, so that a split made before the file is written (the
+  // reading section starting with the writing one) finds it.
+  const std::pair<std::string, std::string> expected{
+      "__presto_temporary_table_PARQUET_q_1", "3"};
+  EXPECT_EQ(
+      storeKey("/data/__presto_temporary_table_PARQUET_q_1/0003_0_query"),
+      expected);
+  EXPECT_EQ(
+      storeKey("/split/__presto_temporary_table_PARQUET_q_1/03_0_query.parquet"),
+      expected);
+  EXPECT_EQ(
+      storeKey("/data/__presto_temporary_table_PARQUET_q_1/012_0_q").second,
+      "12");
+  // Files that are not bucket files keep their name.
+  EXPECT_EQ(storeKey("/data/table/part-0001.parquet").second, "part-0001.parquet");
+  EXPECT_EQ(storeKey("/data/table/0003").second, "0003");
 }
 
 } // namespace

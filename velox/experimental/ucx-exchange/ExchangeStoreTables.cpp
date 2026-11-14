@@ -48,6 +48,7 @@
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/traits.hpp>
 
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <limits>
@@ -1172,6 +1173,34 @@ std::shared_ptr<ExchangeStoreTaskListener>& taskListener() {
 
 } // namespace
 
+namespace {
+
+// Returns the bucket number of a bucketed table's file name, written as "0",
+// the zero-padded bucket, "_", a number and "_" (computeBucketedFileName() in
+// HiveDataSink.cpp), as a decimal without padding; returns the name itself for
+// other files.
+std::string fileKey(std::string_view name) {
+  size_t digitsEnd = 1;
+  while (digitsEnd < name.size() && std::isdigit(name[digitsEnd])) {
+    ++digitsEnd;
+  }
+  size_t sequenceEnd = digitsEnd + 1;
+  while (sequenceEnd < name.size() && std::isdigit(name[sequenceEnd])) {
+    ++sequenceEnd;
+  }
+  const bool bucketFile = name.size() > 1 && name[0] == '0' &&
+      digitsEnd > 1 && digitsEnd < name.size() && name[digitsEnd] == '_' &&
+      sequenceEnd > digitsEnd + 1 && sequenceEnd < name.size() &&
+      name[sequenceEnd] == '_';
+  if (!bucketFile) {
+    return std::string{name};
+  }
+  return std::to_string(
+      std::stoll(std::string{name.substr(1, digitsEnd - 1)}));
+}
+
+} // namespace
+
 std::pair<std::string, std::string> storeKey(std::string_view path) {
   const auto fileStart = path.find_last_of('/');
   VELOX_CHECK(
@@ -1185,7 +1214,7 @@ std::pair<std::string, std::string> storeKey(std::string_view path) {
       slashBeforeTable == std::string_view::npos ? 0 : slashBeforeTable + 1;
   return {
       std::string{path.substr(tableStart, tableEnd - tableStart)},
-      std::string{path.substr(fileStart + 1)},
+      fileKey(path.substr(fileStart + 1)),
   };
 }
 

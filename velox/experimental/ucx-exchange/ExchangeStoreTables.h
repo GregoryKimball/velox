@@ -34,9 +34,11 @@ void registerExchangeStoreTables(uint64_t deviceBytes, uint64_t hostBytes);
 void unregisterExchangeStoreTables();
 
 /// Returns the table and file under which ExchangeStore keeps the data of the
-/// temporary table file at 'path': the names of its directory and of the file.
-/// Both are unique per query and are the same in the writer's path and in a
-/// split's path, which may differ in scheme.
+/// temporary table file at 'path': the name of its directory, and the bucket
+/// number of a bucket file (the name of any other file). Both are unique per
+/// query and are the same in the writer's path and in a split's path, which
+/// may differ in scheme and, for a split made before the file was written, in
+/// the rest of the file name.
 std::pair<std::string, std::string> storeKey(std::string_view path);
 
 } // namespace facebook::velox::ucx_exchange
