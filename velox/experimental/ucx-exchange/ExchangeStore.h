@@ -15,11 +15,13 @@
  */
 #pragma once
 
+#include "velox/common/future/VeloxPromise.h"
 #include "velox/experimental/cudf/connectors/hive/FusedForColumnEncoding.h"
 #include "velox/experimental/ucx-exchange/ExchangeCompression.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeQueue.h"
 
 #include <folly/container/F14Map.h>
+#include <folly/container/F14Set.h>
 #include <rmm/device_buffer.hpp>
 #include <rmm/resource_ref.hpp>
 
@@ -27,9 +29,11 @@
 #include <cuda_runtime_api.h>
 
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -128,6 +132,30 @@ class ExchangeStore {
       rmm::device_async_resource_ref mr,
       TakeStats* stats = nullptr);
 
+  /// Records that the task 'taskId' writes 'table' on this worker. The table
+  /// is complete once every task that began writing it has ended its writes
+  /// (endWrites()); until then takeOrWait() waits for more payloads instead of
+  /// treating a file without payloads as done.
+  void beginWrite(std::string_view table, std::string_view taskId);
+
+  /// Ends the writes of the task 'taskId' to every table it began writing, and
+  /// wakes the readers of each table that is now complete.
+  void endWrites(std::string_view taskId);
+
+  /// Removes the payloads of 'file' of 'table' added so far, like take(), so
+  /// that a reader can consume a table while it is being written. Returns them
+  /// when there are any; an empty vector when there are none and the table is
+  /// complete (the file got no rows or was taken already); and std::nullopt
+  /// with 'future' set when there are none yet: it completes on the table's
+  /// next payload or when the table completes.
+  std::optional<std::vector<TakenPayload>> takeOrWait(
+      std::string_view table,
+      std::string_view file,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr,
+      ContinueFuture& future,
+      TakeStats* stats = nullptr);
+
   /// Frees the payloads of every file of 'table' that was not taken.
   void drop(std::string_view table);
 
@@ -213,6 +241,10 @@ class ExchangeStore {
   struct Table {
     Files files;
     folly::F14FastMap<uint64_t, StoredKeys> keys;
+    // Tasks that began writing the table and have not ended their writes.
+    folly::F14FastSet<std::string> writers;
+    // Readers waiting in takeOrWait() for the next payload or the completion.
+    std::vector<ContinuePromise> waiters;
   };
 
   // Moves 'payload' from the device to the host tier unless the device tier
@@ -225,6 +257,10 @@ class ExchangeStore {
   void forget(const std::vector<StoredPayload>& payloads);
   void forget(const StoredPayload& payload);
   void forget(const Table& table);
+
+  // Records the table 'name' as complete, for takeOrWait(). Called with
+  // 'mutex_' held when its last writer ends.
+  void complete(const std::string& name);
 
   // Restores the device tier's capacity to the configured one once 'tables_'
   // is empty: a demote() answered one query's lack of memory, and keeping the
@@ -241,6 +277,11 @@ class ExchangeStore {
   // The capacity setDeviceCapacity() gave; demote() lowers deviceCapacity_
   // below it until the store is empty again.
   uint64_t configuredDeviceCapacity_{0};
+  // Names of tables whose writers have all ended, so that a file never written
+  // (a bucket without rows) reads as done after its table was taken and
+  // erased. Bounded by kMaxCompletedTables, oldest first out.
+  folly::F14FastSet<std::string> completedTables_;
+  std::deque<std::string> completedOrder_;
   uint64_t hostCapacity_{std::numeric_limits<uint64_t>::max()};
   // Bytes in each tier, including payloads being added.
   uint64_t deviceBytes_{0};

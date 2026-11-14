@@ -524,7 +524,16 @@ class ExchangeStoreDataSink : public connector::hive::HiveDataSink {
         inputType_(inputType),
         pool_(connectorQueryCtx->memoryPool()),
         compression_(compression),
-        gpuBucketFunction_(makeGpuBucketFunction(inputType, *insertTableHandle)) {}
+        gpuBucketFunction_(makeGpuBucketFunction(inputType, *insertTableHandle)) {
+    // The table is complete on this worker once this task ends (see
+    // ExchangeStoreTaskListener): readers that start while it runs wait for it.
+    const auto& location = *insertTableHandle->locationHandle();
+    const auto& directory = location.writePath().empty()
+        ? location.targetPath()
+        : location.writePath();
+    ExchangeStore::instance().beginWrite(
+        storeKey(directory + "/file").first, connectorQueryCtx->taskId());
+  }
 
   void appendData(RowVectorPtr input) override {
     auto gpuInput = std::dynamic_pointer_cast<cudf_velox::CudfVector>(input);
@@ -883,49 +892,66 @@ class ExchangeStoreDataSource : public connector::DataSource {
     allColumns_ = columns_ == allColumns;
   }
 
+  // Takes the payloads of the split's file written so far. A file that is still
+  // being written (its table is read while the producer runs) is read further
+  // in next(), which waits for the rest.
   void addSplit(std::shared_ptr<connector::ConnectorSplit> split) override {
     VELOX_CHECK_EQ(next_, payloads_.size(), "The previous split is not done");
-    const auto [table, file] = storeKey(filePath(*split));
+    std::tie(table_, file_) = storeKey(filePath(*split));
     stream_ = cudf_velox::cudfGlobalStreamPool().get_stream();
-    payloads_ = ExchangeStore::instance().take(
-        table, file, stream_, cudf_velox::get_output_mr(), &takeStats_);
+    payloads_.clear();
     next_ = 0;
+    splitDone_ = false;
+    auto ignored = ContinueFuture::makeEmpty();
+    takeMore(ignored);
   }
 
   // Returns the split's payloads concatenated into batches of at least
   // CudfConfig::batchSizeMinThreshold rows where the payloads allow. A writer
   // splits every batch it gets across all buckets, so a file holds many small
   // payloads, and each batch costs the operators downstream a fixed overhead.
-  std::optional<RowVectorPtr> next(uint64_t /*size*/, ContinueFuture& /*future*/)
+  std::optional<RowVectorPtr> next(uint64_t /*size*/, ContinueFuture& future)
       override {
     const auto targetRows = static_cast<vector_size_t>(
         cudf_velox::CudfConfig::getInstance().batchSizeMinThreshold);
-    std::vector<RestoredPayload> batch;
-    vector_size_t batchRows = 0;
-    while (next_ < payloads_.size() &&
-           (batch.empty() || batchRows < targetRows) &&
-           (batch.empty() ||
-            static_cast<int64_t>(batchRows) + payloads_[next_].data->numRows <=
-                std::numeric_limits<cudf::size_type>::max())) {
-      auto restored = restore(std::move(payloads_[next_++]), stream_);
-      const auto numRows = restored.data->numRows;
-      if (numRows == 0) {
-        continue;
+    // Payloads without rows give no batch; take more until one does or the
+    // split is done.
+    for (;;) {
+      while (next_ == payloads_.size() && !splitDone_) {
+        if (!takeMore(future)) {
+          return std::nullopt;
+        }
       }
-      completedRows_ += numRows;
-      completedBytes_ += restored.data->gpuDataSize();
-      batchRows += numRows;
-      batch.push_back(std::move(restored));
+      std::vector<RestoredPayload> batch;
+      vector_size_t batchRows = 0;
+      while (next_ < payloads_.size() &&
+             (batch.empty() || batchRows < targetRows) &&
+             (batch.empty() ||
+              static_cast<int64_t>(batchRows) +
+                      payloads_[next_].data->numRows <=
+                  std::numeric_limits<cudf::size_type>::max())) {
+        auto restored = restore(std::move(payloads_[next_++]), stream_);
+        const auto numRows = restored.data->numRows;
+        if (numRows == 0) {
+          continue;
+        }
+        completedRows_ += numRows;
+        completedBytes_ += restored.data->gpuDataSize();
+        batchRows += numRows;
+        batch.push_back(std::move(restored));
+      }
+      if (batch.size() == 1) {
+        return toOutput(std::move(batch[0]));
+      }
+      if (!batch.empty()) {
+        return concatenate(batch, batchRows);
+      }
+      if (splitDone_) {
+        payloads_.clear();
+        next_ = 0;
+        return nullptr;
+      }
     }
-    if (batch.size() == 1) {
-      return toOutput(std::move(batch[0]));
-    }
-    if (!batch.empty()) {
-      return concatenate(batch, batchRows);
-    }
-    payloads_.clear();
-    next_ = 0;
-    return nullptr;
   }
 
   // Takes over a source that the scan created to preload the next split. Its
@@ -936,6 +962,9 @@ class ExchangeStoreDataSource : public connector::DataSource {
     VELOX_CHECK_NOT_NULL(preloaded);
     VELOX_CHECK_EQ(next_, payloads_.size(), "The previous split is not done");
     stream_ = preloaded->stream_;
+    table_ = std::move(preloaded->table_);
+    file_ = std::move(preloaded->file_);
+    splitDone_ = preloaded->splitDone_;
     payloads_ = std::move(preloaded->payloads_);
     next_ = preloaded->next_;
     completedRows_ += preloaded->completedRows_;
@@ -1039,6 +1068,23 @@ class ExchangeStoreDataSource : public connector::DataSource {
         pool_, outputType_, numRows, std::move(table), stream_);
   }
 
+  // Replaces the taken payloads with the next ones of the split's file. Returns
+  // false with 'future' set when the file has none yet and is still being
+  // written; sets splitDone_ when it has none and is complete.
+  bool takeMore(ContinueFuture& future) {
+    auto taken = ExchangeStore::instance().takeOrWait(
+        table_, file_, stream_, cudf_velox::get_output_mr(), future, &takeStats_);
+    if (!taken.has_value()) {
+      return false;
+    }
+    if (taken->empty()) {
+      splitDone_ = true;
+    }
+    payloads_ = std::move(*taken);
+    next_ = 0;
+    return true;
+  }
+
   const RowTypePtr outputType_;
   memory::MemoryPool* const pool_;
   RowTypePtr dataColumns_;
@@ -1047,6 +1093,11 @@ class ExchangeStoreDataSource : public connector::DataSource {
   // Whether the output is every column of the table in order.
   bool allColumns_{false};
   cuda::stream_ref stream_{cudaStream_t{cudaStreamDefault}};
+  // The split's temporary table and file (storeKey()).
+  std::string table_;
+  std::string file_;
+  // Set once the split's file has no more payloads and its table is complete.
+  bool splitDone_{true};
   std::vector<ExchangeStore::TakenPayload> payloads_;
   size_t next_{0};
   uint64_t completedRows_{0};
@@ -1100,6 +1151,8 @@ class ExchangeStoreTaskListener : public exec::TaskListener {
       exec::TaskState state,
       std::exception_ptr /*error*/,
       exec::TaskStats /*stats*/) override {
+    // Completes the tables this task wrote, waking readers that wait for them.
+    ExchangeStore::instance().endWrites(taskId);
     if (state == exec::TaskState::kFinished) {
       return;
     }

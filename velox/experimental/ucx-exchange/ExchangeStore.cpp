@@ -177,10 +177,18 @@ bool ExchangeStore::add(
   auto stored = toStored<StoredPayload>(std::move(payload), numRows);
   stored.encoding = std::move(encoding);
   const bool toHost = place(stored, stream);
-  std::lock_guard<std::mutex> lock(mutex_);
-  tables_[std::string{table}].files[std::string{file}].push_back(
-      std::move(stored));
-  ++payloads_;
+  std::vector<ContinuePromise> waiters;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto& entry = tables_[std::string{table}];
+    entry.files[std::string{file}].push_back(std::move(stored));
+    ++payloads_;
+    waiters = std::move(entry.waiters);
+    entry.waiters.clear();
+  }
+  for (auto& waiter : waiters) {
+    waiter.setValue();
+  }
   return toHost;
 }
 
@@ -244,7 +252,8 @@ std::vector<ExchangeStore::TakenPayload> ExchangeStore::take(
         }
       }
     }
-    if (files.empty()) {
+    if (files.empty() && tableIt->second.writers.empty() &&
+        tableIt->second.waiters.empty()) {
       forget(tableIt->second);
       tables_.erase(tableIt);
       restoreDeviceCapacityIfEmpty();
@@ -329,6 +338,89 @@ std::vector<ExchangeStore::TakenPayload> ExchangeStore::take(
     result.push_back(std::move(taken));
   }
   return result;
+}
+
+void ExchangeStore::beginWrite(
+    std::string_view table,
+    std::string_view taskId) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  tables_[std::string{table}].writers.insert(std::string{taskId});
+}
+
+void ExchangeStore::endWrites(std::string_view taskId) {
+  std::vector<ContinuePromise> waiters;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = tables_.begin(); it != tables_.end();) {
+      auto& table = it->second;
+      if (table.writers.erase(std::string{taskId}) == 0 ||
+          !table.writers.empty()) {
+        ++it;
+        continue;
+      }
+      complete(it->first);
+      for (auto& waiter : table.waiters) {
+        waiters.push_back(std::move(waiter));
+      }
+      table.waiters.clear();
+      if (table.files.empty()) {
+        forget(table);
+        it = tables_.erase(it);
+        continue;
+      }
+      ++it;
+    }
+    restoreDeviceCapacityIfEmpty();
+  }
+  for (auto& waiter : waiters) {
+    waiter.setValue();
+  }
+}
+
+void ExchangeStore::complete(const std::string& name) {
+  // Bounds the names kept for reads of files that were never written.
+  constexpr size_t kMaxCompletedTables = 4096;
+  if (completedTables_.insert(name).second) {
+    completedOrder_.push_back(name);
+    if (completedOrder_.size() > kMaxCompletedTables) {
+      completedTables_.erase(completedOrder_.front());
+      completedOrder_.pop_front();
+    }
+  }
+}
+
+std::optional<std::vector<ExchangeStore::TakenPayload>>
+ExchangeStore::takeOrWait(
+    std::string_view table,
+    std::string_view file,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr,
+    ContinueFuture& future,
+    TakeStats* stats) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto tableIt = tables_.find(table);
+    const bool hasPayloads = tableIt != tables_.end() &&
+        tableIt->second.files.find(file) != tableIt->second.files.end();
+    if (!hasPayloads) {
+      const bool written = completedTables_.count(std::string{table}) > 0 &&
+          (tableIt == tables_.end() || tableIt->second.writers.empty());
+      if (written) {
+        return std::vector<TakenPayload>{};
+      }
+      // A reader may come before the table's first writer: the entry it
+      // creates holds its promise until a payload or the completion.
+      auto& entry = tableIt != tables_.end() ? tableIt->second
+                                             : tables_[std::string{table}];
+      auto [promise, semiFuture] =
+          makeVeloxContinuePromiseContract("ExchangeStore::takeOrWait");
+      entry.waiters.push_back(std::move(promise));
+      future = std::move(semiFuture);
+      return std::nullopt;
+    }
+  }
+  // One split reads each file, so nobody takes it in between.
+  return take(table, file, stream, mr, stats);
 }
 
 void ExchangeStore::drop(std::string_view table) {

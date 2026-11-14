@@ -456,6 +456,68 @@ TEST_F(ExchangeStoreTest, restoresDeviceTierOnceItHoldsNoTables) {
   EXPECT_EQ(store.stats().hostBytes, 0);
 }
 
+TEST_F(ExchangeStoreTest, takeOrWaitStreamsATableWhileItIsWritten) {
+  const auto input = makeInput();
+  auto payloads = pack(input, {500}, compressions().back());
+  ExchangeStore store;
+  store.setDeviceCapacity(kUnlimited);
+  store.beginWrite("table", "query.1.0.0.0");
+
+  // Nothing written yet: the reader waits.
+  auto future = ContinueFuture::makeEmpty();
+  EXPECT_FALSE(
+      store.takeOrWait("table", "0", stream_, memoryResource(), future)
+          .has_value());
+  ASSERT_TRUE(future.valid());
+  EXPECT_FALSE(future.isReady());
+
+  // A write wakes the reader, which takes it while the table is still open.
+  store.add("table", "0", std::move(payloads[0]), 500, {}, stream_);
+  EXPECT_TRUE(future.isReady());
+  future = ContinueFuture::makeEmpty();
+  auto taken =
+      store.takeOrWait("table", "0", stream_, memoryResource(), future);
+  ASSERT_TRUE(taken.has_value());
+  EXPECT_EQ(taken->size(), 1);
+
+  // Nothing new and the writer is still open: wait again, until the writer's
+  // task finishes and completes the table.
+  EXPECT_FALSE(
+      store.takeOrWait("table", "0", stream_, memoryResource(), future)
+          .has_value());
+  ASSERT_TRUE(future.valid());
+  store.endWrites("query.1.0.0.0");
+  EXPECT_TRUE(future.isReady());
+  future = ContinueFuture::makeEmpty();
+  auto done = store.takeOrWait("table", "0", stream_, memoryResource(), future);
+  ASSERT_TRUE(done.has_value());
+  EXPECT_THAT(*done, testing::IsEmpty());
+  EXPECT_FALSE(future.valid());
+}
+
+TEST_F(ExchangeStoreTest, takeOrWaitReadsAFileNeverWrittenAsDoneOnceComplete) {
+  const auto input = makeInput();
+  auto payloads = pack(input, {500}, compressions().back());
+  ExchangeStore store;
+  store.setDeviceCapacity(kUnlimited);
+  store.beginWrite("table", "query.1.0.0.0");
+  store.add("table", "0", std::move(payloads[0]), 500, {}, stream_);
+  store.endWrites("query.1.0.0.0");
+  auto future = ContinueFuture::makeEmpty();
+  ASSERT_EQ(
+      store.takeOrWait("table", "0", stream_, memoryResource(), future)
+          ->size(),
+      1);
+
+  // The table was taken entirely and is gone, but a bucket that got no rows
+  // still reads as done instead of waiting for a writer that has finished.
+  auto empty =
+      store.takeOrWait("table", "1", stream_, memoryResource(), future);
+  ASSERT_TRUE(empty.has_value());
+  EXPECT_THAT(*empty, testing::IsEmpty());
+  EXPECT_FALSE(future.valid());
+}
+
 TEST_F(ExchangeStoreTest, failsWhenHostTierIsFull) {
   const auto input = makeInput();
   auto payloads = pack(input, {500}, ExchangeCompression::kNone);
