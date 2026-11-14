@@ -19,6 +19,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <utility>
 #include <vector>
 
 namespace facebook::velox::ucx_exchange {
@@ -73,5 +75,19 @@ std::unique_ptr<std::vector<uint8_t>> wrapExchangePayloadMetadata(
 /// header, returns it unchanged with codec kNone.
 ExchangePayloadMetadata unwrapExchangePayloadMetadata(
     std::unique_ptr<std::vector<uint8_t>> metadata);
+
+/// Prepends to a payload's metadata the Hive bucket that holds all of its rows,
+/// for a receiver that keeps the payload as it is (a materialized exchange in
+/// the exchange store). The tag wraps whatever metadata the payload has,
+/// including a compression header.
+std::unique_ptr<std::vector<uint8_t>> tagPayloadBucket(
+    std::unique_ptr<std::vector<uint8_t>> metadata,
+    int32_t bucket);
+
+/// Removes the bucket tag of a payload's metadata. Returns the bucket and the
+/// metadata as it was before tagPayloadBucket(), or std::nullopt and
+/// 'metadata' unchanged when it has no tag.
+std::pair<std::optional<int32_t>, std::unique_ptr<std::vector<uint8_t>>>
+untagPayloadBucket(std::unique_ptr<std::vector<uint8_t>> metadata);
 
 } // namespace facebook::velox::ucx_exchange

@@ -29,8 +29,10 @@
 #include "velox/exec/tests/utils/QueryAssertions.h"
 
 #include <fmt/format.h>
+#include <folly/ScopeGuard.h>
 #include <gtest/gtest.h>
 
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -298,6 +300,70 @@ TEST_P(ExchangeStoreTableTest, readsEveryTableBucketOfAReadBucketFromOneSplit) {
   }
   facebook::velox::exec::test::assertEqualResults(input, output);
   EXPECT_EQ(ucx_exchange::ExchangeStore::instance().stats().payloads, 0);
+}
+
+TEST_P(ExchangeStoreTableTest, namesTheTableAnExchangeWritesUnchanged) {
+  CudfConfig::getInstance().exchangeStore = true;
+  SCOPE_EXIT {
+    CudfConfig::getInstance().exchangeStore = false;
+  };
+  // A materialized exchange's writer fragment: the received rows go to the
+  // temporary table's writer through a renaming Project and a local exchange.
+  const auto exchangeType = ROW({"k", "v"}, {BIGINT(), DOUBLE()});
+  const std::string directory = "/data/" + std::string{kTable};
+  core::PlanNodeId exchangeId;
+  const auto writerPlan = [&](const std::vector<std::string>& projections,
+                              const std::string& tableDirectory) {
+    return PlanBuilder()
+        .exchange(exchangeType, "Presto", std::string{core::TransportKind::kUcx})
+        .capturePlanNodeId(exchangeId)
+        .project(projections)
+        .localPartition(std::vector<std::string>{})
+        .tableWrite(
+            tableDirectory,
+            {},
+            kNumBuckets,
+            {"key"},
+            {},
+            dwio::common::FileFormat::PARQUET,
+            {},
+            kCudfHiveConnectorId)
+        .planNode();
+  };
+  const auto queryCtx = [](bool readByBucket) {
+    std::unordered_map<std::string, std::shared_ptr<config::ConfigBase>>
+        sessions;
+    sessions.emplace(
+        kCudfHiveConnectorId,
+        std::make_shared<config::ConfigBase>(
+            std::unordered_map<std::string, std::string>{
+                {"stream_temporary_tables", readByBucket ? "true" : "false"}}));
+    return core::QueryCtx::create(nullptr, core::QueryConfig{{}}, sessions);
+  };
+
+  const auto renamed = writerPlan({"k AS key", "v AS value"}, directory);
+  EXPECT_EQ(
+      ucx_exchange::receivingTableInStore(*renamed, exchangeId, *queryCtx(true)),
+      std::optional<std::string>{kTable});
+  // Without reading by bucket, every bucket needs its file from the writer.
+  EXPECT_EQ(
+      ucx_exchange::receivingTableInStore(
+          *renamed, exchangeId, *queryCtx(false)),
+      std::nullopt);
+  // A Project that moves columns changes the rows the writer gets.
+  EXPECT_EQ(
+      ucx_exchange::receivingTableInStore(
+          *writerPlan({"v AS value", "k AS key"}, directory),
+          exchangeId,
+          *queryCtx(true)),
+      std::nullopt);
+  // A table that is not temporary is written as files.
+  EXPECT_EQ(
+      ucx_exchange::receivingTableInStore(
+          *writerPlan({"k AS key", "v AS value"}, "/data/orders"),
+          exchangeId,
+          *queryCtx(true)),
+      std::nullopt);
 }
 
 TEST_P(ExchangeStoreTableTest, readsTheScanColumnsInTheScanOrder) {

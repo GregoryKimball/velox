@@ -229,6 +229,21 @@ class UcxExchangeSource
       vector_size_t numRows,
       bool atEnd);
 
+  // Takes a received payload: one tagged with a Hive bucket
+  // (untagPayloadBucket()) goes to the exchange store as it is, under the
+  // table the queue names (UcxExchangeQueue::storeTable()); any other is
+  // restored and enqueued. Returns false when it failed the queue (see
+  // restoreOrFail()).
+  bool receive(
+      std::unique_ptr<std::vector<uint8_t>> metadata,
+      std::unique_ptr<rmm::device_buffer> data,
+      cuda::stream_ref stream,
+      vector_size_t numRows);
+
+  // Fails the queue with 'error', raised when trying to 'action' a received
+  // payload, and ends this source.
+  void failReceive(std::string_view action, const std::exception& error);
+
   // Restores a received payload (restoreExchangePayload()). Both receive paths
   // run on the Communicator thread, where an exception would terminate the
   // process, so a failure (a decode that runs out of device memory, for one)

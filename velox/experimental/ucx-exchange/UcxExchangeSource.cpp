@@ -24,6 +24,8 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/ucx-exchange/ExchangeCompression.h"
+#include "velox/experimental/ucx-exchange/ExchangeCompressionWire.h"
+#include "velox/experimental/ucx-exchange/ExchangeStore.h"
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeSource.h"
 
@@ -650,17 +652,68 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
 
     // Reconstruct the table on the stream used for the receive. Retain the
     // producer's row count because a table with no columns cannot report it.
-    auto data = restoreOrFail(
-        std::move(ptr->metadata.cudfMetadata),
-        std::move(ptr->dataBuf),
-        ptr->stream,
-        ptr->metadata.numRows);
-    if (data) {
-      enqueue(std::move(data));
+    if (receive(
+            std::move(ptr->metadata.cudfMetadata),
+            std::move(ptr->dataBuf),
+            ptr->stream,
+            ptr->metadata.numRows)) {
       setStateIf(ReceiverState::WaitingForData, ReceiverState::ReadyToReceive);
     }
   }
   communicator_->addToWorkQueue(getSelfPtr());
+}
+
+bool UcxExchangeSource::receive(
+    std::unique_ptr<std::vector<uint8_t>> metadata,
+    std::unique_ptr<rmm::device_buffer> data,
+    cuda::stream_ref stream,
+    vector_size_t numRows) {
+  auto [bucket, untagged] = untagPayloadBucket(std::move(metadata));
+  const auto& table = queue_->storeTable();
+  if (bucket.has_value() && table.has_value()) {
+    try {
+      // The table is complete once this task ends (ExchangeStore::endWrites()).
+      auto& store = ExchangeStore::instance();
+      store.beginWrite(*table, taskId_);
+      PackedExchangePayload payload;
+      payload.packed = std::make_unique<cudf::packed_columns>(
+          std::move(untagged), std::move(data));
+      store.add(
+          *table,
+          std::to_string(*bucket),
+          std::move(payload),
+          numRows,
+          ExchangeStore::PayloadEncoding{},
+          stream);
+      return true;
+    } catch (const std::exception& e) {
+      failReceive("store", e);
+      return false;
+    }
+  }
+  auto restored =
+      restoreOrFail(std::move(untagged), std::move(data), stream, numRows);
+  if (restored == nullptr) {
+    return false;
+  }
+  enqueue(std::move(restored));
+  return true;
+}
+
+void UcxExchangeSource::failReceive(
+    std::string_view action,
+    const std::exception& error) {
+  // VeloxException::what() also carries the context and stack trace.
+  const auto* veloxError = dynamic_cast<const VeloxException*>(&error);
+  const auto errorMsg = fmt::format(
+      "Failed to {} exchange data from task {}: {}",
+      action,
+      partitionKey_.toString(),
+      veloxError != nullptr ? veloxError->message() : error.what());
+  VLOG(0) << toString() << " " << errorMsg;
+  queue_->setError(errorMsg);
+  deliverEndMarker();
+  setState(ReceiverState::Done);
 }
 
 PackedTableWithStreamPtr UcxExchangeSource::restoreOrFail(
@@ -672,16 +725,7 @@ PackedTableWithStreamPtr UcxExchangeSource::restoreOrFail(
     return restoreExchangePayload(
         std::move(metadata), std::move(data), stream, numRows);
   } catch (const std::exception& e) {
-    // VeloxException::what() also carries the context and stack trace.
-    const auto* veloxError = dynamic_cast<const VeloxException*>(&e);
-    const auto errorMsg = fmt::format(
-        "Failed to restore exchange data from task {}: {}",
-        partitionKey_.toString(),
-        veloxError != nullptr ? veloxError->message() : e.what());
-    VLOG(0) << toString() << " " << errorMsg;
-    queue_->setError(errorMsg);
-    deliverEndMarker();
-    setState(ReceiverState::Done);
+    failReceive("restore", e);
     return nullptr;
   }
 }
@@ -839,17 +883,14 @@ void UcxExchangeSource::onIntraNodeData(
   // so the received data is ready. The inter-node receive path likewise keeps
   // its receive stream with the table.
   auto consumerStream = cudf_velox::cudfGlobalStreamPool().get_stream();
-  auto tableWithStream = restoreOrFail(
-      std::move(data->metadata),
-      std::move(data->gpu_data),
-      consumerStream,
-      numRows);
-  if (!tableWithStream) {
+  if (!receive(
+          std::move(data->metadata),
+          std::move(data->gpu_data),
+          consumerStream,
+          numRows)) {
     communicator_->addToWorkQueue(getSelfPtr());
     return;
   }
-
-  enqueue(std::move(tableWithStream));
 
   this->sequenceNumber_++;
   setStateIf(

@@ -221,6 +221,30 @@ TEST(ExchangeCompressionWireTest, rejectsInvalidLaneColumns) {
       unwrapExchangePayloadMetadata(std::move(wrapped)), VeloxRuntimeError);
 }
 
+TEST(ExchangeCompressionWireTest, tagsAndUntagsPayloadBucket) {
+  // A tag wraps any metadata, including a compression envelope, and comes off
+  // leaving it byte for byte.
+  const auto envelope = wrapExchangePayloadMetadata(
+      std::make_unique<std::vector<uint8_t>>(std::vector<uint8_t>{1, 2, 3}),
+      ExchangePayloadCodec::kFusedFor,
+      100,
+      2);
+  for (const auto& metadata :
+       {std::vector<uint8_t>{}, std::vector<uint8_t>{9, 8, 7}, *envelope}) {
+    auto [bucket, untagged] = untagPayloadBucket(tagPayloadBucket(
+        std::make_unique<std::vector<uint8_t>>(metadata), 1'023));
+    EXPECT_EQ(bucket, 1'023);
+    ASSERT_NE(untagged, nullptr);
+    EXPECT_EQ(*untagged, metadata);
+  }
+  // Metadata without a tag passes through.
+  auto [bucket, untagged] =
+      untagPayloadBucket(std::make_unique<std::vector<uint8_t>>(*envelope));
+  EXPECT_FALSE(bucket.has_value());
+  EXPECT_EQ(*untagged, *envelope);
+  EXPECT_FALSE(untagPayloadBucket(nullptr).first.has_value());
+}
+
 TEST(ExchangeCompressionWireTest, rejectsTruncatedEnvelope) {
   auto wrapped = cascadedEnvelope();
   wrapped->resize(kHeaderSize - 1);

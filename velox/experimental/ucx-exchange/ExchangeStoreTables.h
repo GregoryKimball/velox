@@ -16,9 +16,15 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
+
+namespace facebook::velox::core {
+class PlanNode;
+class QueryCtx;
+} // namespace facebook::velox::core
 
 namespace facebook::velox::ucx_exchange {
 
@@ -40,6 +46,19 @@ void unregisterExchangeStoreTables();
 /// may differ in scheme and, for a split made before the file was written, in
 /// the rest of the file name.
 std::pair<std::string, std::string> storeKey(std::string_view path);
+
+/// Returns the store key of the temporary table whose writer, in 'root',
+/// receives the rows of the UCX exchange 'exchangeId' unchanged, when the
+/// exchange store holds temporary tables and the query reads them by bucket
+/// (Hive session property stream_temporary_tables, so that a bucket needs no
+/// file): the writer writes every column it reads, in order, through Projects
+/// that keep each column in its position and local exchanges. The exchange's
+/// sources then keep each bucket's payload in the store as it arrives
+/// (UcxExchangeQueue::setStoreTable()), and the writer gets no rows.
+std::optional<std::string> receivingTableInStore(
+    const core::PlanNode& root,
+    std::string_view exchangeId,
+    const core::QueryCtx& queryCtx);
 
 /// Keys of a temporary table split's custom split info. A coordinator that
 /// reads a bucketed table as fewer buckets than it has, each the union of the

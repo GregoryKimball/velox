@@ -92,7 +92,9 @@ class UcxPartitionedOutput : public exec::Operator,
   void hashPartition(cudf::table_view tableView, cuda::stream_ref stream);
 
   // Sends each row to the partition of its Hive bucket
-  // (hivePartitionFunction_).
+  // (hivePartitionFunction_), one payload per bucket tagged with the bucket
+  // (tagPayloadBucket()), so that a receiver that writes the rows to a
+  // temporary table in the exchange store keeps the payload as it is.
   void hivePartition(cudf::table_view tableView, cuda::stream_ref stream);
 
   // Splits the cudf table view into equal sizes. This is used when
@@ -158,6 +160,8 @@ class UcxPartitionedOutput : public exec::Operator,
   // one aligned with a bucketed table): rows must reach the task that owns
   // their bucket, as the CPU operator sends them.
   std::optional<cudf_velox::CudfHivePartitionFunction> hivePartitionFunction_;
+  // hivePartitionFunction_ giving each row its bucket.
+  std::optional<cudf_velox::CudfHivePartitionFunction> hiveBucketFunction_;
   const size_t numPartitions_;
 
   // True when rows with a null partition key, plus one arbitrary row, must

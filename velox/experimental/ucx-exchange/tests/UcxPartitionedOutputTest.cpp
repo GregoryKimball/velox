@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/ucx-exchange/ExchangeCompressionWire.h"
 #include "velox/experimental/ucx-exchange/UcxPartitionedOutput.h"
 #include <cudf/column/column_factories.hpp>
 #include <cudf/contiguous_split.hpp>
@@ -28,6 +29,8 @@
 #include <algorithm>
 #include <cuda/stream>
 #include <memory>
+#include <optional>
+#include <utility>
 #include <vector>
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/memory/MemoryPool.h"
@@ -240,6 +243,17 @@ class UcxPartitionedOutputTest : public testing::Test {
   // travelled together.
   std::vector<std::vector<int32_t>> drainKeyPackets(int destination) {
     std::vector<std::vector<int32_t>> packets;
+    for (auto& [bucket, keys] : drainBucketPackets(destination)) {
+      packets.push_back(std::move(keys));
+    }
+    return packets;
+  }
+
+  // Drains the key column of each packet with the bucket it is tagged with.
+  std::vector<std::pair<std::optional<int32_t>, std::vector<int32_t>>>
+  drainBucketPackets(int destination) {
+    std::vector<std::pair<std::optional<int32_t>, std::vector<int32_t>>>
+        packets;
     while (true) {
       std::shared_ptr<cudf::packed_columns> payload;
       queueManager_->getData(
@@ -255,8 +269,12 @@ class UcxPartitionedOutputTest : public testing::Test {
       if (payload == nullptr) {
         break;
       }
+      auto [bucket, metadata] =
+          untagPayloadBucket(std::move(payload->metadata));
+      payload->metadata = std::move(metadata);
       auto unpacked = cudf::unpack(*payload);
-      packets.push_back(
+      packets.emplace_back(
+          bucket,
           getColVector<int32_t>(
               unpacked.column(0),
               unpacked.num_rows(),
@@ -650,15 +668,25 @@ TEST_F(UcxPartitionedOutputTest, routesRowsByHiveBucket) {
 
   runPartitionedOutput(task, makeKeyColumn(keyValues, {}, stream), stream);
 
+  // Each payload holds one bucket and is tagged with it, so that a receiver
+  // writing a temporary table into the exchange store can keep it as it is.
   std::vector<std::vector<int32_t>> expected(kNumPartitions);
   for (const auto key : keyValues) {
     expected[bucketToPartition[key % kNumBuckets]].push_back(key);
   }
   for (int destination = 0; destination < kNumPartitions; ++destination) {
-    auto keys = drainKeyColumn(destination);
+    SCOPED_TRACE(fmt::format("destination {}", destination));
+    std::vector<int32_t> keys;
+    for (const auto& [bucket, packetKeys] : drainBucketPackets(destination)) {
+      ASSERT_TRUE(bucket.has_value());
+      EXPECT_EQ(bucketToPartition[*bucket], destination);
+      for (const auto key : packetKeys) {
+        EXPECT_EQ(key % kNumBuckets, *bucket) << "key " << key;
+      }
+      keys.insert(keys.end(), packetKeys.begin(), packetKeys.end());
+    }
     std::sort(keys.begin(), keys.end());
-    EXPECT_THAT(keys, testing::ElementsAreArray(expected[destination]))
-        << "destination " << destination;
+    EXPECT_THAT(keys, testing::ElementsAreArray(expected[destination]));
   }
 }
 

@@ -82,6 +82,10 @@ CudfHivePartitionFunction CudfHivePartitionFunction::fromSpec(
       numBuckets, std::move(bucketToPartition), std::move(keyColumns));
 }
 
+CudfHivePartitionFunction CudfHivePartitionFunction::buckets() const {
+  return CudfHivePartitionFunction(numBuckets_, {}, keyColumns_);
+}
+
 std::pair<std::unique_ptr<cudf::table>, std::vector<cudf::size_type>>
 CudfHivePartitionFunction::partition(
     cudf::table_view input,

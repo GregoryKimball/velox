@@ -190,4 +190,40 @@ ExchangePayloadMetadata unwrapExchangePayloadMetadata(
       std::move(laneColumns)};
 }
 
+namespace {
+
+constexpr std::array<uint8_t, 8> kBucketMagic{
+    'V', 'L', 'X', 'B', 'U', 'C', 'K', 0};
+constexpr std::size_t kBucketTagSize = kBucketMagic.size() + sizeof(int32_t);
+
+} // namespace
+
+std::unique_ptr<std::vector<uint8_t>> tagPayloadBucket(
+    std::unique_ptr<std::vector<uint8_t>> metadata,
+    int32_t bucket) {
+  VELOX_CHECK_NOT_NULL(metadata);
+  VELOX_CHECK_GE(bucket, 0);
+  auto tagged = std::make_unique<std::vector<uint8_t>>(
+      kBucketMagic.begin(), kBucketMagic.end());
+  tagged->reserve(kBucketTagSize + metadata->size());
+  appendScalar(*tagged, bucket);
+  tagged->insert(tagged->end(), metadata->begin(), metadata->end());
+  return tagged;
+}
+
+std::pair<std::optional<int32_t>, std::unique_ptr<std::vector<uint8_t>>>
+untagPayloadBucket(std::unique_ptr<std::vector<uint8_t>> metadata) {
+  if (metadata == nullptr || metadata->size() < kBucketTagSize ||
+      !std::equal(kBucketMagic.begin(), kBucketMagic.end(), metadata->begin())) {
+    return {std::nullopt, std::move(metadata)};
+  }
+  const uint8_t* current = metadata->data() + kBucketMagic.size();
+  const auto bucket = readScalar<int32_t>(current);
+  VELOX_CHECK_GE(bucket, 0, "Malformed payload bucket tag");
+  return {
+      bucket,
+      std::make_unique<std::vector<uint8_t>>(
+          metadata->begin() + kBucketTagSize, metadata->end())};
+}
+
 } // namespace facebook::velox::ucx_exchange

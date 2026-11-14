@@ -16,6 +16,7 @@
 #include "velox/experimental/ucx-exchange/UcxExchange.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/ucx-exchange/ExchangeCompression.h"
+#include "velox/experimental/ucx-exchange/ExchangeStoreTables.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 using facebook::velox::exec::Operator;
@@ -58,6 +59,16 @@ UcxExchange::UcxExchange(
       "UCX exchange client is null, plan node: {}",
       planNode->id());
   exchangeClient_ = std::move(ucxExchangeClient);
+  // Driver 0 adds the sources (processSplits_), so it names the store table
+  // before any source exists.
+  if (processSplits_) {
+    if (auto table = receivingTableInStore(
+            *driverCtx->task->planFragment().planNode,
+            planNode->id(),
+            *driverCtx->task->queryCtx())) {
+      exchangeClient_->queue()->setStoreTable(std::move(*table));
+    }
+  }
 }
 
 UcxExchange::~UcxExchange() {

@@ -21,6 +21,8 @@
 #include <cinttypes>
 #include <cuda/stream>
 #include <memory>
+#include <optional>
+#include <string>
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/future/VeloxPromise.h"
 #include "velox/experimental/ucx-exchange/ExchangeCompressionWire.h"
@@ -124,6 +126,18 @@ class UcxExchangeQueue {
 
   bool isInError() {
     return !error_.empty();
+  }
+
+  /// Makes the sources keep every payload tagged with a Hive bucket
+  /// (tagPayloadBucket()) in the exchange store under 'table', the store key
+  /// of the temporary table this exchange's consumer writes, instead of
+  /// queueing it. Called before any source is added.
+  void setStoreTable(std::string table) {
+    storeTable_ = std::move(table);
+  }
+
+  const std::optional<std::string>& storeTable() const {
+    return storeTable_;
   }
   /// Returns a PackedTableWithStream object.
   ///
@@ -252,6 +266,8 @@ class UcxExchangeQueue {
   // When set, all promises will be realized and the next dequeue will
   // throw an exception with this message.
   std::string error_;
+  // See setStoreTable().
+  std::optional<std::string> storeTable_;
   // Total size of packed tables in queue. Updated under 'mutex_' and atomic for
   // the same unlocked backpressure reads as 'size_'.
   std::atomic<int64_t> totalBytes_{0};

@@ -34,6 +34,8 @@
 #include "velox/dwio/common/Writer.h"
 #include "velox/dwio/common/WriterFactory.h"
 #include "velox/common/base/RuntimeMetrics.h"
+#include "velox/common/config/Config.h"
+#include "velox/core/QueryCtx.h"
 #include "velox/exec/Task.h"
 #include "velox/exec/TableWriter.h"
 
@@ -1258,6 +1260,94 @@ std::pair<std::string, std::string> storeKey(std::string_view path) {
       std::string{path.substr(tableStart, tableEnd - tableStart)},
       fileKey(path.substr(fileStart + 1)),
   };
+}
+
+namespace {
+
+// Returns the source of 'node' when 'node' passes its rows on unchanged: a
+// Project whose output column i is its input column i under another name, or a
+// local exchange of one source. Returns nullptr otherwise.
+const core::PlanNode* passThroughSource(const core::PlanNode& node) {
+  if (const auto* project = dynamic_cast<const core::ProjectNode*>(&node)) {
+    const auto& inputType = project->sources()[0]->outputType();
+    const auto& projections = project->projections();
+    if (projections.size() != inputType->size()) {
+      return nullptr;
+    }
+    for (column_index_t i = 0; i < projections.size(); ++i) {
+      const auto* field = dynamic_cast<const core::FieldAccessTypedExpr*>(
+          projections[i].get());
+      if (field == nullptr || !field->isInputColumn() ||
+          inputType->getChildIdx(field->name()) != i) {
+        return nullptr;
+      }
+    }
+    return project->sources()[0].get();
+  }
+  if (dynamic_cast<const core::LocalPartitionNode*>(&node) != nullptr &&
+      node.sources().size() == 1) {
+    return node.sources()[0].get();
+  }
+  return nullptr;
+}
+
+const core::TableWriteNode* findTableWriter(const core::PlanNode& node) {
+  if (const auto* writer = dynamic_cast<const core::TableWriteNode*>(&node)) {
+    return writer;
+  }
+  for (const auto& source : node.sources()) {
+    if (const auto* writer = findTableWriter(*source)) {
+      return writer;
+    }
+  }
+  return nullptr;
+}
+
+} // namespace
+
+std::optional<std::string> receivingTableInStore(
+    const core::PlanNode& root,
+    std::string_view exchangeId,
+    const core::QueryCtx& queryCtx) {
+  if (!cudf_velox::CudfConfig::getInstance().exchangeStore) {
+    return std::nullopt;
+  }
+  const auto* writer = findTableWriter(root);
+  if (writer == nullptr) {
+    return std::nullopt;
+  }
+  const auto& writerInput = writer->sources()[0]->outputType();
+  if (writer->columns()->names() != writerInput->names()) {
+    return std::nullopt;
+  }
+  const core::PlanNode* node = writer->sources()[0].get();
+  while (node != nullptr && node->id() != exchangeId) {
+    node = passThroughSource(*node);
+  }
+  if (node == nullptr ||
+      dynamic_cast<const core::ExchangeNode*>(node) == nullptr) {
+    return std::nullopt;
+  }
+  const auto insert =
+      std::dynamic_pointer_cast<const connector::hive::HiveInsertTableHandle>(
+          writer->insertTableHandle()->connectorInsertTableHandle());
+  if (insert == nullptr || insert->bucketProperty() == nullptr) {
+    return std::nullopt;
+  }
+  const auto& location = *insert->locationHandle();
+  const auto& directory = location.writePath().empty()
+      ? location.targetPath()
+      : location.writePath();
+  if (!cudf_velox::connector::hive::isTemporaryTable(directory)) {
+    return std::nullopt;
+  }
+  const auto* session = queryCtx.connectorSessionProperties(
+      writer->insertTableHandle()->connectorId());
+  if (session == nullptr ||
+      !session->get<bool>("stream_temporary_tables", false)) {
+    return std::nullopt;
+  }
+  return storeKey(directory + "/file").first;
 }
 
 void registerExchangeStoreTables(uint64_t deviceBytes, uint64_t hostBytes) {

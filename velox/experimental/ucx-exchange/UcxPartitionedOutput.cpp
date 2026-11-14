@@ -29,6 +29,7 @@
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 #include "velox/experimental/ucx-exchange/ExchangeCompression.h"
+#include "velox/experimental/ucx-exchange/ExchangeCompressionWire.h"
 #include "velox/vector/VectorStream.h"
 
 #include <cudf/binaryop.hpp>
@@ -379,6 +380,7 @@ void UcxPartitionedOutput::initPartitionKeys(
         /*localExchange=*/false,
         planNode->inputType(),
         planNode->outputType()));
+    hiveBucketFunction_.emplace(hivePartitionFunction_->buckets());
     return;
   }
 
@@ -646,16 +648,39 @@ void UcxPartitionedOutput::hashPartition(
 void UcxPartitionedOutput::hivePartition(
     cudf::table_view tableView,
     cuda::stream_ref stream) {
-  auto [partitionedTable, partitionOffsets] = hivePartitionFunction_->partition(
-      tableView, numPartitions_, stream, get_temp_mr());
+  const auto numBuckets = hiveBucketFunction_->numBuckets();
+  auto [grouped, offsets] = hiveBucketFunction_->partition(
+      tableView, numBuckets, stream, get_temp_mr());
+  VELOX_CHECK_EQ(offsets.size(), numBuckets + 1);
+  const std::vector<cudf::size_type> boundaries(
+      offsets.begin() + 1, offsets.end() - 1);
+  auto payloads = splitExchangePayloads(
+      grouped->view(),
+      boundaries,
+      compression_,
+      stream,
+      get_temp_mr(),
+      get_output_mr());
+  // UCX is not stream-aware (see splitAndEnqueue()).
+  stream.sync();
+  VELOX_CHECK_EQ(payloads.size(), numBuckets);
 
-  VELOX_CHECK_EQ(partitionOffsets.size(), numPartitions_ + 1);
-  VELOX_CHECK_EQ(partitionOffsets[0], 0);
-  // splitAndEnqueue() takes the boundaries between partitions.
-  partitionOffsets.erase(partitionOffsets.begin());
-  partitionOffsets.pop_back();
-
-  splitAndEnqueue(partitionedTable->view(), partitionOffsets, stream);
+  auto queueManager = sharedQueueManager();
+  for (int bucket = 0; bucket < numBuckets; ++bucket) {
+    const auto numRows = offsets[bucket + 1] - offsets[bucket];
+    if (numRows == 0) {
+      continue;
+    }
+    auto& payload = payloads[bucket];
+    recordCompressionStats(payload);
+    payload.packed->metadata =
+        tagPayloadBucket(std::move(payload.packed->metadata), bucket);
+    queueManager->enqueue(
+        this->taskId(),
+        hivePartitionFunction_->partitionOf(bucket),
+        std::move(payload.packed),
+        static_cast<vector_size_t>(numRows));
+  }
 }
 
 void UcxPartitionedOutput::equalPartition(

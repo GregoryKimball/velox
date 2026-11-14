@@ -84,6 +84,20 @@ class CudfHivePartitionFunction {
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) const;
 
+  /// Returns the function that gives each row its bucket instead of its
+  /// partition.
+  CudfHivePartitionFunction buckets() const;
+
+  /// Returns the number of buckets rows hash to.
+  int numBuckets() const {
+    return numBuckets_;
+  }
+
+  /// Returns the partition of the rows of 'bucket'.
+  int partitionOf(int bucket) const {
+    return bucketToPartition_.empty() ? bucket : bucketToPartition_[bucket];
+  }
+
   /// Returns the rows of 'input' grouped by partition, partitions 0 to
   /// 'numPartitions' - 1 in order, with the 'numPartitions' + 1 offsets of the
   /// partitions in them. Every partition of a row must be below
