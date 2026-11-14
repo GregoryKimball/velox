@@ -15,11 +15,19 @@
  */
 #pragma once
 
+#include "velox/vector/TypeAliases.h"
+
+#include <rmm/device_buffer.hpp>
+
+#include <cuda/stream>
+
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace facebook::velox::core {
 class PlanNode;
@@ -60,6 +68,21 @@ std::optional<std::string> receivingTableInStore(
     const core::PlanNode& root,
     std::string_view exchangeId,
     const core::QueryCtx& queryCtx);
+
+/// Adds a payload that a source of the exchange receivingTableInStore() names
+/// received with a Hive bucket tag (untagPayloadBucket()) to the bucket's file
+/// of the store table 'table', as it arrived: with the exchange codec, without
+/// the store's dictionary and difference encodings. 'metadata' is without the
+/// tag. The table is complete once the receiving task 'taskId' ends
+/// (ExchangeStore::endWrites()).
+void addReceivedBucketPayload(
+    std::string_view table,
+    int32_t bucket,
+    std::string_view taskId,
+    std::unique_ptr<std::vector<uint8_t>> metadata,
+    std::unique_ptr<rmm::device_buffer> data,
+    vector_size_t numRows,
+    cuda::stream_ref stream);
 
 /// Keys of a temporary table split's custom split info. A coordinator that
 /// reads a bucketed table as fewer buckets than it has, each the union of the

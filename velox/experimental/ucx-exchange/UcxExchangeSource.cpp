@@ -25,7 +25,7 @@
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/ucx-exchange/ExchangeCompression.h"
 #include "velox/experimental/ucx-exchange/ExchangeCompressionWire.h"
-#include "velox/experimental/ucx-exchange/ExchangeStore.h"
+#include "velox/experimental/ucx-exchange/ExchangeStoreTables.h"
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeSource.h"
 
@@ -683,18 +683,13 @@ bool UcxExchangeSource::receive(
   const auto& table = queue_->storeTable();
   if (bucket.has_value() && table.has_value()) {
     try {
-      // The table is complete once this task ends (ExchangeStore::endWrites()).
-      auto& store = ExchangeStore::instance();
-      store.beginWrite(*table, taskId_);
-      PackedExchangePayload payload;
-      payload.packed = std::make_unique<cudf::packed_columns>(
-          std::move(untagged), std::move(data));
-      store.add(
+      addReceivedBucketPayload(
           *table,
-          std::to_string(*bucket),
-          std::move(payload),
+          *bucket,
+          taskId_,
+          std::move(untagged),
+          std::move(data),
           numRows,
-          ExchangeStore::PayloadEncoding{},
           stream);
       return true;
     } catch (const std::exception& e) {

@@ -1245,6 +1245,28 @@ std::string fileKey(std::string_view name) {
 
 } // namespace
 
+void addReceivedBucketPayload(
+    std::string_view table,
+    int32_t bucket,
+    std::string_view taskId,
+    std::unique_ptr<std::vector<uint8_t>> metadata,
+    std::unique_ptr<rmm::device_buffer> data,
+    vector_size_t numRows,
+    cuda::stream_ref stream) {
+  auto& store = ExchangeStore::instance();
+  store.beginWrite(table, taskId);
+  PackedExchangePayload payload;
+  payload.packed = std::make_unique<cudf::packed_columns>(
+      std::move(metadata), std::move(data));
+  store.add(
+      table,
+      std::to_string(bucket),
+      std::move(payload),
+      numRows,
+      ExchangeStore::PayloadEncoding{},
+      stream);
+}
+
 std::pair<std::string, std::string> storeKey(std::string_view path) {
   const auto fileStart = path.find_last_of('/');
   VELOX_CHECK(

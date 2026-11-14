@@ -14,8 +14,12 @@
  * limitations under the License.
  */
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/tests/utils/CudfHiveConnectorTestBase.h"
+#include "velox/experimental/ucx-exchange/ExchangeCompression.h"
 #include "velox/experimental/ucx-exchange/ExchangeStore.h"
 #include "velox/experimental/ucx-exchange/ExchangeStoreTables.h"
 
@@ -373,6 +377,96 @@ TEST_P(ExchangeStoreTableTest, namesTheTableAnExchangeWritesUnchanged) {
           exchangeId,
           *queryCtx(true)),
       std::nullopt);
+}
+
+// The sources of a materialized exchange keep each bucket's payload in the
+// store as it arrives, and the writer gets no rows: a scan of the bucket's file
+// reads the payloads with the exchange codec and without the store's encodings.
+TEST_P(ExchangeStoreTableTest, readsPayloadsKeptAsTheyArrived) {
+  const auto input = makeInput();
+  const auto tableType = asRowType(input[0]->type());
+  facebook::velox::connector::hive::HivePartitionFunction bucketFunction(
+      kNumBuckets, std::vector<column_index_t>{0});
+  // A Presto task id starts with its query id.
+  const std::string taskId{"test_1.1.0.0.0"};
+  auto stream = cudfGlobalStreamPool().get_stream();
+  for (const auto& batch : input) {
+    // The producer groups a batch's rows by bucket and packs each bucket's rows
+    // with the exchange codec.
+    std::vector<uint32_t> buckets;
+    bucketFunction.partition(*batch, buckets);
+    auto grouped =
+        BaseVector::create<RowVector>(batch->type(), batch->size(), pool());
+    // Bucket b's rows are rows offsets[b] to offsets[b + 1] of 'grouped'.
+    std::vector<cudf::size_type> offsets{0};
+    vector_size_t numGrouped = 0;
+    for (uint32_t bucket = 0; bucket < kNumBuckets; ++bucket) {
+      for (vector_size_t row = 0; row < batch->size(); ++row) {
+        if (buckets[row] == bucket) {
+          grouped->copy(batch.get(), numGrouped++, row, 1);
+        }
+      }
+      offsets.push_back(numGrouped);
+    }
+    auto table =
+        with_arrow::toCudfTable(grouped, pool(), stream, get_output_mr());
+    auto payloads = ucx_exchange::splitExchangePayloads(
+        table->view(),
+        std::vector<cudf::size_type>(offsets.begin() + 1, offsets.end() - 1),
+        ucx_exchange::parseExchangeCompression("fused-for-bitpacked"),
+        stream,
+        get_temp_mr(),
+        get_output_mr());
+    stream.sync();
+    ASSERT_EQ(payloads.size(), kNumBuckets);
+    for (int bucket = 0; bucket < kNumBuckets; ++bucket) {
+      ASSERT_GT(offsets[bucket + 1], offsets[bucket]);
+      ucx_exchange::addReceivedBucketPayload(
+          kTable,
+          bucket,
+          taskId,
+          std::move(payloads[bucket].packed->metadata),
+          std::move(payloads[bucket].packed->gpu_data),
+          offsets[bucket + 1] - offsets[bucket],
+          stream);
+    }
+  }
+  auto& store = ucx_exchange::ExchangeStore::instance();
+  EXPECT_EQ(store.stats().payloads, input.size() * kNumBuckets);
+  if (GetParam() == 0) {
+    EXPECT_EQ(store.stats().deviceBytes, 0);
+    EXPECT_GT(store.stats().hostBytes, 0);
+  }
+  // The receiving task ends, which completes the table.
+  store.endWrites(taskId);
+
+  // The writer wrote no files. A split names its bucket's file as the
+  // coordinator lists it when it reads the table by bucket.
+  auto directory = common::testutil::TempDirectoryPath::create();
+  const auto tableDirectory = directory->getPath() + "/" + kTable;
+  const auto scan = scanPlan(tableType, tableType);
+  std::vector<RowVectorPtr> output;
+  for (int bucket = 0; bucket < kNumBuckets; ++bucket) {
+    SCOPED_TRACE(fmt::format("bucket {}", bucket));
+    const auto rows =
+        AssertQueryBuilder(scan)
+            .split(facebook::velox::connector::hive::HiveConnectorSplitBuilder(
+                       fmt::format("{}/{:06d}_0_query", tableDirectory, bucket))
+                       .connectorId(kCudfHiveConnectorId)
+                       .fileFormat(dwio::common::FileFormat::PARQUET)
+                       .tableBucketNumber(bucket)
+                       .build())
+            .copyResults(pool());
+    ASSERT_GT(rows->size(), 0);
+    std::vector<uint32_t> buckets;
+    bucketFunction.partition(*rows, buckets);
+    for (vector_size_t row = 0; row < rows->size(); ++row) {
+      ASSERT_EQ(buckets[row], bucket) << "row " << row;
+    }
+    output.push_back(rows);
+  }
+  facebook::velox::exec::test::assertEqualResults(input, output);
+  EXPECT_EQ(store.stats().payloads, 0);
 }
 
 TEST_P(ExchangeStoreTableTest, readsTheScanColumnsInTheScanOrder) {
