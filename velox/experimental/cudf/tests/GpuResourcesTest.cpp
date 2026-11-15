@@ -152,6 +152,30 @@ TEST_F(GpuResourcesTest, admitsASplitGroupWhileItsShareFits) {
   EXPECT_FALSE(admitSplitGroup(10, 0, 1, 1, 0.8));
 }
 
+TEST_F(GpuResourcesTest, waitsForAFailedTaskToReleaseDeviceMemory) {
+  // A terminating task frees 1 GiB a little later.
+  constexpr int64_t kGiB = int64_t{1} << 30;
+  const auto start = std::chrono::steady_clock::now();
+  const auto releasedAfter = std::chrono::milliseconds(50);
+  const auto allocated = [&]() {
+    return std::chrono::steady_clock::now() - start < releasedAfter ? 5 * kGiB
+                                                                     : 4 * kGiB;
+  };
+  EXPECT_TRUE(waitForReleasedDeviceMemory(
+      kGiB / 2, std::chrono::milliseconds(2'000), allocated));
+  EXPECT_LT(
+      std::chrono::steady_clock::now() - start, std::chrono::milliseconds(1'000));
+
+  // Nothing is released: it gives up after the timeout.
+  const auto unchanged = [&]() { return 5 * kGiB; };
+  const auto waitStart = std::chrono::steady_clock::now();
+  EXPECT_FALSE(waitForReleasedDeviceMemory(
+      kGiB / 2, std::chrono::milliseconds(100), unchanged));
+  EXPECT_GE(
+      std::chrono::steady_clock::now() - waitStart,
+      std::chrono::milliseconds(100));
+}
+
 TEST_F(GpuResourcesTest, allocatedBytesIncludesSeparateOutputResource) {
   auto& config = CudfConfig::getInstance();
   config.memoryResource = "async";

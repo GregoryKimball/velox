@@ -36,6 +36,7 @@
 
 #include <cstdlib>
 #include <mutex>
+#include <thread>
 #include <vector>
 #include <string_view>
 
@@ -160,6 +161,24 @@ std::vector<std::function<bool(std::size_t)>>& releasers() {
 void registerDeviceMemoryReleaser(std::function<bool(std::size_t)> releaser) {
   std::lock_guard lock(releasersMutex());
   releasers().push_back(std::move(releaser));
+}
+
+bool waitForReleasedDeviceMemory(
+    std::size_t bytes,
+    std::chrono::milliseconds timeout,
+    const std::function<int64_t()>& allocatedBytes) {
+  const auto before = allocatedBytes();
+  const auto released = [&]() {
+    return before - allocatedBytes() >= static_cast<int64_t>(bytes);
+  };
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (released()) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return released();
 }
 
 bool releaseDeviceMemory(std::size_t bytes) {
