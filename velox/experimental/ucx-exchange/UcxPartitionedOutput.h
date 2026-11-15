@@ -86,6 +86,9 @@ class UcxPartitionedOutput : public exec::Operator,
   // drained ?
   bool isFinished() override;
 
+  /// Releases the batches waiting for a flush.
+  void close() override;
+
  private:
   std::shared_ptr<facebook::velox::ucx_exchange::UcxOutputQueueManager>
   sharedQueueManager();

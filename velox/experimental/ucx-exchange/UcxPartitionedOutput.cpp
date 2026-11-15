@@ -345,6 +345,15 @@ bool UcxPartitionedOutput::isFinished() {
   return finished_;
 }
 
+void UcxPartitionedOutput::close() {
+  // A failed task closes its operators, but frees them only with the last
+  // reference to their Driver, which a pending future can hold for seconds.
+  pendingInputs_.clear();
+  pendingRows_ = 0;
+  pendingBytes_ = 0;
+  Operator::close();
+}
+
 std::shared_ptr<facebook::velox::ucx_exchange::UcxOutputQueueManager>
 UcxPartitionedOutput::sharedQueueManager() {
   auto shared_queueManager = queueManager_.lock();

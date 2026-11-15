@@ -189,8 +189,9 @@ class UcxPartitionedOutputTest : public testing::Test {
   }
 
   // Wraps 'keyColumn' in a CudfVector of kTestRowType and feeds it as one
-  // batch, mirroring how SourceDriverMock drives the operator.
-  void feedBatch(
+  // batch, mirroring how SourceDriverMock drives the operator. Returns the
+  // batch, which only the operator holds afterwards.
+  std::weak_ptr<cudf_velox::CudfVector> feedBatch(
       UcxPartitionedOutput* partitionedOutput,
       std::unique_ptr<cudf::column> keyColumn,
       cuda::stream_ref stream) {
@@ -217,6 +218,7 @@ class UcxPartitionedOutputTest : public testing::Test {
 
     partitionedOutput->addInput(cudfVector);
     partitionedOutput->getOutput();
+    return cudfVector;
   }
 
   // Runs the operator to completion, flushing whatever is still buffered.
@@ -506,6 +508,29 @@ TEST_F(UcxPartitionedOutputTest, buffersBatchesWithoutEagerFlush) {
 
   finishPartitionedOutput(partitionedOutput);
   EXPECT_GT(numBufferedPages(), 0);
+}
+
+// A failed task closes its operators, but frees them only with the last
+// reference to their Driver, which a pending future can hold for seconds. The
+// batches waiting for a flush are device memory that the next query needs.
+TEST_F(UcxPartitionedOutputTest, closeReleasesBufferedBatches) {
+  cuda::stream_ref stream{cudaStream_t{cudaStreamDefault}};
+  auto task = makeKeyPartitionedTask(/*extraConfig=*/{});
+  registerUcxTransports();
+  SCOPE_EXIT {
+    unregisterUcxTransports();
+  };
+
+  auto op = makePartitionedOutputFromRegistry(task, /*eagerFlush=*/false);
+  auto* partitionedOutput = dynamic_cast<UcxPartitionedOutput*>(op.get());
+  ASSERT_NE(partitionedOutput, nullptr);
+  const auto batch = feedBatch(
+      partitionedOutput, makeKeyColumn({1, 2, 3, 4, 5, 6}, {}, stream), stream);
+  ASSERT_FALSE(batch.expired());
+
+  partitionedOutput->close();
+  EXPECT_TRUE(batch.expired());
+  EXPECT_EQ(numBufferedPages(), 0);
 }
 
 // LocalPlanner sets eagerFlush below a small partial LIMIT so that the final
