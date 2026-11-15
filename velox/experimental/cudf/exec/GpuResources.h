@@ -74,6 +74,17 @@ bool admitSplitGroup(
     uint32_t numCompletedSplitGroups,
     double fraction);
 
+/// Returns the device memory that the pool of an "async" memory resource keeps
+/// for reuse to the device. Called when the worker goes idle: the pool keeps
+/// everything it ever reserved otherwise, and device memory allocated outside
+/// it (by UCX, for one) then fails although no query holds the memory. A no-op
+/// for the other memory resource modes.
+void trimDeviceMemoryPool();
+
+/// Forgets the pools trimDeviceMemoryPool() trims. Called when the memory
+/// resources that own them are destroyed.
+void forgetDeviceMemoryPools();
+
 /// Registers a function that frees device memory its owner holds outside the
 /// cuDF memory resource (e.g. a cache), given the size of a failed allocation.
 /// It returns whether it freed any.
