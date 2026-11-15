@@ -86,6 +86,9 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
 
   std::unordered_map<std::string, RuntimeMetric> getRuntimeStats() override;
 
+  /// Releases the reads of the current split.
+  void cancel() override;
+
  protected:
   // Virtual method to create a `CudfSplitReader` or subclass for the data
   // source.

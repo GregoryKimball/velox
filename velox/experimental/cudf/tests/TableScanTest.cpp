@@ -33,6 +33,7 @@
 #include "velox/common/memory/MemoryArbitrator.h"
 #include "velox/common/testutil/TempDirectoryPath.h"
 #include "velox/common/testutil/TestValue.h"
+#include "velox/connectors/ConnectorRegistry.h"
 #include "velox/connectors/hive/HiveConnector.h"
 #include "velox/connectors/hive/HiveConnectorSplit.h"
 #include "velox/dwio/common/FileSink.h"
@@ -46,6 +47,7 @@
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
 #include "velox/exec/tests/utils/LocalExchangeSource.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/expression/Expr.h"
 #include "velox/expression/ExprToSubfieldFilter.h"
 #include "velox/type/Type.h"
 #include "velox/type/tests/SubfieldFiltersBuilder.h"
@@ -948,6 +950,89 @@ TEST_F(TableScanTest, fusedForScanCacheFillTakesASlice) {
   // The decoded file takes 16 bytes per row.
   EXPECT_GE(wholeFileBytes, int64_t{kNumGroups} * kRowsPerGroup * 16);
   EXPECT_LT(rowGroupBytes * 4, wholeFileBytes);
+}
+
+// A failed task closes its TableScan, which cancels the data source, but frees
+// the data source only with the last reference to its Driver, which a pending
+// future can hold for seconds. The reads of the split are device memory that
+// the next query needs.
+TEST_F(TableScanTest, cancelReleasesTheReadsOfTheSplit) {
+  constexpr vector_size_t kRowsPerGroup = 50'000;
+  constexpr int kNumGroups = 8;
+  std::vector<RowVectorPtr> vectors;
+  for (int group = 0; group < kNumGroups; ++group) {
+    const int64_t first = int64_t{group} * kRowsPerGroup;
+    vectors.push_back(makeRowVector(
+        {"c0", "c1"},
+        {
+            makeFlatVector<int64_t>(
+                kRowsPerGroup, [&](auto row) { return first + row; }),
+            makeFlatVector<double>(
+                kRowsPerGroup, [&](auto row) { return (first + row) * 0.25; }),
+        }));
+  }
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), vectors);
+  const auto rowType = asRowType(vectors.front()->type());
+
+  auto root = memory::memoryManager()->addRootPool(
+      "TableScanTest.cancelReleasesTheReadsOfTheSplit");
+  auto operatorPool = root->addLeafChild("operator");
+  auto connectorPool = root->addAggregateChild("connector");
+  // Small chunks, so that the first batch leaves the rest of the split read.
+  facebook::velox::config::ConfigBase session(
+      std::unordered_map<std::string, std::string>{
+          {cudf_velox::connector::hive::CudfHiveConfig::
+               kMaxChunkReadLimitSession,
+           "1048576"},
+      });
+  auto queryCtx = core::QueryCtx::create(nullptr, core::QueryConfig({}));
+  auto connectorQueryCtx =
+      facebook::velox::connector::ConnectorQueryCtx::Builder()
+          .operatorPool(operatorPool.get())
+          .connectorPool(connectorPool.get())
+          .sessionProperties(&session)
+          .expressionEvaluator(
+              std::make_unique<facebook::velox::exec::SimpleExpressionEvaluator>(
+                  queryCtx.get(), operatorPool.get()))
+          .queryId("query.cancelReleasesTheReadsOfTheSplit")
+          .taskId("task.cancelReleasesTheReadsOfTheSplit")
+          .planNodeId("0")
+          .build();
+
+  // The reads are counted by an adaptor of the test's own, which outlives
+  // them.
+  rmm::mr::statistics_resource_adaptor counting(cudf_velox::mr_.value());
+  auto previous = cudf::set_current_device_resource(counting);
+  auto previousOutput = cudf_velox::output_mr_;
+  cudf_velox::output_mr_ = counting;
+  SCOPE_EXIT {
+    cudf::set_current_device_resource(std::move(previous));
+    cudf_velox::output_mr_ = std::move(previousOutput);
+  };
+  auto dataSource =
+      facebook::velox::connector::ConnectorRegistry::tryGet(
+          kCudfHiveConnectorId)
+          ->createDataSource(
+              rowType,
+              makeTableHandle("parquet_table", rowType),
+              HiveConnectorTestBase::allRegularColumns(rowType),
+              connectorQueryCtx.get());
+  dataSource->addSplit(makeCudfHiveConnectorSplits({filePath}).front());
+  auto future = ContinueFuture::makeEmpty();
+  auto batch = dataSource->next(kRowsPerGroup, future);
+  ASSERT_TRUE(batch.has_value());
+  ASSERT_NE(batch.value(), nullptr);
+  ASSERT_LT(batch.value()->size(), kNumGroups * kRowsPerGroup);
+  batch.reset();
+  const auto read = counting.get_bytes_counter().value;
+
+  dataSource->cancel();
+  const auto cancelled = counting.get_bytes_counter().value;
+  dataSource.reset();
+  // The cancelled data source held nothing that its destruction frees.
+  EXPECT_EQ(counting.get_bytes_counter().value, cancelled);
+  EXPECT_LT(cancelled, read);
 }
 
 TEST_F(TableScanTest, columnAliases) {

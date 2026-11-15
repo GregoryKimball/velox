@@ -335,6 +335,13 @@ void CudfHiveDataSource::setFromDataSource(std::unique_ptr<DataSource> source) {
   ioStats_ = std::move(preparedSource->ioStats_);
 }
 
+void CudfHiveDataSource::cancel() {
+  // A failed task closes its TableScan, but frees the data source only with the
+  // last reference to its Driver, which a pending future can hold for seconds.
+  // The reader's destructor discards reads still in flight.
+  cudfSplitReader_.reset();
+}
+
 std::optional<RowVectorPtr> CudfHiveDataSource::next(
     uint64_t size,
     velox::ContinueFuture& /* future */) {
