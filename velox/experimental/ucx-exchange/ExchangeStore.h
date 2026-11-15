@@ -179,6 +179,9 @@ class ExchangeStore {
     uint64_t payloads{0};
     /// Pinned host memory the host tier's pool holds, in use or not.
     uint64_t hostPoolBytes{0};
+    /// Tables held, including tables whose files were all taken but whose
+    /// writers or readers have not finished.
+    uint64_t tables{0};
   };
 
   Stats stats() const;

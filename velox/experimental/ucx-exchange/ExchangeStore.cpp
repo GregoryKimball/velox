@@ -557,7 +557,8 @@ ExchangeStore::Stats ExchangeStore::stats() const {
       .deviceBytes = deviceBytes_,
       .hostBytes = hostBytes_,
       .payloads = payloads_,
-      .hostPoolBytes = hostPool_ != nullptr ? hostPool_->pool.pool_size() : 0};
+      .hostPoolBytes = hostPool_ != nullptr ? hostPool_->pool.pool_size() : 0,
+      .tables = tables_.size()};
 }
 
 void ExchangeStore::forget(const StoredPayload& payload) {

@@ -1199,6 +1199,7 @@ class ExchangeStoreTaskListener : public exec::TaskListener {
     // Completes the tables this task wrote, waking readers that wait for them.
     ExchangeStore::instance().endWrites(taskId);
     if (state == exec::TaskState::kFinished) {
+      logOccupancy(taskId, state);
       return;
     }
     // A Presto task id starts with the query id, which every temporary table
@@ -1207,6 +1208,20 @@ class ExchangeStoreTaskListener : public exec::TaskListener {
     if (!queryId.empty()) {
       ExchangeStore::instance().dropQuery(queryId);
     }
+    logOccupancy(taskId, state);
+  }
+
+ private:
+  // What a query leaves in the store shows here: the next query has that much
+  // less memory.
+  static void logOccupancy(const std::string& taskId, exec::TaskState state) {
+    const auto stats = ExchangeStore::instance().stats();
+    LOG_IF(INFO, stats.tables > 0)
+        << "Exchange store after task " << taskId << " ended ("
+        << exec::taskStateString(state) << "): " << stats.tables << " tables, "
+        << stats.payloads << " payloads, " << stats.deviceBytes
+        << " device bytes, " << stats.hostBytes << " host bytes, "
+        << stats.hostPoolBytes << " host pool bytes";
   }
 };
 

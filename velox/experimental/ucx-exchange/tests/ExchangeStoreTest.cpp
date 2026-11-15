@@ -371,8 +371,10 @@ TEST_F(ExchangeStoreTest, dropQueryFreesOnlyThatQuerysTables) {
   store.add("__presto_temporary_table_ORC_q1_b", "0", std::move(payloads[1]), 400, {}, stream_);
   const auto keptBytes = bytesOf(payloads[2]);
   store.add("__presto_temporary_table_ORC_q2_a", "0", std::move(payloads[2]), 300, {}, stream_);
+  EXPECT_EQ(store.stats().tables, 3);
 
   store.dropQuery("q1");
+  EXPECT_EQ(store.stats().tables, 1);
   EXPECT_EQ(store.stats().payloads, 1);
   EXPECT_EQ(store.stats().deviceBytes + store.stats().hostBytes, keptBytes);
   EXPECT_THAT(
