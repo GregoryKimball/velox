@@ -97,8 +97,6 @@ class MemoryPeakLogger : public exec::TaskListener {
         return;
       }
     }
-    // The pool would keep the busy period's device memory for good.
-    trimDeviceMemoryPool();
     // What stays once the worker is idle: memory still allocated through the
     // cuDF memory resource, and device memory free for the next query.
     std::size_t freeBytes{0};
@@ -547,7 +545,6 @@ void unregisterCudf() {
   }
   // Reset the any_resource copies before the adaptors they were copied from,
   // so that the wrapped upstream resources are released here.
-  forgetDeviceMemoryPools();
   output_mr_.reset();
   mr_.reset();
   outputStatsMr_.reset();

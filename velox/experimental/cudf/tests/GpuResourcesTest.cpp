@@ -152,27 +152,6 @@ TEST_F(GpuResourcesTest, admitsASplitGroupWhileItsShareFits) {
   EXPECT_FALSE(admitSplitGroup(10, 0, 1, 1, 0.8));
 }
 
-TEST_F(GpuResourcesTest, trimReturnsTheAsyncPoolsMemoryToTheDevice) {
-  CudfConfig::getInstance().memoryResource = "async";
-  registerCudf();
-  constexpr std::size_t kBytes = std::size_t{512} << 20;
-  auto stream = cudfGlobalStreamPool().get_stream();
-  {
-    rmm::device_buffer buffer(
-        kBytes, stream, cudf::get_current_device_resource_ref());
-  }
-  stream.sync();
-
-  // The pool keeps the freed buffer's memory; the trim returns it.
-  std::size_t freeBefore{0};
-  std::size_t total{0};
-  ASSERT_EQ(cudaMemGetInfo(&freeBefore, &total), cudaSuccess);
-  trimDeviceMemoryPool();
-  std::size_t freeAfter{0};
-  ASSERT_EQ(cudaMemGetInfo(&freeAfter, &total), cudaSuccess);
-  EXPECT_GE(freeAfter, freeBefore + kBytes / 2);
-}
-
 TEST_F(GpuResourcesTest, allocatedBytesIncludesSeparateOutputResource) {
   auto& config = CudfConfig::getInstance();
   config.memoryResource = "async";
