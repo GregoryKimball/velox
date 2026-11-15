@@ -385,6 +385,32 @@ TEST_F(ExchangeStoreTest, dropQueryFreesOnlyThatQuerysTables) {
       testing::SizeIs(1));
 }
 
+TEST_F(ExchangeStoreTest, keepsNothingForADroppedQuery) {
+  const auto input = makeInput();
+  auto payloads = pack(input, {300, 700}, compressions().back());
+  ExchangeStore store;
+  store.add("__presto_temporary_table_ORC_q1_a", "0", std::move(payloads[0]), 300, {}, stream_);
+  store.dropQuery("q1");
+
+  // A writer of the query that ends after the drop, and a late reader.
+  store.beginWrite("__presto_temporary_table_ORC_q1_b", "q1.2.0.0.0");
+  store.add("__presto_temporary_table_ORC_q1_b", "0", std::move(payloads[1]), 400, {}, stream_);
+  ContinueFuture future = ContinueFuture::makeEmpty();
+  const auto taken = store.takeOrWait(
+      "__presto_temporary_table_ORC_q1_c", {"0"}, stream_, memoryResource(), future);
+  ASSERT_TRUE(taken.has_value());
+  EXPECT_THAT(*taken, testing::IsEmpty());
+  store.endWrites("q1.2.0.0.0");
+  EXPECT_EQ(store.stats().tables, 0);
+  EXPECT_EQ(store.stats().payloads, 0);
+  EXPECT_EQ(store.stats().deviceBytes + store.stats().hostBytes, 0);
+
+  // Other queries keep their data.
+  store.add("__presto_temporary_table_ORC_q2_a", "0", std::move(payloads[2]), 300, {}, stream_);
+  EXPECT_EQ(store.stats().tables, 1);
+  EXPECT_EQ(store.stats().payloads, 1);
+}
+
 TEST_F(ExchangeStoreTest, keepsSharedKeysUntilTheirLastPayloadIsTaken) {
   using cudf_velox::connector::hive::FusedForEncoding;
   const auto keysInput = makeRowVector({makeFlatVector<int64_t>({10, 20, 30})});

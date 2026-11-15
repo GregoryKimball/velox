@@ -160,7 +160,9 @@ class ExchangeStore {
   /// Frees the payloads of every file of 'table' that was not taken.
   void drop(std::string_view table);
 
-  /// Frees the payloads of every table whose name contains 'queryId'.
+  /// Frees the payloads of every table whose name contains 'queryId', and
+  /// keeps nothing that the query's later writers add: a failed query's
+  /// writers on other stages may finish after the drop.
   void dropQuery(std::string_view queryId);
 
   /// Moves device-tier payloads to the host tier until at least 'bytes' are
@@ -277,10 +279,16 @@ class ExchangeStore {
   // process. Called with 'mutex_' held.
   void resetTiersIfEmpty();
 
+  // Whether 'table' belongs to a query that dropQuery() dropped. Called with
+  // 'mutex_' held.
+  bool isDropped(std::string_view table) const;
+
   mutable std::mutex mutex_;
   // Declared before 'tables_' so that it outlives the host buffers.
   std::unique_ptr<HostPool> hostPool_;
   folly::F14FastMap<std::string, Table> tables_;
+  // The queries dropQuery() dropped most recently, oldest first.
+  std::deque<std::string> droppedQueries_;
   uint64_t nextKeysId_{0};
   uint64_t deviceCapacity_{0};
   // The capacity setDeviceCapacity() gave; demote() lowers deviceCapacity_

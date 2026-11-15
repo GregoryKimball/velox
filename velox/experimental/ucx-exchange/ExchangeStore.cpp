@@ -19,6 +19,7 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <iterator>
@@ -33,6 +34,10 @@ namespace facebook::velox::ucx_exchange {
 namespace {
 // The host pool's first block. The pool grows by at least its current size.
 constexpr std::size_t kInitialHostPoolBytes{std::size_t{1} << 30};
+
+// Dropped queries remembered, so that their late writers keep nothing. A failed
+// query's tasks end within seconds, during which few other queries fail.
+constexpr std::size_t kMaxDroppedQueries{64};
 
 // Host buffers are allocated and freed on one stream, so the pool reuses them
 // without waiting; copies into and out of them are synchronized separately.
@@ -106,6 +111,15 @@ void ExchangeStore::setDeviceCapacity(uint64_t bytes) {
   std::lock_guard<std::mutex> lock(mutex_);
   deviceCapacity_ = bytes;
   configuredDeviceCapacity_ = bytes;
+}
+
+bool ExchangeStore::isDropped(std::string_view table) const {
+  return std::any_of(
+      droppedQueries_.begin(),
+      droppedQueries_.end(),
+      [&](const std::string& queryId) {
+        return table.find(queryId) != std::string_view::npos;
+      });
 }
 
 void ExchangeStore::resetTiersIfEmpty() {
@@ -186,12 +200,23 @@ bool ExchangeStore::add(
     vector_size_t numRows,
     PayloadEncoding encoding,
     cuda::stream_ref stream) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (isDropped(table)) {
+      return false;
+    }
+  }
   auto stored = toStored<StoredPayload>(std::move(payload), numRows);
   stored.encoding = std::move(encoding);
   const bool toHost = place(stored, stream);
   std::vector<ContinuePromise> waiters;
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (isDropped(table)) {
+      // Dropped while the payload was placed. It is freed on return.
+      forget(stored);
+      return false;
+    }
     auto& entry = tables_[std::string{table}];
     entry.files[std::string{file}].push_back(std::move(stored));
     ++payloads_;
@@ -215,6 +240,10 @@ uint64_t ExchangeStore::addKeys(
   place(stored, stream);
   std::lock_guard<std::mutex> lock(mutex_);
   const auto id = nextKeysId_++;
+  if (isDropped(table)) {
+    forget(stored);
+    return id;
+  }
   tables_[std::string{table}].keys.emplace(
       id,
       StoredKeys{
@@ -363,7 +392,9 @@ void ExchangeStore::beginWrite(
     std::string_view table,
     std::string_view taskId) {
   std::lock_guard<std::mutex> lock(mutex_);
-  tables_[std::string{table}].writers.insert(std::string{taskId});
+  if (!isDropped(table)) {
+    tables_[std::string{table}].writers.insert(std::string{taskId});
+  }
 }
 
 void ExchangeStore::endWrites(std::string_view taskId) {
@@ -429,8 +460,9 @@ ExchangeStore::takeOrWait(
         }
       }
       if (written.empty()) {
-        const bool complete = completedTables_.count(std::string{table}) > 0 &&
-            (tableIt == tables_.end() || tableIt->second.writers.empty());
+        const bool complete = isDropped(table) ||
+            (completedTables_.count(std::string{table}) > 0 &&
+             (tableIt == tables_.end() || tableIt->second.writers.empty()));
         if (complete) {
           return std::vector<TakenPayload>{};
         }
@@ -486,6 +518,10 @@ void ExchangeStore::dropQuery(std::string_view queryId) {
   std::vector<Table> dropped;
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    droppedQueries_.emplace_back(queryId);
+    if (droppedQueries_.size() > kMaxDroppedQueries) {
+      droppedQueries_.pop_front();
+    }
     for (auto it = tables_.begin(); it != tables_.end();) {
       if (it->first.find(queryId) == std::string::npos) {
         ++it;
