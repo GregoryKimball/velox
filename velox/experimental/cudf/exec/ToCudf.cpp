@@ -48,7 +48,6 @@
 #include <cuda_runtime_api.h>
 
 #include <fstream>
-#include <mutex>
 #include <sstream>
 #include <string>
 
@@ -523,22 +522,6 @@ void registerCudf() {
               fraction);
         });
   }
-
-  // The last resort of a failed allocation: a task that failed or was
-  // cancelled frees its operators' device memory when its drivers finish, about
-  // a second after the failure, and a query that starts at once would fail too.
-  static std::once_flag releaserRegistered;
-  std::call_once(releaserRegistered, [] {
-    registerDeviceMemoryReleaser([](std::size_t bytes) {
-      bool terminatedTaskAlive = false;
-      for (const auto& task : exec::Task::getRunningTasks()) {
-        terminatedTaskAlive |= !task->isRunning();
-      }
-      return terminatedTaskAlive &&
-          waitForReleasedDeviceMemory(
-                 bytes, std::chrono::milliseconds(2'000), cudfAllocatedBytes);
-    });
-  });
 
   memoryPeakLogger() = std::make_shared<MemoryPeakLogger>();
   exec::registerTaskListener(memoryPeakLogger());

@@ -23,7 +23,6 @@
 
 #include <cuda/memory_resource>
 
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -74,15 +73,6 @@ bool admitSplitGroup(
     uint32_t numRunningSplitGroups,
     uint32_t numCompletedSplitGroups,
     double fraction);
-
-/// Waits up to 'timeout' for 'allocatedBytes' to drop at least 'bytes' below its
-/// value on entry and returns whether it did. A task that failed or was
-/// cancelled frees its operators' device memory when its drivers finish, which
-/// can take a second; an allocation that fails in the meantime can wait for it.
-bool waitForReleasedDeviceMemory(
-    std::size_t bytes,
-    std::chrono::milliseconds timeout,
-    const std::function<int64_t()>& allocatedBytes);
 
 /// Registers a function that frees device memory its owner holds outside the
 /// cuDF memory resource (e.g. a cache), given the size of a failed allocation.
