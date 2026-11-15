@@ -45,6 +45,8 @@
 
 #include <cuda.h>
 
+#include <cuda_runtime_api.h>
+
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -95,9 +97,19 @@ class MemoryPeakLogger : public exec::TaskListener {
         return;
       }
     }
+    // What stays once the worker is idle: memory still allocated through the
+    // cuDF memory resource, and device memory free for the next query.
+    std::size_t freeBytes{0};
+    std::size_t totalBytes{0};
+    if (cudaMemGetInfo(&freeBytes, &totalBytes) != cudaSuccess) {
+      cudaGetLastError();
+    }
     LOG(INFO) << "Memory peak while busy: device "
               << takeCudfPeakAllocatedBytes() << " bytes, host resident "
-              << takeHostPeakResidentBytes() << " bytes, last task " << taskId;
+              << takeHostPeakResidentBytes() << " bytes, last task " << taskId
+              << "; idle: device allocated " << cudfAllocatedBytes()
+              << " bytes, device free " << freeBytes << " of " << totalBytes
+              << " bytes";
   }
 };
 
