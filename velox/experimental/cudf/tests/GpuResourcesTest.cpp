@@ -135,6 +135,23 @@ TEST_F(GpuResourcesTest, peakAllocatedBytesCoversEachWindow) {
   EXPECT_EQ(takeCudfPeakAllocatedBytes(), -1);
 }
 
+// A task starts a split group next to running ones once it has completed one
+// and while one more running split group's share of the allocated memory fits.
+TEST_F(GpuResourcesTest, admitsASplitGroupWhileItsShareFits) {
+  constexpr int64_t kAvailableBytes{100};
+  // No split group has completed: what one allocates is not known yet.
+  EXPECT_FALSE(admitSplitGroup(0, kAvailableBytes, 1, 0, 0.8));
+  // Two split groups hold 40 bytes: a third one's 20 reaches 60 of 80.
+  EXPECT_TRUE(admitSplitGroup(40, kAvailableBytes, 2, 1, 0.8));
+  // Two hold 60 bytes: a third one's 30 would reach 90 of 80.
+  EXPECT_FALSE(admitSplitGroup(60, kAvailableBytes, 2, 1, 0.8));
+  // Exactly the fraction fits.
+  EXPECT_TRUE(admitSplitGroup(50, kAvailableBytes, 1, 1, 1.0));
+  // Unknown memory admits nothing.
+  EXPECT_FALSE(admitSplitGroup(-1, kAvailableBytes, 1, 1, 0.8));
+  EXPECT_FALSE(admitSplitGroup(10, 0, 1, 1, 0.8));
+}
+
 TEST_F(GpuResourcesTest, allocatedBytesIncludesSeparateOutputResource) {
   auto& config = CudfConfig::getInstance();
   config.memoryResource = "async";

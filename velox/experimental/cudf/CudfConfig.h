@@ -84,6 +84,8 @@ struct CudfConfig {
       "cudf.exchange_store_device_bytes"};
   static constexpr const char* kExchangeStoreHostBytes{
       "cudf.exchange_store_host_bytes"};
+  static constexpr const char* kSplitGroupAdmissionFraction{
+      "cudf.split_group_admission_fraction"};
   static constexpr const char* kCudfKvikioCacheCopyThreads{
       "cudf.kvikio_cache_copy_threads"};
   /// Query configuration key for selecting UCX exchange compression.
@@ -163,6 +165,12 @@ struct CudfConfig {
   /// Bytes of temporary table data the exchange store keeps in pinned host
   /// memory; a query that needs more fails. 0 means no limit.
   int64_t exchangeStoreHostBytes{0};
+
+  /// Share of the device memory available at startup that a task's split
+  /// groups (grouped execution) may fill before the task starts another split
+  /// group next to running ones (admitSplitGroup()). 0 starts them up to the
+  /// task's concurrent split group limit.
+  double splitGroupAdmissionFraction{0};
 
   /// Threads that copy KvikIO data from the async data cache to the GPU. One
   /// pool for the whole process, created by the first cached GPU read.

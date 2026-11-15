@@ -97,6 +97,16 @@ TEST(ConfigTest, rejectsNegativeExchangeMaxQueuedBytes) {
       "UCX exchange maximum queued bytes must be a non-negative integer: -1");
 }
 
+TEST(ConfigTest, splitGroupAdmissionFraction) {
+  CudfConfig config;
+  EXPECT_EQ(config.splitGroupAdmissionFraction, 0);
+  config.initialize({{CudfConfig::kSplitGroupAdmissionFraction, "0.75"}});
+  EXPECT_EQ(config.splitGroupAdmissionFraction, 0.75);
+  VELOX_ASSERT_USER_THROW(
+      config.initialize({{CudfConfig::kSplitGroupAdmissionFraction, "1.5"}}),
+      "Split group admission fraction must be between 0 and 1: 1.5");
+}
+
 TEST(ConfigTest, rejectsNonPositiveStreamingGroupbyPartitions) {
   auto initialize = [](const char* value) {
     CudfConfig config;

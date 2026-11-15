@@ -61,6 +61,19 @@ int64_t takeCudfPeakAllocatedBytes();
 /// statistics adaptor that holds it is destroyed.
 void endCudfPeakWindow();
 
+/// Returns whether a task may start one more split group next to
+/// 'numRunningSplitGroups' running ones: once it has completed one, so that
+/// what a split group allocates shows in 'allocatedBytes', and while
+/// 'allocatedBytes' grown by the share of one running split group stays within
+/// 'fraction' of 'availableBytes'. 'allocatedBytes' counts the whole process,
+/// so the share overestimates what one split group needs.
+bool admitSplitGroup(
+    int64_t allocatedBytes,
+    int64_t availableBytes,
+    uint32_t numRunningSplitGroups,
+    uint32_t numCompletedSplitGroups,
+    double fraction);
+
 /// Registers a function that frees device memory its owner holds outside the
 /// cuDF memory resource (e.g. a cache), given the size of a failed allocation.
 /// It returns whether it freed any.

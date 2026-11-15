@@ -223,6 +223,22 @@ int64_t takeCudfPeakAllocatedBytes() {
   return peak;
 }
 
+bool admitSplitGroup(
+    int64_t allocatedBytes,
+    int64_t availableBytes,
+    uint32_t numRunningSplitGroups,
+    uint32_t numCompletedSplitGroups,
+    double fraction) {
+  if (numCompletedSplitGroups == 0 || numRunningSplitGroups == 0 ||
+      allocatedBytes < 0 || availableBytes <= 0) {
+    return false;
+  }
+  const double share =
+      static_cast<double>(allocatedBytes) / numRunningSplitGroups;
+  return static_cast<double>(allocatedBytes) + share <=
+      fraction * static_cast<double>(availableBytes);
+}
+
 void endCudfPeakWindow() {
   std::lock_guard lock(peakWindowMutex());
   peakWindowOpen = false;

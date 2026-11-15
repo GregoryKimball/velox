@@ -494,6 +494,23 @@ void registerCudf() {
   }
 #endif
 
+  if (const auto fraction =
+          CudfConfig::getInstance().splitGroupAdmissionFraction;
+      fraction > 0) {
+    exec::Task::setSplitGroupAdmission(
+        [fraction](
+            const exec::Task& /*task*/,
+            uint32_t numRunningSplitGroups,
+            uint32_t numCompletedSplitGroups) {
+          return admitSplitGroup(
+              cudfAllocatedBytes(),
+              static_cast<int64_t>(gpuCapabilities().availableMemoryBytes),
+              numRunningSplitGroups,
+              numCompletedSplitGroups,
+              fraction);
+        });
+  }
+
   memoryPeakLogger() = std::make_shared<MemoryPeakLogger>();
   exec::registerTaskListener(memoryPeakLogger());
   // Starts the first window at registration.
@@ -509,6 +526,7 @@ void unregisterCudf() {
   ucx_exchange::unregisterUcxTransports();
   ucx_exchange::unregisterExchangeStoreTables();
 #endif
+  exec::Task::setSplitGroupAdmission(nullptr);
   if (memoryPeakLogger() != nullptr) {
     exec::unregisterTaskListener(memoryPeakLogger());
     memoryPeakLogger() = nullptr;
@@ -681,6 +699,15 @@ void CudfConfig::initialize(
         "Exchange store host bytes must be a non-negative integer: {}",
         value);
     exchangeStoreHostBytes = bytes.value();
+  }
+  if (config.find(kSplitGroupAdmissionFraction) != config.end()) {
+    const auto& value = config[kSplitGroupAdmissionFraction];
+    const auto fraction = folly::tryTo<double>(value);
+    VELOX_USER_CHECK(
+        fraction.hasValue() && fraction.value() >= 0 && fraction.value() <= 1,
+        "Split group admission fraction must be between 0 and 1: {}",
+        value);
+    splitGroupAdmissionFraction = fraction.value();
   }
   if (config.find(kCudfKvikioCacheCopyThreads) != config.end()) {
     kvikioCacheCopyThreads =
