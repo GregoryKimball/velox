@@ -849,6 +849,23 @@ class Task : public std::enable_shared_from_this<Task> {
     return concurrentSplitGroups_;
   }
 
+  /// Decides whether a task may start one more split group while
+  /// 'numRunningSplitGroups' of its split groups run and
+  /// 'numCompletedSplitGroups' have completed, below its concurrent split group
+  /// limit, for example from the memory left to the process. Called under the
+  /// task's lock, so it must not call back into the task.
+  using SplitGroupAdmission = std::function<bool(
+      const Task& task,
+      uint32_t numRunningSplitGroups,
+      uint32_t numCompletedSplitGroups)>;
+
+  /// Sets the split group admission of every task, or clears it with nullptr.
+  /// A split group held back starts when another split group of the task
+  /// finishes or a split group is added. A task starts a split group whenever
+  /// none runs, so it progresses whatever the admission returns. Set it before
+  /// tasks run.
+  static void setSplitGroupAdmission(SplitGroupAdmission admission);
+
   /// Returns the cancellation token to check if this task has been terminated
   /// or not. This helps the Velox integration with query system using folly
   /// cancellation mechanism.

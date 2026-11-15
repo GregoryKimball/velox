@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <folly/ScopeGuard.h>
 #include <regex>
 
 #include "velox/common/base/tests/GTestUtils.h"
@@ -315,6 +316,75 @@ TEST_F(GroupedExecutionTest, groupedExecutionWithOutputBuffer) {
   EXPECT_EQ(18, taskStats.pipelineStats[1].operatorStats[1].inputVectors);
 }
 
+
+// A split group admission holds queued split groups back below the concurrent
+// split group limit, for example while memory is short. A task starts a split
+// group whenever none runs, so it progresses whatever the admission returns.
+TEST_F(GroupedExecutionTest, splitGroupAdmissionHoldsBackSplitGroups) {
+  auto vectors = makeVectors(10, 1'000);
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), vectors);
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId tableScanNodeId;
+  auto planFragment =
+      PlanBuilder(planNodeIdGenerator)
+          .tableScan(rowType_)
+          .capturePlanNodeId(tableScanNodeId)
+          .project({"c3 as x", "c2 as y", "c1 as z", "c0 as w", "c4", "c5"})
+          .localPartitionRoundRobinRow()
+          .project({"w as c0", "z as c1", "y as c2", "x as c3", "c4", "c5"})
+          .localPartitionRoundRobinRow()
+          .partitionedOutput({}, 1, {"c0", "c1", "c2", "c3", "c4", "c5"})
+          .planFragment();
+  planFragment.executionStrategy = core::ExecutionStrategy::kGrouped;
+  planFragment.groupedExecutionLeafNodeIds.emplace(tableScanNodeId);
+  planFragment.numSplitGroups = 10;
+
+  std::atomic_bool admit{false};
+  Task::setSplitGroupAdmission(
+      [&](const Task& /*task*/,
+          uint32_t /*numRunningSplitGroups*/,
+          uint32_t /*numCompletedSplitGroups*/) { return admit.load(); });
+  SCOPE_EXIT {
+    Task::setSplitGroupAdmission(nullptr);
+  };
+  auto task = exec::Task::create(
+      "0",
+      std::move(planFragment),
+      0,
+      core::QueryCtx::create(executor_.get()),
+      Task::ExecutionMode::kParallel);
+  // 3 drivers per pipeline and up to 2 split groups at once.
+  task->start(3, 2);
+
+  // The admission holds split group 5 back: one split group, 3 pipelines of 3
+  // drivers, runs.
+  task->addSplit("0", makeHiveSplitWithGroup(filePath->getPath(), 1));
+  task->addSplit("0", makeHiveSplitWithGroup(filePath->getPath(), 5));
+  EXPECT_EQ(9, task->numRunningDrivers());
+
+  // Split group 5 starts when split group 1 finishes.
+  task->noMoreSplitsForGroup("0", 1);
+  waitForFinishedDrivers(task, 9);
+  EXPECT_EQ(9, task->numRunningDrivers());
+  EXPECT_EQ(std::unordered_set<int32_t>({1}), getCompletedSplitGroups(task));
+
+  // Admitted, split group 8 runs next to split group 5.
+  admit = true;
+  task->addSplit("0", makeHiveSplitWithGroup(filePath->getPath(), 8));
+  EXPECT_EQ(18, task->numRunningDrivers());
+
+  task->noMoreSplitsForGroup("0", 5);
+  task->noMoreSplitsForGroup("0", 8);
+  waitForFinishedDrivers(task, 27);
+  task->noMoreSplits("0");
+  exec::DefaultOutputBufferManager::getInstanceRef()->deleteResults(
+      task->taskId(), 0);
+  EXPECT_EQ(exec::TaskState::kFinished, task->state());
+  EXPECT_EQ(
+      std::unordered_set<int32_t>({1, 5, 8}), getCompletedSplitGroups(task));
+}
 TEST_F(GroupedExecutionTest, hashJoinWithMixedGroupedExecution) {
   // Create source file for probe and build sides
   auto vectors = makeVectors(4, 20);

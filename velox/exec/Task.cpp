@@ -1757,6 +1757,18 @@ void Task::removeDriver(std::shared_ptr<Task> self, Driver* driver) {
   }
 }
 
+namespace {
+// See Task::setSplitGroupAdmission().
+Task::SplitGroupAdmission& splitGroupAdmission() {
+  static Task::SplitGroupAdmission admission;
+  return admission;
+}
+} // namespace
+
+void Task::setSplitGroupAdmission(SplitGroupAdmission admission) {
+  splitGroupAdmission() = std::move(admission);
+}
+
 void Task::ensureSplitGroupsAreBeingProcessedLocked() {
   // Splits received during startup wait until driver slots are allocated.
   if (not isRunningLocked() or (numDriversPerSplitGroup_ == 0) or
@@ -1764,8 +1776,14 @@ void Task::ensureSplitGroupsAreBeingProcessedLocked() {
     return;
   }
 
+  const auto& admission = splitGroupAdmission();
   while (numRunningSplitGroups_ < concurrentSplitGroups_ and
-         not queuedSplitGroups_.empty()) {
+         not queuedSplitGroups_.empty() and
+         (numRunningSplitGroups_ == 0 or admission == nullptr or
+          admission(
+              *this,
+              numRunningSplitGroups_,
+              taskStats_.completedSplitGroups.size()))) {
     const uint32_t splitGroupId = queuedSplitGroups_.front();
     queuedSplitGroups_.pop();
 
