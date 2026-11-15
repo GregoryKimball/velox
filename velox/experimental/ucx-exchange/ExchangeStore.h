@@ -270,14 +270,11 @@ class ExchangeStore {
   // 'mutex_' held when its last writer ends.
   void complete(const std::string& name);
 
-  // Once 'tables_' is empty, restores the device tier's capacity to the
-  // configured one and releases the host tier's pool when no host buffer is
-  // left. A demote() answered one query's lack of memory, and keeping the
+  // Restores the device tier's capacity to the configured one once 'tables_'
+  // is empty: a demote() answered one query's lack of memory, and keeping the
   // smaller tier would send later queries' payloads to host memory although
-  // the device has room again. The pool keeps the pinned memory of the largest
-  // spill until it is released, which would hold it for the life of the
-  // process. Called with 'mutex_' held.
-  void resetTiersIfEmpty();
+  // the device has room again. Called with 'mutex_' held.
+  void restoreDeviceCapacityIfEmpty();
 
   // Whether 'table' belongs to a query that dropQuery() dropped. Called with
   // 'mutex_' held.

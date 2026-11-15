@@ -260,58 +260,6 @@ TEST_F(ExchangeStoreTest, overflowsToHostWhenDeviceTierIsFull) {
   EXPECT_EQ(store.stats().hostBytes, 0);
 }
 
-TEST_F(ExchangeStoreTest, releasesHostPoolOnceEmpty) {
-  const auto input = makeInput();
-  const auto type = asRowType(input->type());
-  const std::vector<vector_size_t> offsets{0, 500, kNumRows};
-
-  // A device tier without room sends every payload to the host tier.
-  ExchangeStore store;
-  store.setDeviceCapacity(0);
-  const auto addTable = [&](const std::string& table) {
-    auto payloads = pack(input, {500}, compressions().back());
-    for (int part = 0; part < 2; ++part) {
-      store.add(
-          table,
-          "file",
-          std::move(payloads[part]),
-          offsets[part + 1] - offsets[part],
-          {},
-          stream_);
-    }
-  };
-  addTable("first");
-  addTable("second");
-  ASSERT_GT(store.stats().hostBytes, 0);
-  ASSERT_GT(store.stats().hostPoolBytes, 0);
-
-  // "second" still holds pinned payloads.
-  EXPECT_EQ(takeRows(store, "first", "file", type).size(), 2);
-  EXPECT_GT(store.stats().hostPoolBytes, 0);
-
-  store.drop("second");
-  EXPECT_EQ(store.stats().hostPoolBytes, 0);
-
-  // The pool comes back for later payloads, and a take that empties the store
-  // releases it again.
-  addTable("third");
-  EXPECT_GT(store.stats().hostPoolBytes, 0);
-  const auto rows = takeRows(store, "third", "file", type);
-  ASSERT_EQ(rows.size(), 2);
-  for (int part = 0; part < 2; ++part) {
-    velox::test::assertEqualVectors(
-        expectedRows(input, offsets[part], offsets[part + 1] - offsets[part]),
-        rows[part]);
-  }
-  EXPECT_EQ(store.stats().hostPoolBytes, 0);
-
-  // Dropping a query's last table releases it too.
-  addTable("query1_fourth");
-  EXPECT_GT(store.stats().hostPoolBytes, 0);
-  store.dropQuery("query1");
-  EXPECT_EQ(store.stats().hostPoolBytes, 0);
-}
-
 TEST_F(ExchangeStoreTest, readsHostTierCopiedOnAnotherStream) {
   const auto input = makeInput();
   const auto type = asRowType(input->type());
