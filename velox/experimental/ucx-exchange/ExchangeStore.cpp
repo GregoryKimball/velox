@@ -19,6 +19,7 @@
 
 #include <glog/logging.h>
 
+#include <atomic>
 #include <chrono>
 #include <iterator>
 
@@ -45,13 +46,18 @@ struct ExchangeStore::HostPool {
 
   rmm::mr::pinned_host_memory_resource upstream;
   rmm::mr::pool_memory_resource pool;
+  // Host buffers allocated from 'pool' and not yet returned to it. Buffers of
+  // taken payloads are freed without 'mutex_'.
+  std::atomic<std::size_t> liveBuffers{0};
 };
 
 ExchangeStore::HostBuffer::HostBuffer(HostPool& pool, std::size_t bytes)
     : pool_(pool),
       data_(pool.pool.allocate(
           hostPoolStream(), bytes, rmm::CUDA_ALLOCATION_ALIGNMENT)),
-      bytes_(bytes) {}
+      bytes_(bytes) {
+  ++pool_.liveBuffers;
+}
 
 ExchangeStore::HostBuffer::~HostBuffer() {
   if (written_ != nullptr) {
@@ -64,6 +70,7 @@ ExchangeStore::HostBuffer::~HostBuffer() {
   }
   pool_.pool.deallocate(
       hostPoolStream(), data_, bytes_, rmm::CUDA_ALLOCATION_ALIGNMENT);
+  --pool_.liveBuffers;
 }
 
 void ExchangeStore::HostBuffer::recordWrite(cuda::stream_ref stream) {
@@ -101,9 +108,13 @@ void ExchangeStore::setDeviceCapacity(uint64_t bytes) {
   configuredDeviceCapacity_ = bytes;
 }
 
-void ExchangeStore::restoreDeviceCapacityIfEmpty() {
-  if (tables_.empty()) {
-    deviceCapacity_ = configuredDeviceCapacity_;
+void ExchangeStore::resetTiersIfEmpty() {
+  if (!tables_.empty()) {
+    return;
+  }
+  deviceCapacity_ = configuredDeviceCapacity_;
+  if (hostPool_ != nullptr && hostPool_->liveBuffers == 0) {
+    hostPool_.reset();
   }
 }
 
@@ -257,7 +268,7 @@ std::vector<ExchangeStore::TakenPayload> ExchangeStore::take(
         tableIt->second.waiters.empty()) {
       forget(tableIt->second);
       tables_.erase(tableIt);
-      restoreDeviceCapacityIfEmpty();
+      resetTiersIfEmpty();
     }
   }
 
@@ -338,6 +349,13 @@ std::vector<ExchangeStore::TakenPayload> ExchangeStore::take(
     }
     result.push_back(std::move(taken));
   }
+  // The taken payloads' host buffers are freed now. Release the host tier's
+  // pool if the store emptied while they were in use.
+  payloadKeys.clear();
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    resetTiersIfEmpty();
+  }
   return result;
 }
 
@@ -371,7 +389,7 @@ void ExchangeStore::endWrites(std::string_view taskId) {
       }
       ++it;
     }
-    restoreDeviceCapacityIfEmpty();
+    resetTiersIfEmpty();
   }
   for (auto& waiter : waiters) {
     waiter.setValue();
@@ -450,14 +468,18 @@ void ExchangeStore::drop(std::string_view table) {
     dropped = std::move(it->second);
     tables_.erase(it);
     forget(dropped);
-    restoreDeviceCapacityIfEmpty();
+    resetTiersIfEmpty();
   }
-  // 'dropped' frees both tiers' memory outside the lock. Its readers wake up:
-  // a broken promise would fail their tasks with an error that hides the one
+  // 'dropped' frees both tiers' memory outside the lock, and the host tier's
+  // pool is released after it if the store is empty. Its readers wake up: a
+  // broken promise would fail their tasks with an error that hides the one
   // that dropped the table.
   for (auto& waiter : dropped.waiters) {
     waiter.setValue();
   }
+  dropped = Table{};
+  std::lock_guard<std::mutex> lock(mutex_);
+  resetTiersIfEmpty();
 }
 
 void ExchangeStore::dropQuery(std::string_view queryId) {
@@ -473,7 +495,7 @@ void ExchangeStore::dropQuery(std::string_view queryId) {
       dropped.push_back(std::move(it->second));
       it = tables_.erase(it);
     }
-    restoreDeviceCapacityIfEmpty();
+    resetTiersIfEmpty();
   }
   // 'dropped' frees both tiers' memory outside the lock. Its readers wake up,
   // as in drop().
@@ -482,6 +504,9 @@ void ExchangeStore::dropQuery(std::string_view queryId) {
       waiter.setValue();
     }
   }
+  dropped.clear();
+  std::lock_guard<std::mutex> lock(mutex_);
+  resetTiersIfEmpty();
 }
 
 std::size_t ExchangeStore::demote(std::size_t bytes) {
@@ -531,7 +556,8 @@ ExchangeStore::Stats ExchangeStore::stats() const {
   return Stats{
       .deviceBytes = deviceBytes_,
       .hostBytes = hostBytes_,
-      .payloads = payloads_};
+      .payloads = payloads_,
+      .hostPoolBytes = hostPool_ != nullptr ? hostPool_->pool.pool_size() : 0};
 }
 
 void ExchangeStore::forget(const StoredPayload& payload) {

@@ -177,6 +177,8 @@ class ExchangeStore {
     uint64_t hostBytes{0};
     /// Payloads held in either tier, keys included.
     uint64_t payloads{0};
+    /// Pinned host memory the host tier's pool holds, in use or not.
+    uint64_t hostPoolBytes{0};
   };
 
   Stats stats() const;
@@ -263,11 +265,14 @@ class ExchangeStore {
   // 'mutex_' held when its last writer ends.
   void complete(const std::string& name);
 
-  // Restores the device tier's capacity to the configured one once 'tables_'
-  // is empty: a demote() answered one query's lack of memory, and keeping the
+  // Once 'tables_' is empty, restores the device tier's capacity to the
+  // configured one and releases the host tier's pool when no host buffer is
+  // left. A demote() answered one query's lack of memory, and keeping the
   // smaller tier would send later queries' payloads to host memory although
-  // the device has room again. Called with 'mutex_' held.
-  void restoreDeviceCapacityIfEmpty();
+  // the device has room again. The pool keeps the pinned memory of the largest
+  // spill until it is released, which would hold it for the life of the
+  // process. Called with 'mutex_' held.
+  void resetTiersIfEmpty();
 
   mutable std::mutex mutex_;
   // Declared before 'tables_' so that it outlives the host buffers.
