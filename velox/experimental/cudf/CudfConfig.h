@@ -39,6 +39,8 @@ struct CudfConfig {
       "cudf.spill_host_numa_node"};
   static constexpr const char* kCudfSpillPartitionFanout{
       "cudf.spill_partition_fanout"};
+  static constexpr const char* kCudfSpillJoinPartitionBytes{
+      "cudf.spill_join_partition_bytes"};
   static constexpr const char* kCudfGroupbySelfSpillPercent{
       "cudf.groupby_self_spill_percent"};
   static constexpr const char* kCudfGroupbySelfSpillTargetPercent{
@@ -165,6 +167,14 @@ struct CudfConfig {
   /// of its leaves outgrows the row limit, from 2 to 1024. A wider split
   /// partitions each buffered row fewer times.
   int32_t spillPartitionFanout{64};
+
+  /// A hash join build whose estimated device memory exceeds this many bytes
+  /// is split into hash partitions that are joined one after the other. Zero,
+  /// the default, uses the room the query's GPU pool has when the build
+  /// starts. A smaller value makes smaller partitions, which leaves more room
+  /// for the join's output at the price of more probe rows going through host
+  /// memory.
+  uint64_t spillJoinPartitionBytes{0};
 
   /// A spillable final group-by moves its largest leaves to host memory by
   /// itself, from its driver thread, when the query's GPU pool is fuller than

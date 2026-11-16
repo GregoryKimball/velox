@@ -18,6 +18,7 @@
 
 #include "velox/experimental/cudf/exec/CudfJoin.h"
 #include "velox/experimental/cudf/exec/CudfJoinBuild.h"
+#include "velox/experimental/cudf/exec/CudfJoinSpillState.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
 #include "velox/experimental/cudf/expression/AstExpression.h"
 #include "velox/experimental/cudf/expression/AstExpressionUtils.h"
@@ -68,7 +69,52 @@ class CudfHashJoinBridge : public exec::JoinBridge {
 
   void setHashTable(std::optional<hash_type> hashObject);
 
-  std::optional<hash_type> hashOrFuture(ContinueFuture* future);
+  /// Returns the published hash tables, or nullopt with 'future' set when
+  /// there are none yet. A probe that has finished round 'completedRound' of
+  /// a partitioned build passes it and waits until a later round is
+  /// published. Returns nullopt without setting 'future' once every round of
+  /// a partitioned build is done; see finished().
+  std::optional<hash_type> hashOrFuture(
+      ContinueFuture* future,
+      std::optional<int64_t> completedRound = std::nullopt);
+
+  /// One hash partition of a build that does not fit on the device. 'path'
+  /// is the sequence of two-way splits that leads to it, and 'data' its
+  /// build rows, in host memory until its round.
+  struct Partition {
+    std::vector<uint8_t> path;
+    std::unique_ptr<CudfJoinSpillState> data;
+  };
+
+  /// The path of every partition, in round order. Empty for a build that was
+  /// published whole.
+  using PartitionPaths = std::vector<std::vector<uint8_t>>;
+
+  /// Makes the build a partitioned one, joined in one round per partition.
+  /// Called by the build before it publishes anything.
+  void configurePartitions(std::vector<Partition> partitions);
+
+  PartitionPaths partitionPaths();
+
+  /// The partition being joined, or -1 for a build published whole.
+  int64_t round();
+
+  /// Returns the build rows of the current round once, when its hash tables
+  /// are due, and nullptr otherwise.
+  std::unique_ptr<CudfJoinSpillState> takeBuildWork();
+
+  /// Returns true, with 'future' set, while the build has nothing to do: the
+  /// probes are still on the round that was published.
+  bool waitForBuildWork(ContinueFuture* future);
+
+  /// Called by each of the 'numProbes' probe drivers when it is done with
+  /// 'round', after it dropped its reference to that round's tables. When the
+  /// last one calls, the round's tables are released and the next round is
+  /// due, or the join is finished.
+  void probeFinished(int64_t round, uint32_t numProbes);
+
+  /// True once every round of a partitioned build is done.
+  bool finished();
 
   // Store and retrieve the CUDA stream used for building the hash join.
   void setBuildStream(cuda::stream_ref buildStream);
@@ -87,6 +133,16 @@ class CudfHashJoinBridge : public exec::JoinBridge {
   std::optional<cuda::stream_ref> buildStream_;
   /** @brief Event recorded after build-side CUDA work is ready for probes */
   std::shared_ptr<CudaEvent> buildReadyEvent_;
+
+  // State of a partitioned build, all guarded by the bridge mutex.
+  std::vector<Partition> partitions_;
+  // Index into 'partitions_' of the round in progress, or -1.
+  int64_t round_{-1};
+  // Probe drivers that have finished 'round_'.
+  uint32_t numProbesFinished_{0};
+  // True when the hash tables of 'round_' have not been built yet.
+  bool buildWorkDue_{false};
+  bool roundsFinished_{false};
 };
 
 /**
@@ -110,8 +166,25 @@ class CudfHashJoinBuild : public CudfJoinBuild {
   void recordInputStats(const CudfVector& input) override;
   void buildAndPublish(std::vector<CudfVectorPtr> inputs) override;
 
+  // Splits a build that does not fit the query's GPU pool into hash
+  // partitions over the join keys and publishes the first one. Returns false,
+  // leaving 'state' alone, when the build fits or its join type needs the
+  // whole build at once.
+  bool tryBuildAndPublishInParts(
+      std::unique_ptr<CudfJoinSpillState>& state) override;
+  bool waitForBuildWork(ContinueFuture* future) override;
+  bool buildWorkFinished() override;
+
  private:
+  std::shared_ptr<CudfHashJoinBridge> bridge() const;
+
+  // Restores the build rows of one partition and publishes their hash tables.
+  void publishPartition(std::unique_ptr<CudfJoinSpillState> data);
+
   std::shared_ptr<const core::HashJoinNode> joinNode_;
+  // True for the driver that partitioned the build. It stays until the last
+  // round to build each partition's hash tables.
+  bool partitionedBuild_{false};
 };
 
 /**
@@ -190,6 +263,21 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   struct ReadStream;
   ReadStream* findReadStream(cuda::stream_ref stream);
 
+  // The remaining methods serve a partitioned build, which is joined in
+  // rounds, one build partition at a time.
+
+  // Returns the rows of 'input' that belong to the partition of the current
+  // round, or nullptr when there are none. Rows of other partitions are
+  // copied to host memory and joined in their own round.
+  CudfVectorPtr routeSpillInput(CudfVectorPtr input);
+
+  // Releases the tables of the round this driver has finished and tells the
+  // bridge.
+  void finishSpillRound();
+
+  // Reports the counters of probe rows moved to host memory and back.
+  void recordSpillStats();
+
   std::shared_ptr<const core::HashJoinNode> joinNode_;
   /** @brief Hash tables and join objects received from build operator */
   std::optional<hash_type> hashObject_;
@@ -225,6 +313,23 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   std::vector<cudf::size_type> rightKeyIndices_;
   CudfJoinOutputLayout outputLayout_;
   bool finished_{false};
+
+  // Set when the query can spill. Its build may then be partitioned.
+  std::shared_ptr<CudfSpillContext> spillContext_;
+  std::shared_ptr<CudfJoinSpillStats> spillStats_;
+  // The paths of the build's partitions. Empty unless the build is
+  // partitioned.
+  CudfHashJoinBridge::PartitionPaths spillPaths_;
+  // For each partition, this driver's probe rows that wait for its round.
+  std::vector<std::unique_ptr<CudfJoinSpillState>> spillInputs_;
+  // Probe rows of the current round that were parked in an earlier round and
+  // have not been joined yet.
+  std::vector<CudfJoinSpillState::Chunk> spillReplay_;
+  // The partition this driver is joining, or -1.
+  int64_t spillRound_{-1};
+  // True between this driver finishing a round and the next one being
+  // published.
+  bool waitingForSpillRound_{false};
 
   /// True if any build table has NULL values in join key columns.
   /// Used for null-aware LEFT SEMI PROJECT to determine match column

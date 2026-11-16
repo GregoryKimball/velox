@@ -63,15 +63,18 @@ bool CudfJoinBuild::needsInput() const {
 }
 
 exec::BlockingReason CudfJoinBuild::isBlocked(ContinueFuture* future) {
-  if (!future_.valid()) {
-    return exec::BlockingReason::kNotBlocked;
+  if (future_.valid()) {
+    *future = std::move(future_);
+    return exec::BlockingReason::kWaitForJoinBuild;
   }
-  *future = std::move(future_);
-  return exec::BlockingReason::kWaitForJoinBuild;
+  if (noMoreInput_ && waitForBuildWork(future)) {
+    return exec::BlockingReason::kWaitForJoinProbe;
+  }
+  return exec::BlockingReason::kNotBlocked;
 }
 
 bool CudfJoinBuild::isFinished() {
-  return !future_.valid() && noMoreInput_;
+  return !future_.valid() && noMoreInput_ && buildWorkFinished();
 }
 
 void CudfJoinBuild::doAddInput(RowVectorPtr input) {
@@ -154,6 +157,10 @@ void CudfJoinBuild::doNoMoreInput() {
   }
 
   auto inputs = std::exchange(inputs_, {});
+  if (spillState_ != nullptr && tryBuildAndPublishInParts(spillState_)) {
+    publishGpuReclaimableEstimate(0);
+    return;
+  }
   if (spillState_ != nullptr) {
     // Take every chunk out of the state before any of it is read: what is
     // taken out can no longer be moved to host memory under the build.

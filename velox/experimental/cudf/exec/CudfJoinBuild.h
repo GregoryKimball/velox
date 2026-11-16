@@ -71,6 +71,37 @@ class CudfJoinBuild : public CudfOperatorBase {
   // Consumes accumulated inputs and publishes the build result to the bridge.
   virtual void buildAndPublish(std::vector<CudfVectorPtr> inputs) = 0;
 
+  // Called by the last driver with all build input when that input can spill,
+  // before any of it is restored. A build that splits the input and publishes
+  // it part by part takes 'state' and returns true. Otherwise the input is
+  // restored whole and passed to buildAndPublish().
+  virtual bool tryBuildAndPublishInParts(
+      std::unique_ptr<CudfJoinSpillState>& /*state*/) {
+    return false;
+  }
+
+  // Called from isBlocked() once the input has ended. A build that publishes
+  // part by part does the work that is due and returns true, with 'future'
+  // set, while it waits for the probes to finish the part it published.
+  virtual bool waitForBuildWork(ContinueFuture* /*future*/) {
+    return false;
+  }
+
+  // Returns false while a build that publishes part by part has parts left.
+  virtual bool buildWorkFinished() {
+    return true;
+  }
+
+  // The spill context of the query, or nullptr when the build cannot spill.
+  const std::shared_ptr<CudfSpillContext>& spillContext() const {
+    return spillContext_;
+  }
+
+  // The counters every spill state of this build reports to.
+  const std::shared_ptr<CudfJoinSpillStats>& spillStats() const {
+    return spillStats_;
+  }
+
   bool gpuReclaimableBytes(uint64_t& reclaimableBytes) const override;
 
   bool supportsGpuSpillWithActiveCall() const override {

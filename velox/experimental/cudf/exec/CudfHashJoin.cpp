@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
+#include "velox/experimental/cudf/exec/CudfSpillContext.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -55,6 +56,7 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <algorithm>
+#include <array>
 #include <iterator>
 #include <optional>
 
@@ -216,6 +218,9 @@ void CudfHashJoinProbe::waitForReadCompletion() {
 }
 
 void CudfHashJoinProbe::doClose() {
+  recordSpillStats();
+  spillReplay_.clear();
+  spillInputs_.clear();
   Operator::close();
   waitForReadCompletion();
   filterEvaluator_.reset();
@@ -241,26 +246,107 @@ void CudfHashJoinBridge::setHashTable(
 }
 
 std::optional<CudfHashJoinBridge::hash_type> CudfHashJoinBridge::hashOrFuture(
-    ContinueFuture* future) {
+    ContinueFuture* future,
+    std::optional<int64_t> completedRound) {
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(2) << "Calling CudfHashJoinBridge::hashOrFuture";
   }
   std::lock_guard<std::mutex> l(mutex_);
-  if (hashObject_.has_value()) {
+  if (roundsFinished_) {
+    return std::nullopt;
+  }
+  // A probe that is done with the round in progress waits for its peers to
+  // finish it and for the next round's tables.
+  const bool onCompletedRound =
+      completedRound.has_value() && *completedRound == round_;
+  if (hashObject_.has_value() && !onCompletedRound) {
     return hashObject_;
   }
-  if (CudfConfig::getInstance().debugEnabled) {
-    VLOG(2) << "Calling CudfHashJoinBridge::hashOrFuture constructing promise";
-  }
   promises_.emplace_back("CudfHashJoinBridge::hashOrFuture");
-  if (CudfConfig::getInstance().debugEnabled) {
-    VLOG(2) << "Calling CudfHashJoinBridge::hashOrFuture getSemiFuture";
-  }
   *future = promises_.back().getSemiFuture();
-  if (CudfConfig::getInstance().debugEnabled) {
-    VLOG(2) << "Calling CudfHashJoinBridge::hashOrFuture returning nullopt";
-  }
   return std::nullopt;
+}
+
+void CudfHashJoinBridge::configurePartitions(
+    std::vector<Partition> partitions) {
+  std::lock_guard<std::mutex> l(mutex_);
+  VELOX_CHECK(
+      !hashObject_.has_value(),
+      "A join build cannot be partitioned after it was published");
+  VELOX_CHECK(partitions_.empty());
+  VELOX_CHECK_GT(partitions.size(), 1);
+  partitions_ = std::move(partitions);
+  round_ = 0;
+  buildWorkDue_ = true;
+}
+
+CudfHashJoinBridge::PartitionPaths CudfHashJoinBridge::partitionPaths() {
+  std::lock_guard<std::mutex> l(mutex_);
+  PartitionPaths paths;
+  paths.reserve(partitions_.size());
+  for (const auto& partition : partitions_) {
+    paths.push_back(partition.path);
+  }
+  return paths;
+}
+
+int64_t CudfHashJoinBridge::round() {
+  std::lock_guard<std::mutex> l(mutex_);
+  return round_;
+}
+
+std::unique_ptr<CudfJoinSpillState> CudfHashJoinBridge::takeBuildWork() {
+  std::lock_guard<std::mutex> l(mutex_);
+  if (!buildWorkDue_) {
+    return nullptr;
+  }
+  buildWorkDue_ = false;
+  VELOX_CHECK_GE(round_, 0);
+  VELOX_CHECK_LT(round_, partitions_.size());
+  VELOX_CHECK_NOT_NULL(partitions_[round_].data);
+  return std::move(partitions_[round_].data);
+}
+
+bool CudfHashJoinBridge::waitForBuildWork(ContinueFuture* future) {
+  std::lock_guard<std::mutex> l(mutex_);
+  if (roundsFinished_ || buildWorkDue_) {
+    return false;
+  }
+  promises_.emplace_back("CudfHashJoinBridge::waitForBuildWork");
+  *future = promises_.back().getSemiFuture();
+  return true;
+}
+
+void CudfHashJoinBridge::probeFinished(int64_t round, uint32_t numProbes) {
+  std::vector<ContinuePromise> promises;
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    VELOX_CHECK_EQ(round, round_);
+    VELOX_CHECK_LT(numProbesFinished_, numProbes);
+    if (++numProbesFinished_ != numProbes) {
+      return;
+    }
+    numProbesFinished_ = 0;
+    // Every probe dropped its reference before it called. This releases the
+    // last one, so the round's tables are gone before the next ones are
+    // built.
+    hashObject_.reset();
+    buildReadyEvent_.reset();
+    buildStream_.reset();
+    if (round_ + 1 == static_cast<int64_t>(partitions_.size())) {
+      roundsFinished_ = true;
+    } else {
+      ++round_;
+      buildWorkDue_ = true;
+    }
+    promises = std::move(promises_);
+  }
+  notify(std::move(promises));
+}
+
+bool CudfHashJoinBridge::finished() {
+  std::lock_guard<std::mutex> l(mutex_);
+  return roundsFinished_;
 }
 
 void CudfHashJoinBridge::setBuildStream(cuda::stream_ref buildStream) {
@@ -296,6 +382,177 @@ CudfHashJoinBuild::CudfHashJoinBuild(
           "CudfHashJoinBuild",
           NvtxMethodFlag::kAll),
       joinNode_(joinNode) {}
+
+namespace {
+
+// Returns true for a join whose probe rows can be joined against one hash
+// partition of the build at a time, with nothing carried from one partition
+// to the next. A join that emits build rows keeps state for each build row
+// across all probe input, and a null-aware join depends on whether any build
+// key is null. Those need the whole build at once.
+bool canJoinInParts(const core::HashJoinNode& joinNode) {
+  if (joinNode.isNullAware()) {
+    return false;
+  }
+  return joinNode.isInnerJoin() || joinNode.isLeftJoin() ||
+      joinNode.isLeftSemiFilterJoin() || joinNode.isLeftSemiProjectJoin() ||
+      joinNode.isAntiJoin();
+}
+
+// The device memory building 'state' needs at once: its rows twice, as the
+// input batches and their concatenation, or its rows and their hash table at
+// 16 bytes per row, whichever is more.
+uint64_t estimatedBuildBytes(const CudfJoinSpillState& state) {
+  const auto bytes = state.bytes();
+  return std::max<uint64_t>(2 * bytes, bytes + 16 * state.rows());
+}
+
+// A build partition that still has to be split or accepted as a leaf.
+struct PendingPartition {
+  CudfHashJoinBridge::Partition partition;
+  // Consecutive splits above this partition that left every row on one side.
+  uint32_t numStalledSplits{0};
+};
+
+// A partition whose rows stay together through this many splits holds more
+// rows of one join key value than fit.
+constexpr uint32_t kMaxStalledSplits = 4;
+
+} // namespace
+
+std::shared_ptr<CudfHashJoinBridge> CudfHashJoinBuild::bridge() const {
+  auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
+      operatorCtx_->driverCtx()->splitGroupId, planNodeId());
+  auto cudfHashJoinBridge =
+      std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
+  VELOX_CHECK_NOT_NULL(cudfHashJoinBridge);
+  return cudfHashJoinBridge;
+}
+
+bool CudfHashJoinBuild::tryBuildAndPublishInParts(
+    std::unique_ptr<CudfJoinSpillState>& state) {
+  auto* pool = gpuPool();
+  if (pool == nullptr || state->empty() || !canJoinInParts(*joinNode_)) {
+    return false;
+  }
+  auto* root = pool->root();
+  const auto configured = CudfConfig::getInstance().spillJoinPartitionBytes;
+  // The room below the query's limit, capped by the configured size.
+  const auto budget = [&](uint64_t reclaimable) {
+    const auto free = root->maxCapacity() - root->reservedBytes();
+    auto bytes = (free > 0 ? static_cast<uint64_t>(free) : 0) + reclaimable;
+    return configured != 0 ? std::min<uint64_t>(bytes, configured) : bytes;
+  };
+  // What the build holds on the device is given up before it is built, so it
+  // counts as room.
+  if (estimatedBuildBytes(*state) <= budget(state->reclaimableBytes())) {
+    return false;
+  }
+
+  // The build does not fit. Move all of it to host memory and split it there,
+  // one chunk on the device at a time.
+  state->spill(0);
+  const auto target = budget(0);
+
+  const auto& buildType = joinNode_->sources()[1]->outputType();
+  std::vector<cudf::size_type> keys;
+  keys.reserve(joinNode_->rightKeys().size());
+  for (const auto& key : joinNode_->rightKeys()) {
+    keys.push_back(
+        static_cast<cudf::size_type>(buildType->getChildIdx(key->name())));
+  }
+
+  std::vector<PendingPartition> pending;
+  pending.push_back({{{}, std::move(state)}, 0});
+  std::vector<CudfHashJoinBridge::Partition> leaves;
+  while (!pending.empty()) {
+    auto current = std::move(pending.back());
+    pending.pop_back();
+    auto& partition = current.partition;
+    // An empty partition is kept: probe rows that hash to it still have to
+    // be answered, with no match.
+    if (partition.data->empty() ||
+        estimatedBuildBytes(*partition.data) <= target) {
+      leaves.push_back(std::move(partition));
+      continue;
+    }
+    VELOX_CHECK_LT(
+        current.numStalledSplits,
+        kMaxStalledSplits,
+        "A join build cannot be split to fit the query's GPU memory: too "
+        "many of its rows share one join key value. Rows {}, bytes {}, "
+        "partition budget {}",
+        partition.data->rows(),
+        partition.data->bytes(),
+        target);
+
+    const auto depth = static_cast<uint32_t>(partition.path.size());
+    const auto parentRows = partition.data->rows();
+    std::array<std::unique_ptr<CudfJoinSpillState>, 2> children{
+        std::make_unique<CudfJoinSpillState>(spillContext(), spillStats()),
+        std::make_unique<CudfJoinSpillState>(spillContext(), spillStats())};
+    while (!partition.data->empty()) {
+      auto chunk = partition.data->takeFront();
+      auto pieces = CudfJoinSpillState::partition(
+          chunk.take(get_output_mr()), keys, depth, get_output_mr());
+      for (size_t i = 0; i < pieces.size(); ++i) {
+        children[i]->append(std::move(pieces[i]));
+        children[i]->spill(0);
+      }
+    }
+    for (uint8_t i = 0; i < children.size(); ++i) {
+      auto path = partition.path;
+      path.push_back(i);
+      const bool stalled = children[i]->rows() == parentRows;
+      pending.push_back(
+          {{std::move(path), std::move(children[i])},
+           stalled ? current.numStalledSplits + 1 : 0});
+    }
+  }
+
+  VELOX_CHECK_GT(leaves.size(), 1);
+  addRuntimeStat(
+      "cudfJoinSpillPartitions",
+      RuntimeCounter(static_cast<int64_t>(leaves.size())));
+  auto joinBridge = bridge();
+  joinBridge->configurePartitions(std::move(leaves));
+  partitionedBuild_ = true;
+  publishPartition(joinBridge->takeBuildWork());
+  return true;
+}
+
+void CudfHashJoinBuild::publishPartition(
+    std::unique_ptr<CudfJoinSpillState> data) {
+  VELOX_CHECK_NOT_NULL(data);
+  // Taken out of the state before any of it is read: what is taken out can
+  // no longer be moved to host memory under the build.
+  auto chunks = data->takeChunks();
+  std::vector<CudfVectorPtr> inputs;
+  inputs.reserve(chunks.size());
+  for (auto& chunk : chunks) {
+    inputs.push_back(chunk.take(get_output_mr()));
+  }
+  buildAndPublish(std::move(inputs));
+}
+
+bool CudfHashJoinBuild::waitForBuildWork(ContinueFuture* future) {
+  if (!partitionedBuild_) {
+    return false;
+  }
+  auto joinBridge = bridge();
+  if (auto work = joinBridge->takeBuildWork()) {
+    // isBlocked() runs outside the operator's entry points that install its
+    // memory resources.
+    ensureCudaContextForThread();
+    auto memoryResources = scopedMemoryResources();
+    publishPartition(std::move(work));
+  }
+  return joinBridge->waitForBuildWork(future);
+}
+
+bool CudfHashJoinBuild::buildWorkFinished() {
+  return !partitionedBuild_ || bridge()->finished();
+}
 
 void CudfHashJoinBuild::recordInputStats(const CudfVector& input) {
   auto [_, nullCount] = cudf::bitmask_and(
@@ -491,6 +748,13 @@ void CudfHashJoinProbe::waitForBuildReady(cuda::stream_ref stream) {
 void CudfHashJoinProbe::initialize() {
   Operator::initialize();
 
+  if (gpuPool() != nullptr) {
+    spillContext_ = cudfSpillContext(*operatorCtx_->task()->queryCtx());
+    if (spillContext_ != nullptr) {
+      spillStats_ = std::make_shared<CudfJoinSpillStats>();
+    }
+  }
+
   if (!joinNode_->filter()) {
     return;
   }
@@ -606,9 +870,108 @@ void CudfHashJoinProbe::doAddInput(RowVectorPtr input) {
     return;
   }
 
-  if (input->size() > 0) {
-    input_ = std::move(input);
+  if (input->size() == 0) {
+    return;
   }
+  if (!spillPaths_.empty()) {
+    // The build is partitioned. Only the rows of the partition being joined
+    // go on now.
+    input.reset();
+    if (auto resident = routeSpillInput(std::move(cudfInput))) {
+      input_ = std::move(resident);
+    }
+    return;
+  }
+  input_ = std::move(input);
+}
+
+CudfVectorPtr CudfHashJoinProbe::routeSpillInput(CudfVectorPtr input) {
+  CudfVectorPtr resident;
+  // Follows the build's splits: 'prefix' is the path of 'piece' so far. The
+  // same keys, split depths and hash seeds send a probe row to the partition
+  // that holds every build row it can match.
+  std::vector<uint8_t> prefix;
+  std::function<void(CudfVectorPtr)> route = [&](CudfVectorPtr piece) {
+    if (piece == nullptr || piece->size() == 0) {
+      return;
+    }
+    for (size_t i = 0; i < spillPaths_.size(); ++i) {
+      if (spillPaths_[i] != prefix) {
+        continue;
+      }
+      if (static_cast<int64_t>(i) == spillRound_) {
+        VELOX_CHECK_NULL(resident);
+        resident = std::move(piece);
+        return;
+      }
+      VELOX_CHECK_GT(
+          static_cast<int64_t>(i),
+          spillRound_,
+          "Probe rows arrived for a build partition that was joined already");
+      if (spillInputs_[i] == nullptr) {
+        spillInputs_[i] =
+            std::make_unique<CudfJoinSpillState>(spillContext_, spillStats_);
+      }
+      // Parked in host memory at once: the device is short, which is why the
+      // build is partitioned.
+      spillInputs_[i]->append(std::move(piece));
+      spillInputs_[i]->spill(0);
+      return;
+    }
+    VELOX_CHECK_LT(
+        prefix.size(), 32, "A probe row matches no partition of the build");
+    auto pieces = CudfJoinSpillState::partition(
+        std::move(piece),
+        leftKeyIndices_,
+        static_cast<uint32_t>(prefix.size()),
+        get_output_mr());
+    for (uint8_t i = 0; i < pieces.size(); ++i) {
+      prefix.push_back(i);
+      route(std::move(pieces[i]));
+      prefix.pop_back();
+    }
+  };
+  route(std::move(input));
+  return resident;
+}
+
+void CudfHashJoinProbe::finishSpillRound() {
+  // This driver's reference to the round's tables goes before the bridge is
+  // told, so that the tables are freed before the next round's are built.
+  waitForReadCompletion();
+  cachedExtendedRightViews_.clear();
+  cachedRightPrecomputed_.clear();
+  hashObject_.reset();
+  buildReadyEvent_.reset();
+  buildStream_.reset();
+  waitingForSpillRound_ = true;
+
+  auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
+      operatorCtx_->driverCtx()->splitGroupId, planNodeId());
+  auto cudfJoinBridge =
+      std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
+  VELOX_CHECK_NOT_NULL(cudfJoinBridge);
+  cudfJoinBridge->probeFinished(
+      spillRound_, operatorCtx_->task()->numDrivers(operatorCtx_->driver()));
+}
+
+void CudfHashJoinProbe::recordSpillStats() {
+  if (spillStats_ == nullptr) {
+    return;
+  }
+  const auto add = [&](const char* name, uint64_t bytes) {
+    if (bytes != 0) {
+      addRuntimeStat(
+          name,
+          RuntimeCounter(
+              static_cast<int64_t>(bytes), RuntimeCounter::Unit::kBytes));
+    }
+  };
+  add("cudfJoinProbeSpilledBytes", spillStats_->spilledBytes.exchange(0));
+  add("cudfJoinProbeRestoredBytes", spillStats_->restoredBytes.exchange(0));
+  add(
+      "cudfJoinProbeHostBytesWritten",
+      spillStats_->hostBytesWritten.exchange(0));
 }
 
 void CudfHashJoinProbe::doNoMoreInput() {
@@ -2108,6 +2471,19 @@ RowVectorPtr CudfHashJoinProbe::doGetOutput() {
   if (finished_ or !hashObject_.has_value()) {
     return nullptr;
   }
+  if (!input_ && !spillPaths_.empty()) {
+    if (!spillReplay_.empty()) {
+      // Rows that an earlier round parked for the partition being joined.
+      auto chunk = std::move(spillReplay_.back());
+      spillReplay_.pop_back();
+      input_ = chunk.take(get_output_mr());
+    } else {
+      if (noMoreInput_) {
+        finishSpillRound();
+      }
+      return nullptr;
+    }
+  }
   if (!input_) {
     // If no more input, emit unmatched-right rows if needed.
     if ((joinNode_->isRightJoin() || joinNode_->isFullJoin()) && noMoreInput_ &&
@@ -2255,8 +2631,9 @@ RowVectorPtr CudfHashJoinProbe::doGetOutput() {
   // the refcount while cudfInput still holds a reference.
   cudfInput.reset();
   input_.reset();
-  finished_ =
-      noMoreInput_ && !joinNode_->isRightJoin() && !joinNode_->isFullJoin();
+  // A partitioned build finishes when its last round does; see isBlocked().
+  finished_ = noMoreInput_ && !joinNode_->isRightJoin() &&
+      !joinNode_->isFullJoin() && spillPaths_.empty();
 
   vector_size_t zeroColumnOutputRows = 0;
   std::vector<std::unique_ptr<cudf::table>> cudfOutputTables;
@@ -2289,6 +2666,11 @@ bool CudfHashJoinProbe::skipProbeOnEmptyBuild() const {
 }
 
 exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
+  // Set when the last round of a partitioned build is done. The bridge has
+  // no tables to wait for after that.
+  if (finished_ && !spillPaths_.empty()) {
+    return exec::BlockingReason::kNotBlocked;
+  }
   if ((joinNode_->isRightJoin() || joinNode_->isRightSemiFilterJoin() ||
        joinNode_->isFullJoin()) &&
       hashObject_.has_value()) {
@@ -2309,9 +2691,18 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
       std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
   VELOX_CHECK_NOT_NULL(cudfJoinBridge);
   VELOX_CHECK_NOT_NULL(future);
-  auto hashObject = cudfJoinBridge->hashOrFuture(future);
+  auto hashObject = cudfJoinBridge->hashOrFuture(
+      future,
+      waitingForSpillRound_ ? std::optional<int64_t>{spillRound_}
+                            : std::nullopt);
 
   if (!hashObject.has_value()) {
+    if (waitingForSpillRound_ && cudfJoinBridge->finished()) {
+      // Every partition of the build has been joined.
+      waitingForSpillRound_ = false;
+      finished_ = true;
+      return exec::BlockingReason::kNotBlocked;
+    }
     if (CudfConfig::getInstance().debugEnabled) {
       VLOG(2) << "CudfHashJoinProbe is blocked, waiting for join build";
     }
@@ -2320,6 +2711,22 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
   hashObject_ = std::move(hashObject);
   buildStream_ = cudfJoinBridge->getBuildStream();
   buildReadyEvent_ = cudfJoinBridge->getBuildReadyEvent();
+
+  // A build that does not fit on the device is published one hash partition
+  // at a time. These are the tables of one partition, and this driver joins
+  // the probe rows of that partition against them.
+  spillPaths_ = cudfJoinBridge->partitionPaths();
+  if (!spillPaths_.empty()) {
+    VELOX_CHECK_NOT_NULL(
+        spillContext_, "A partitioned join build needs a probe that can spill");
+    spillRound_ = cudfJoinBridge->round();
+    waitingForSpillRound_ = false;
+    spillInputs_.resize(spillPaths_.size());
+    if (auto& parked = spillInputs_[spillRound_]) {
+      spillReplay_ = parked->takeChunks();
+      parked.reset();
+    }
+  }
 
   // Lazy initialize matched flags only when build side is done
   if (joinNode_->isRightJoin() || joinNode_->isFullJoin()) {
@@ -2388,7 +2795,8 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
   auto& rightTables = hashObject_.value().first;
   // should be rightTable->numDistinct() but it needs compute,
   // so we use num_rows()
-  if (rightTables[0]->num_rows() == 0) {
+  // An empty partition of a partitioned build says nothing about the others.
+  if (rightTables[0]->num_rows() == 0 && spillPaths_.empty()) {
     if (skipProbeOnEmptyBuild()) {
       if (operatorCtx_->driverCtx()
               ->queryConfig()
@@ -2409,7 +2817,10 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
 }
 
 bool CudfHashJoinProbe::isFinished() {
-  auto const isFinished = finished_ || (noMoreInput_ && input_ == nullptr);
+  // With a partitioned build the end of the input ends only the first round.
+  auto const isFinished = spillPaths_.empty()
+      ? finished_ || (noMoreInput_ && input_ == nullptr)
+      : finished_;
 
   // hashObject_ is shared with the bridge and other probe instances, so this
   // reset() may not be the last reference; each instance still waits for its

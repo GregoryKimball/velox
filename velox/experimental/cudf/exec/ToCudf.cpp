@@ -520,6 +520,10 @@ void CudfConfig::initialize(
         fanout, 1024, "cudf.spill_partition_fanout is too large");
     spillPartitionFanout = fanout;
   }
+  if (config.find(kCudfSpillJoinPartitionBytes) != config.end()) {
+    spillJoinPartitionBytes =
+        folly::to<uint64_t>(config[kCudfSpillJoinPartitionBytes]);
+  }
   if (config.find(kCudfGroupbySelfSpillPercent) != config.end()) {
     const auto percent =
         folly::to<int32_t>(config[kCudfGroupbySelfSpillPercent]);

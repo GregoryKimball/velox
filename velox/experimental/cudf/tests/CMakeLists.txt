@@ -120,6 +120,12 @@ velox_add_cudf_test(
 )
 
 velox_add_cudf_test(
+  NAME velox_cudf_hash_join_spill_test
+  SOURCES Main.cpp HashJoinSpillTest.cpp
+  LIBS ${CUDF_TEST_DEFAULT_LIBS}
+)
+
+velox_add_cudf_test(
   NAME velox_cudf_host_spill_budget_test
   SOURCES Main.cpp HostSpillBudgetTest.cpp
   LIBS velox_cudf_exec Folly::folly
