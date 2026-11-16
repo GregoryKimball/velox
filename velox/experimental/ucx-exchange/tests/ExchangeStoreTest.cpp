@@ -487,6 +487,43 @@ TEST_F(ExchangeStoreTest, restoresDeviceTierOnceItHoldsNoTables) {
   EXPECT_EQ(store.stats().hostBytes, 0);
 }
 
+TEST_F(ExchangeStoreTest, releasesHostPoolOnceItHoldsNoTables) {
+  const auto input = makeInput();
+  const auto type = asRowType(input->type());
+  auto payloads = pack(input, {300, 700}, compressions().back());
+  ExchangeStore store;
+  store.setDeviceCapacity(0);
+  store.add("query1_table", "0", std::move(payloads[0]), 300, {}, stream_);
+  store.add("query2_table", "0", std::move(payloads[1]), 400, {}, stream_);
+  const auto poolBytes = store.stats().hostPoolBytes;
+  ASSERT_GT(poolBytes, 0);
+
+  // Another table still holds payloads in the pool.
+  store.drop("query1_table");
+  EXPECT_EQ(store.stats().hostPoolBytes, poolBytes);
+
+  // The pool grew for queries whose payloads did not fit the device tier.
+  // Once the store holds no tables, its pinned memory goes back to the host,
+  // also while the read that emptied the store still copies from it.
+  auto rows = takeRows(store, "query2_table", "0", type);
+  ASSERT_EQ(rows.size(), 1);
+  velox::test::assertEqualVectors(expectedRows(input, 300, 400), rows[0]);
+  EXPECT_EQ(store.stats().hostPoolBytes, 0);
+
+  // A later payload gets a new pool.
+  ASSERT_TRUE(store.add(
+      "query3_table",
+      "0",
+      std::move(payloads[2]),
+      kNumRows - 700,
+      {},
+      stream_));
+  rows = takeRows(store, "query3_table", "0", type);
+  ASSERT_EQ(rows.size(), 1);
+  velox::test::assertEqualVectors(
+      expectedRows(input, 700, kNumRows - 700), rows[0]);
+}
+
 TEST_F(ExchangeStoreTest, takeOrWaitStreamsATableWhileItIsWritten) {
   const auto input = makeInput();
   auto payloads = pack(input, {500}, compressions().back());

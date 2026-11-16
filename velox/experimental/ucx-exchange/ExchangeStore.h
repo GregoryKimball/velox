@@ -49,7 +49,7 @@ namespace facebook::velox::ucx_exchange {
 /// device tier is below its capacity and is moved to pinned host memory
 /// otherwise. Nothing is written to disk: adding a payload that fits in neither
 /// tier fails. The host tier has a pinned memory pool of its own, which grows
-/// in large blocks.
+/// in large blocks and is released once the store holds no tables.
 class ExchangeStore {
  public:
   /// How the columns of a payload were encoded before packing.
@@ -203,7 +203,7 @@ class ExchangeStore {
   // Pinned host memory from the host tier's pool.
   class HostBuffer {
    public:
-    HostBuffer(HostPool& pool, std::size_t bytes);
+    HostBuffer(std::shared_ptr<HostPool> pool, std::size_t bytes);
     ~HostBuffer();
     HostBuffer(const HostBuffer&) = delete;
     HostBuffer& operator=(const HostBuffer&) = delete;
@@ -223,15 +223,17 @@ class ExchangeStore {
     void orderReadsOn(cuda::stream_ref stream) const;
 
    private:
-    HostPool& pool_;
+    // Keeps the pool alive after the store released it (resetTiersIfEmpty()),
+    // until this buffer returns to it.
+    const std::shared_ptr<HostPool> pool_;
     void* data_;
     const std::size_t bytes_;
     cudaEvent_t written_{nullptr};
   };
 
-  // Returns the host tier's pool, creating it on first use. Called with
-  // 'mutex_' held.
-  HostPool& hostPool();
+  // Returns the host tier's pool, creating it on first use after the store was
+  // created or emptied. Called with 'mutex_' held.
+  std::shared_ptr<HostPool> hostPool();
 
   // A payload's metadata, which names its codec, its data in exactly one of
   // the tiers, and the encoding of its columns.
@@ -278,19 +280,24 @@ class ExchangeStore {
   // 'mutex_' held when its last writer ends.
   void complete(const std::string& name);
 
-  // Restores the device tier's capacity to the configured one once 'tables_'
-  // is empty: a demote() answered one query's lack of memory, and keeping the
+  // Once 'tables_' is empty, returns both tiers to their state before the
+  // queries that used them. The device tier gets its configured capacity
+  // again: a demote() answered one query's lack of memory, and keeping the
   // smaller tier would send later queries' payloads to host memory although
-  // the device has room again. Called with 'mutex_' held.
-  void restoreDeviceCapacityIfEmpty();
+  // the device has room again. The host tier's pool is released: it grew for
+  // payloads that are gone, and would keep that pinned memory for the life of
+  // the process. Returns the released pool, which the caller destroys after
+  // unlocking 'mutex_' because freeing pinned memory is slow. Called with
+  // 'mutex_' held.
+  [[nodiscard]] std::shared_ptr<HostPool> resetTiersIfEmpty();
 
   // Whether 'table' belongs to a query that dropQuery() dropped. Called with
   // 'mutex_' held.
   bool isDropped(std::string_view table) const;
 
   mutable std::mutex mutex_;
-  // Declared before 'tables_' so that it outlives the host buffers.
-  std::unique_ptr<HostPool> hostPool_;
+  // Shared with the host buffers allocated from it.
+  std::shared_ptr<HostPool> hostPool_;
   folly::F14FastMap<std::string, Table> tables_;
   // The queries dropQuery() dropped most recently, oldest first.
   std::deque<std::string> droppedQueries_;
