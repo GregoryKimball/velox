@@ -84,6 +84,9 @@ CudfVector::CudfVector(
   logDefaultStreamIfNeeded(stream_, "CudfVector(table)");
   auto& tablePtr = std::get<std::unique_ptr<cudf::table>>(tableStorage_);
   rebindTable(tablePtr, stream_);
+  // The bytes of every buffer the table owns: data, null masks and children.
+  // A host spill of the vector is admitted for this many bytes and copies
+  // exactly these buffers.
   flatSize_ = tablePtr->alloc_size();
   tabView_ = tablePtr->view();
 }

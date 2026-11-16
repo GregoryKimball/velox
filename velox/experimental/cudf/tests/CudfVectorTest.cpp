@@ -219,6 +219,18 @@ std::unique_ptr<cudf::packed_table> makePackedTable(
       cudf::packed_table{tableView, std::move(packedColumns)});
 }
 
+// Returns a device buffer of 'bytes' zero bytes.
+rmm::device_buffer makeZeroedBuffer(
+    std::size_t bytes,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  rmm::device_buffer buffer(bytes, stream, mr);
+  if (bytes > 0) {
+    CUDF_CUDA_TRY(cudaMemsetAsync(buffer.data(), 0, bytes, stream.get()));
+  }
+  return buffer;
+}
+
 class CudfVectorTest : public ::testing::Test, public VectorTestBase {
  protected:
   static void SetUpTestCase() {
@@ -240,6 +252,98 @@ TEST_F(CudfVectorTest, retainedSizeReportsDeviceStorage) {
       stream.view());
 
   EXPECT_EQ(vector.estimateFlatSize(), 4 * sizeof(int32_t));
+  EXPECT_EQ(vector.retainedSize(), vector.estimateFlatSize());
+}
+
+TEST_F(CudfVectorTest, flatSizeCountsNullMasksAndNestedColumns) {
+  constexpr cudf::size_type kNumRows{1'000};
+  constexpr std::size_t kNumChars{64};
+  TestCudaStream stream;
+  const auto mr = cudf::get_current_device_resource_ref();
+
+  // The bytes of every buffer handed to a column below. A host spill of the
+  // vector copies these buffers, and is admitted for estimateFlatSize() bytes.
+  uint64_t ownedBytes{0};
+  auto makeData = [&](std::size_t bytes) {
+    ownedBytes += bytes;
+    return makeZeroedBuffer(bytes, stream.view(), mr);
+  };
+  // A null mask is allocated in whole 64-byte blocks. For these rows that is
+  // 128 bytes, which is 32 mask words.
+  auto makeMask = [&]() {
+    ownedBytes += cudf::bitmask_allocation_size_bytes(kNumRows);
+    return cudf::create_null_mask(
+        kNumRows,
+        cudf::mask_state::ALL_VALID,
+        stream.view(),
+        cudf::memory_resources{mr, mr});
+  };
+  auto makeNoMask = [&]() {
+    return cudf::create_null_mask(
+        0,
+        cudf::mask_state::UNALLOCATED,
+        stream.view(),
+        cudf::memory_resources{mr, mr});
+  };
+
+  // STRING: characters, a null mask, and an offsets child with one more row.
+  // Zero offsets make every string empty.
+  std::vector<std::unique_ptr<cudf::column>> stringChildren;
+  stringChildren.push_back(
+      std::make_unique<cudf::column>(
+          cudf::data_type{cudf::type_id::INT32},
+          kNumRows + 1,
+          makeData((kNumRows + 1) * sizeof(int32_t)),
+          makeNoMask(),
+          0));
+  std::vector<std::unique_ptr<cudf::column>> structChildren;
+  structChildren.push_back(
+      std::make_unique<cudf::column>(
+          cudf::data_type{cudf::type_id::INT32},
+          kNumRows,
+          makeData(kNumRows * sizeof(int32_t)),
+          makeMask(),
+          0));
+  structChildren.push_back(
+      std::make_unique<cudf::column>(
+          cudf::data_type{cudf::type_id::STRING},
+          kNumRows,
+          makeData(kNumChars),
+          makeMask(),
+          0,
+          std::move(stringChildren)));
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(
+      std::make_unique<cudf::column>(
+          cudf::data_type{cudf::type_id::INT64},
+          kNumRows,
+          makeData(kNumRows * sizeof(int64_t)),
+          makeMask(),
+          0));
+  // STRUCT: no data of its own, a null mask, and two nullable children, one
+  // of which has a child itself.
+  columns.push_back(
+      std::make_unique<cudf::column>(
+          cudf::data_type{cudf::type_id::STRUCT},
+          kNumRows,
+          makeData(0),
+          makeMask(),
+          0,
+          std::move(structChildren)));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  stream.view().sync();
+
+  CudfVector vector(
+      pool_.get(),
+      ROW(
+          {{"c0", BIGINT()},
+           {"c1", ROW({{"a", INTEGER()}, {"b", VARCHAR()}})}}),
+      kNumRows,
+      std::move(table),
+      stream.view());
+
+  EXPECT_EQ(vector.estimateFlatSize(), ownedBytes);
   EXPECT_EQ(vector.retainedSize(), vector.estimateFlatSize());
 }
 
