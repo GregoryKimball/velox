@@ -33,6 +33,10 @@ struct CudfConfig {
   static constexpr const char* kCudfMemoryPercent{"cudf.memory_percent"};
   static constexpr const char* kCudfMemoryLimitBytes{
       "cudf.memory_limit_bytes"};
+  static constexpr const char* kCudfSpillHostBytes{
+      "cudf.spill_host_memory_bytes"};
+  static constexpr const char* kCudfSpillHostNumaNode{
+      "cudf.spill_host_numa_node"};
   static constexpr const char* kCudfFunctionNamePrefix{
       "cudf.function_name_prefix"};
   static constexpr const char* kCudfAstExpressionEnabled{
@@ -140,6 +144,16 @@ struct CudfConfig {
   /// queries that were given a GPU pool with attachCudfMemoryPool() are
   /// accounted against it.
   uint64_t memoryLimitBytes{0};
+
+  /// Limit in bytes of the pinned host memory that spilled device data may
+  /// occupy, a multiple of 256. Zero turns spilling off: an operator that does
+  /// not fit its query's GPU pool then fails. The limit is never derived from
+  /// the machine's memory. There is no disk spilling.
+  uint64_t spillHostBytes{0};
+
+  /// NUMA node of the pinned host memory for spilled data. Negative leaves the
+  /// placement to CUDA.
+  int32_t spillHostNumaNode{-1};
 
   /// Memory resource for output vectors. When set to a value different from
   /// memoryResource, a separate MR is created for output allocations.

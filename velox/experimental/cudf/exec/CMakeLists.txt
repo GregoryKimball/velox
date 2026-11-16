@@ -36,6 +36,7 @@ add_library(
   CudfOperator.cpp
   CudfOrderBy.cpp
   CudfReduce.cpp
+  CudfSpillContext.cpp
   CudfTopN.cpp
   CudfTopNRowNumber.cpp
   CudfWindow.cpp
@@ -45,7 +46,9 @@ add_library(
   DecimalAggregationState.cpp
   GpuCapabilities.cpp
   GpuResources.cpp
+  HostSpillBudget.cpp
   OperatorAdapters.cpp
+  PinnedSpillPool.cpp
   PrestoAggregateFunctions.cpp
   SparkAggregateFunctions.cpp
   ToCudf.cpp

@@ -20,6 +20,7 @@
 #include "velox/experimental/cudf/exec/CudfMemoryArbitration.h"
 #include "velox/experimental/cudf/exec/CudfNestedLoopJoin.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
+#include "velox/experimental/cudf/exec/CudfSpillContext.h"
 #include "velox/experimental/cudf/exec/GpuCapabilities.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
@@ -410,7 +411,13 @@ void registerCudf() {
     registerCudfMemoryResource(gpuCapacity);
     LOG(INFO) << "cuDF GPU memory budget: capacity_bytes=" << gpuCapacity
               << " startup_free_bytes=" << freeBytes
-              << " physical_total_bytes=" << totalBytes;
+              << " physical_total_bytes=" << totalBytes
+              << " host_spill_bytes=" << config.spillHostBytes;
+    initializeCudfSpilling(
+        config.spillHostBytes,
+        config.spillHostNumaNode < 0
+            ? std::nullopt
+            : std::optional<int>{config.spillHostNumaNode});
   }
 
   const auto& outputMrMode = CudfConfig::getInstance().outputMemoryResource;
@@ -456,6 +463,7 @@ void unregisterCudf() {
   // CudfConfig::exchange was set when registerCudf() ran.
   ucx_exchange::unregisterUcxTransports();
 #endif
+  unregisterCudfSpilling();
   // Reset the any_resource copies before the adaptors they were copied from,
   // so that the wrapped upstream resources are released here.
   output_mr_.reset();
@@ -497,6 +505,12 @@ void CudfConfig::initialize(
   }
   if (config.find(kCudfMemoryLimitBytes) != config.end()) {
     memoryLimitBytes = folly::to<uint64_t>(config[kCudfMemoryLimitBytes]);
+  }
+  if (config.find(kCudfSpillHostBytes) != config.end()) {
+    spillHostBytes = folly::to<uint64_t>(config[kCudfSpillHostBytes]);
+  }
+  if (config.find(kCudfSpillHostNumaNode) != config.end()) {
+    spillHostNumaNode = folly::to<int32_t>(config[kCudfSpillHostNumaNode]);
   }
   if (config.find(kCudfOutputMr) != config.end()) {
     outputMemoryResource = config[kCudfOutputMr];
