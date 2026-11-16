@@ -20,6 +20,7 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #include "velox/experimental/cudf/connectors/hive/FusedForColumnEncoding.h"
+#include "velox/experimental/cudf/exec/CudfBatchConcat.h"
 #include "velox/experimental/cudf/exec/CudfHivePartitionFunction.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
@@ -854,6 +855,18 @@ struct RestoredPayload {
   cudf::table_view view;
 };
 
+// Device bytes 'restored' holds: its payload's storage and its decoded
+// columns.
+uint64_t deviceBytes(const RestoredPayload& restored) {
+  uint64_t bytes = restored.data->gpuDataSize();
+  for (const auto& column : restored.decoded) {
+    if (column != nullptr) {
+      bytes += column->alloc_size();
+    }
+  }
+  return bytes;
+}
+
 RestoredPayload restore(ExchangeStore::TakenPayload taken, cuda::stream_ref stream) {
   joinExchangeLanes(*taken.data, cudf_velox::get_output_mr());
   RestoredPayload restored;
@@ -909,7 +922,9 @@ class ExchangeStoreDataSource : public connector::DataSource {
       const connector::ConnectorTableHandlePtr& tableHandle,
       const connector::ColumnHandleMap& columnHandles,
       connector::ConnectorQueryCtx* connectorQueryCtx)
-      : outputType_(outputType), pool_(connectorQueryCtx->memoryPool()) {
+      : outputType_(outputType),
+        pool_(connectorQueryCtx->memoryPool()),
+        batchTarget_(outputType_) {
     auto hiveTable =
         std::dynamic_pointer_cast<const HiveTableHandle>(tableHandle);
     VELOX_CHECK_NOT_NULL(hiveTable);
@@ -950,14 +965,12 @@ class ExchangeStoreDataSource : public connector::DataSource {
     takeMore(ignored);
   }
 
-  // Returns the split's payloads concatenated into batches of at least
-  // CudfConfig::batchSizeMinThreshold rows where the payloads allow. A writer
-  // splits every batch it gets across all buckets, so a file holds many small
-  // payloads, and each batch costs the operators downstream a fixed overhead.
+  // Returns the split's payloads concatenated into batches of CudfBatchConcat's
+  // target where the payloads allow. A writer splits every batch it gets
+  // across all buckets, so a file holds many small payloads, and each batch
+  // costs the operators downstream a fixed overhead.
   std::optional<RowVectorPtr> next(uint64_t /*size*/, ContinueFuture& future)
       override {
-    const auto targetRows = static_cast<vector_size_t>(
-        cudf_velox::CudfConfig::getInstance().batchSizeMinThreshold);
     // Payloads without rows give no batch; take more until one does or the
     // split is done.
     for (;;) {
@@ -968,8 +981,9 @@ class ExchangeStoreDataSource : public connector::DataSource {
       }
       std::vector<RestoredPayload> batch;
       vector_size_t batchRows = 0;
+      uint64_t batchBytes = 0;
       while (next_ < payloads_.size() &&
-             (batch.empty() || batchRows < targetRows) &&
+             (batch.empty() || !batchTarget_.isMet(batchRows, batchBytes)) &&
              (batch.empty() ||
               static_cast<int64_t>(batchRows) +
                       payloads_[next_].data->numRows <=
@@ -982,6 +996,7 @@ class ExchangeStoreDataSource : public connector::DataSource {
         completedRows_ += numRows;
         completedBytes_ += restored.data->gpuDataSize();
         batchRows += numRows;
+        batchBytes += deviceBytes(restored);
         batch.push_back(std::move(restored));
       }
       if (batch.size() == 1) {
@@ -1140,6 +1155,8 @@ class ExchangeStoreDataSource : public connector::DataSource {
 
   const RowTypePtr outputType_;
   memory::MemoryPool* const pool_;
+  // When a batch of payloads is complete, as for CudfBatchConcat.
+  const cudf_velox::BatchConcatTarget batchTarget_;
   RowTypePtr dataColumns_;
   // Position in the table, and so in each payload, of each output column.
   std::vector<cudf::size_type> columns_;
