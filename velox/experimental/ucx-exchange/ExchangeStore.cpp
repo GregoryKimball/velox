@@ -52,11 +52,9 @@ struct ExchangeStore::HostPool {
   rmm::mr::pool_memory_resource pool;
 };
 
-ExchangeStore::HostBuffer::HostBuffer(
-    std::shared_ptr<HostPool> pool,
-    std::size_t bytes)
-    : pool_(std::move(pool)),
-      data_(pool_->pool.allocate(
+ExchangeStore::HostBuffer::HostBuffer(HostPool& pool, std::size_t bytes)
+    : pool_(pool),
+      data_(pool.pool.allocate(
           hostPoolStream(), bytes, rmm::CUDA_ALLOCATION_ALIGNMENT)),
       bytes_(bytes) {}
 
@@ -69,7 +67,7 @@ ExchangeStore::HostBuffer::~HostBuffer() {
         << cudaGetErrorString(status);
     cudaEventDestroy(written_);
   }
-  pool_->pool.deallocate(
+  pool_.pool.deallocate(
       hostPoolStream(), data_, bytes_, rmm::CUDA_ALLOCATION_ALIGNMENT);
 }
 
@@ -90,11 +88,11 @@ ExchangeStore::ExchangeStore() = default;
 
 ExchangeStore::~ExchangeStore() = default;
 
-std::shared_ptr<ExchangeStore::HostPool> ExchangeStore::hostPool() {
+ExchangeStore::HostPool& ExchangeStore::hostPool() {
   if (hostPool_ == nullptr) {
-    hostPool_ = std::make_shared<HostPool>();
+    hostPool_ = std::make_unique<HostPool>();
   }
-  return hostPool_;
+  return *hostPool_;
 }
 
 ExchangeStore& ExchangeStore::instance() {
@@ -117,12 +115,10 @@ bool ExchangeStore::isDropped(std::string_view table) const {
       });
 }
 
-std::shared_ptr<ExchangeStore::HostPool> ExchangeStore::resetTiersIfEmpty() {
-  if (!tables_.empty()) {
-    return nullptr;
+void ExchangeStore::restoreDeviceCapacityIfEmpty() {
+  if (tables_.empty()) {
+    deviceCapacity_ = configuredDeviceCapacity_;
   }
-  deviceCapacity_ = configuredDeviceCapacity_;
-  return std::move(hostPool_);
 }
 
 void ExchangeStore::setHostCapacity(uint64_t bytes) {
@@ -151,12 +147,12 @@ bool ExchangeStore::place(StoredPayload& stored, cuda::stream_ref stream) {
   // A payload without data, such as one with no columns, takes no memory and
   // stays in the device tier.
   bool toHost;
-  std::shared_ptr<HostPool> pool;
+  HostPool* pool = nullptr;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     toHost = stored.bytes > 0 && deviceBytes_ + stored.bytes > deviceCapacity_;
     if (toHost) {
-      pool = hostPool();
+      pool = &hostPool();
       VELOX_CHECK_LE(
           stored.bytes,
           hostCapacity_ - hostBytes_,
@@ -170,7 +166,7 @@ bool ExchangeStore::place(StoredPayload& stored, cuda::stream_ref stream) {
   }
 
   if (toHost) {
-    stored.host = std::make_unique<HostBuffer>(std::move(pool), stored.bytes);
+    stored.host = std::make_unique<HostBuffer>(*pool, stored.bytes);
     CUDF_CUDA_TRY(cudaMemcpyAsync(
         stored.host->data(),
         stored.device->data(),
@@ -256,7 +252,6 @@ std::vector<ExchangeStore::TakenPayload> ExchangeStore::take(
   std::vector<StoredPayload> payloads;
   // The keys each payload refers to, in its column order.
   std::vector<std::vector<std::shared_ptr<const StoredPayload>>> payloadKeys;
-  std::shared_ptr<HostPool> releasedPool;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto tableIt = tables_.find(table);
@@ -307,7 +302,7 @@ std::vector<ExchangeStore::TakenPayload> ExchangeStore::take(
         tableIt->second.waiters.empty()) {
       forget(tableIt->second);
       tables_.erase(tableIt);
-      releasedPool = resetTiersIfEmpty();
+      restoreDeviceCapacityIfEmpty();
     }
   }
 
@@ -402,7 +397,6 @@ void ExchangeStore::beginWrite(
 
 void ExchangeStore::endWrites(std::string_view taskId) {
   std::vector<ContinuePromise> waiters;
-  std::shared_ptr<HostPool> releasedPool;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto it = tables_.begin(); it != tables_.end();) {
@@ -424,7 +418,7 @@ void ExchangeStore::endWrites(std::string_view taskId) {
       }
       ++it;
     }
-    releasedPool = resetTiersIfEmpty();
+    restoreDeviceCapacityIfEmpty();
   }
   for (auto& waiter : waiters) {
     waiter.setValue();
@@ -503,7 +497,6 @@ ExchangeStore::takeOrWait(
 
 void ExchangeStore::drop(std::string_view table) {
   Table dropped;
-  std::shared_ptr<HostPool> releasedPool;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = tables_.find(table);
@@ -513,7 +506,7 @@ void ExchangeStore::drop(std::string_view table) {
     dropped = std::move(it->second);
     tables_.erase(it);
     forget(dropped);
-    releasedPool = resetTiersIfEmpty();
+    restoreDeviceCapacityIfEmpty();
   }
   // 'dropped' frees both tiers' memory outside the lock. Its readers wake up:
   // a broken promise would fail their tasks with an error that hides the one
@@ -525,7 +518,6 @@ void ExchangeStore::drop(std::string_view table) {
 
 void ExchangeStore::dropQuery(std::string_view queryId) {
   std::vector<Table> dropped;
-  std::shared_ptr<HostPool> releasedPool;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     droppedQueries_.emplace_back(queryId);
@@ -541,7 +533,7 @@ void ExchangeStore::dropQuery(std::string_view queryId) {
       dropped.push_back(std::move(it->second));
       it = tables_.erase(it);
     }
-    releasedPool = resetTiersIfEmpty();
+    restoreDeviceCapacityIfEmpty();
   }
   // 'dropped' frees both tiers' memory outside the lock. Its readers wake up,
   // as in drop().
