@@ -319,6 +319,8 @@ bool CudfHashJoinBridge::waitForBuildWork(ContinueFuture* future) {
 
 void CudfHashJoinBridge::probeFinished(int64_t round, uint32_t numProbes) {
   std::vector<ContinuePromise> promises;
+  std::optional<hash_type> released;
+  std::optional<cuda::stream_ref> releasedStream;
   {
     std::lock_guard<std::mutex> l(mutex_);
     VELOX_CHECK_EQ(round, round_);
@@ -327,10 +329,9 @@ void CudfHashJoinBridge::probeFinished(int64_t round, uint32_t numProbes) {
       return;
     }
     numProbesFinished_ = 0;
-    // Every probe dropped its reference before it called. This releases the
-    // last one, so the round's tables are gone before the next ones are
-    // built.
+    released = std::move(hashObject_);
     hashObject_.reset();
+    releasedStream = buildStream_;
     buildReadyEvent_.reset();
     buildStream_.reset();
     if (round_ + 1 == static_cast<int64_t>(partitions_.size())) {
@@ -340,6 +341,14 @@ void CudfHashJoinBridge::probeFinished(int64_t round, uint32_t numProbes) {
       buildWorkDue_ = true;
     }
     promises = std::move(promises_);
+  }
+  // Every probe dropped its reference before it called, so this is the last
+  // one. The tables are freed on the stream they were built on. Wait for
+  // that stream, so that the device has the memory back before the build is
+  // told to bring in the next partition.
+  released.reset();
+  if (releasedStream.has_value()) {
+    releasedStream->sync();
   }
   notify(std::move(promises));
 }
@@ -2684,6 +2693,11 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
   if (hashObject_.has_value()) {
     return exec::BlockingReason::kNotBlocked;
   }
+
+  // What follows may allocate device memory for the tables it receives.
+  // isBlocked() runs outside the entry points that install this operator's
+  // memory resources.
+  auto memoryResources = scopedMemoryResources();
 
   auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
       operatorCtx_->driverCtx()->splitGroupId, planNodeId());
