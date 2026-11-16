@@ -31,6 +31,8 @@ class QueryConfig;
 namespace facebook::velox::cudf_velox {
 
 class CudaEvent;
+class PartitionedBufferedState;
+struct CudfSpillContext;
 
 inline constexpr std::string_view kStreamingGroupbyUsedStat{
     "streamingGroupbyUsed"};
@@ -184,10 +186,28 @@ bool canGroupbyAggregationBeEvaluatedByCudf(
 
 class CudfGroupby : public CudfOperatorBase {
  public:
+  /// Counters of the spillable buffered state. Bytes are device bytes unless
+  /// the name says host.
+  static constexpr std::string_view kSpilledBytes{"cudfGroupbySpilledBytes"};
+  static constexpr std::string_view kSpilledHostBytes{
+      "cudfGroupbySpilledHostBytes"};
+  static constexpr std::string_view kSpilledRows{"cudfGroupbySpilledRows"};
+  static constexpr std::string_view kSpilledLeaves{"cudfGroupbySpilledLeaves"};
+  static constexpr std::string_view kSpilledInputChunks{
+      "cudfGroupbySpilledInputChunks"};
+  static constexpr std::string_view kRestoredInputChunks{
+      "cudfGroupbyRestoredInputChunks"};
+  static constexpr std::string_view kRestoredBytes{"cudfGroupbyRestoredBytes"};
+  static constexpr std::string_view kRestoredRows{"cudfGroupbyRestoredRows"};
+  static constexpr std::string_view kRestoredLeaves{
+      "cudfGroupbyRestoredLeaves"};
+
   CudfGroupby(
       int32_t operatorId,
       exec::DriverCtx* driverCtx,
       std::shared_ptr<const core::AggregationNode> const& aggregationNode);
+
+  ~CudfGroupby() override;
 
   void initialize() override;
 
@@ -210,7 +230,24 @@ class CudfGroupby : public CudfOperatorBase {
 
   void doClose() override;
 
+  bool gpuReclaimableBytes(uint64_t& reclaimableBytes) const override;
+
+  bool supportsGpuSpillWithActiveCall() const override {
+    return spillableState_ != nullptr;
+  }
+
+  uint64_t spillGpu(uint64_t targetBytes) override;
+
  private:
+  // The operations the spillable buffered state performs on this operator's
+  // leaves. Nested so that it can use the operator's aggregators.
+  class SpillableStateOps;
+
+  // After a final input, moves the largest leaves of the spillable state to
+  // host memory when the query's GPU pool is fuller than the configured
+  // percentage of its capacity.
+  void maybeSelfSpill();
+
   CudfVectorPtr doGroupByAggregation(
       cudf::table_view tableView,
       std::vector<column_index_t> const& groupByKeys,
@@ -282,6 +319,13 @@ class CudfGroupby : public CudfOperatorBase {
   std::optional<cuda::stream_ref> streamingGroupbyStream_;
   std::unique_ptr<CudaEvent> streamingGroupbyEvent_;
   size_t streamingGroupbyCapacity_{0};
+
+  // Set when the query has a GPU pool and host spilling is on.
+  std::shared_ptr<CudfSpillContext> spillContext_;
+  // The buffered result of a final or single step that can spill: a tree of
+  // hash partitions whose leaves move to host memory and back. Used in place
+  // of 'bufferedResult_' when 'spillContext_' is set.
+  std::unique_ptr<PartitionedBufferedState> spillableState_;
 };
 
 } // namespace facebook::velox::cudf_velox

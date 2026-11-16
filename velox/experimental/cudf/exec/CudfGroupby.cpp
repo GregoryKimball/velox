@@ -17,9 +17,12 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfGroupby.h"
+#include "velox/experimental/cudf/exec/CudfSpillContext.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationHostOps.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationState.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/PartitionedBufferedState.h"
+#include "velox/experimental/cudf/exec/SpilledCudfVector.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
@@ -40,6 +43,7 @@
 #include <cudf/lists/count_elements.hpp>
 #include <cudf/lists/lists_column_view.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/partitioning.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/transform.hpp>
@@ -51,6 +55,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <deque>
 #include <limits>
 
 namespace {
@@ -1553,6 +1558,832 @@ std::unique_ptr<StreamingGroupbyAggregator> createStreamingGroupbyAggregator(
 
 namespace facebook::velox::cudf_velox {
 
+namespace {
+
+int64_t saturateCast(uint64_t value) {
+  return static_cast<int64_t>(
+      std::min<uint64_t>(value, std::numeric_limits<int64_t>::max()));
+}
+
+// Concatenates 'views', which were produced on 'inputStreams', on 'stream'.
+// The input streams then wait for the copy, so that an input freed on its own
+// stream afterwards is freed after the copy has read it.
+std::unique_ptr<cudf::table> concatenateViews(
+    const std::vector<cudf::table_view>& views,
+    const std::vector<cuda::stream_ref>& inputStreams,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  VELOX_CHECK_GT(views.size(), 0);
+  cudf::detail::join_streams(inputStreams, stream);
+  auto output = cudf::concatenate(views, stream, mr);
+  CudaEvent event(cudaEventDisableTiming);
+  streamsWaitForStream(event, inputStreams, stream);
+  return output;
+}
+
+void checkOwnedLeafChunk(const InputChunk& chunk) {
+  VELOX_CHECK(chunk.ownsFullTable());
+  VELOX_CHECK_NOT_NULL(chunk.owner);
+  VELOX_CHECK_NULL(chunk.tableOwner);
+  VELOX_CHECK_EQ(
+      chunk.owner.use_count(),
+      1,
+      "A persistent groupby leaf must be the sole owner of its CudfVector");
+}
+
+// One piece of a leaf in host memory. 'leafSnapshot' is true for the leaf's
+// chunk as it was when the leaf spilled, false for input appended later.
+struct SpilledGroupbyChunk {
+  size_t rowCount;
+  bool leafSnapshot;
+  SpilledCudfVector vector;
+};
+
+// The buffered rows of one leaf of the spillable state. The rows are on the
+// device ('chunk' and 'pending') or in host memory ('spilledChunks'), never
+// both.
+struct GroupbyLeafState final : public BufferedState {
+  bool isResident() const {
+    return chunk.owner != nullptr || !pending.empty();
+  }
+
+  void appendSpilledChunk(SpilledGroupbyChunk spilled) {
+    spilledQueuedRows += spilled.rowCount;
+    spilledChunks.push_back(std::move(spilled));
+  }
+
+  void popSpilledChunk() {
+    spilledQueuedRows -= spilledChunks.front().rowCount;
+    spilledChunks.pop_front();
+  }
+
+  // Rows of 'chunk', 'pending' and 'spilledChunks' together.
+  size_t rowCount{0};
+  // An independently owned table in the buffered layout.
+  InputChunk chunk;
+  // Inputs added after 'chunk' that have not been aggregated with it. Each is
+  // independently owned, so that spilling the leaf frees them.
+  std::vector<InputChunk> pending;
+  // The owner of 'chunk' at the time a group-by over the leaf's keys made it.
+  // While 'chunk' still has that owner it holds one row for each key. Any
+  // other owner, also a later vector at the same address, does not match.
+  std::weak_ptr<CudfVector> groupedOwner;
+  std::deque<SpilledGroupbyChunk> spilledChunks;
+  uint64_t spilledQueuedRows{0};
+};
+
+} // namespace
+
+// Implements the leaves of the spillable buffered state of a final or single
+// group-by.
+//
+// A final step appends its input, which holds partial states, to a leaf and
+// aggregates each leaf once when it is drained. A leaf that was moved to host
+// memory stays there: later input for it is copied to host memory as well,
+// and the leaf is restored only to be drained. A single step aggregates raw
+// input as it arrives and merges it into the leaf, and restores a spilled
+// leaf when input arrives for it.
+class CudfGroupby::SpillableStateOps final : public BufferedStateOps {
+ public:
+  explicit SpillableStateOps(CudfGroupby& owner)
+      : owner_(owner), appendInputs_(!owner.isSingleStep_) {
+    keyIndices_.reserve(owner_.groupingKeyOutputChannels_.size());
+    for (auto keyIndex : owner_.groupingKeyOutputChannels_) {
+      keyIndices_.push_back(static_cast<cudf::size_type>(keyIndex));
+    }
+  }
+
+  InputChunk prepareInput(CudfVectorPtr rawInput) override {
+    auto stream = rawInput->stream();
+    auto permutedInputView = rawInput->getTableView().select(
+        owner_.aggregationInputChannels_.begin(),
+        owner_.aggregationInputChannels_.end());
+
+    if (!owner_.isSingleStep_) {
+      // The input of a final step has the buffered layout already, possibly
+      // permuted. It is routed as a view and aggregated when its leaf is
+      // drained.
+      return makeBorrowedChunk(
+          std::move(rawInput), owner_.bufferedResultType_, permutedInputView);
+    }
+
+    auto compacted = owner_.doGroupByAggregation(
+        permutedInputView,
+        owner_.groupingKeyOutputChannels_,
+        owner_.partialAggregators_,
+        owner_.bufferedResultType_,
+        stream,
+        get_output_mr());
+    return compacted
+        ? makeOwnedChunk(std::move(compacted), owner_.bufferedResultType_)
+        : InputChunk{};
+  }
+
+  size_t estimatedMergedRowUpperBound(
+      const BufferedState& leaf,
+      const InputChunk& input) const override {
+    return asLeafState(leaf).rowCount + input.size();
+  }
+
+  std::unique_ptr<BufferedState> createLeaf(InputChunk input) override {
+    auto leaf = std::make_unique<GroupbyLeafState>();
+    leaf->chunk = std::move(input).materialize(get_output_mr());
+    leaf->rowCount = leaf->chunk.size();
+    return leaf;
+  }
+
+  std::unique_ptr<BufferedState> createLeafFromInputs(
+      InputChunk first,
+      InputChunk second) override {
+    if (appendInputs_) {
+      auto leaf = createLeaf(std::move(first));
+      addInputToLeaf(*leaf, std::move(second));
+      return leaf;
+    }
+    bool grouped = false;
+    auto leaf = std::make_unique<GroupbyLeafState>();
+    leaf->chunk = mergeChunks(std::move(first), std::move(second), grouped);
+    leaf->rowCount = leaf->chunk.size();
+    checkOwnedLeafChunk(leaf->chunk);
+    if (grouped) {
+      leaf->groupedOwner = leaf->chunk.owner;
+    }
+    return leaf;
+  }
+
+  void addInputToLeaf(BufferedState& leaf, InputChunk input) override {
+    auto& groupbyLeaf = asLeafState(leaf);
+    if (appendInputs_) {
+      groupbyLeaf.rowCount += input.size();
+      // A borrowed slice keeps the whole partitioned input alive, which it
+      // shares with the slices of other leaves. Own the slice, so that
+      // spilling this leaf frees it.
+      input = std::move(input).materialize(get_output_mr());
+      groupbyLeaf.pending.push_back(std::move(input));
+      owner_.addRuntimeStat("cudfGroupbyAppendedChunks", RuntimeCounter(1));
+      return;
+    }
+    bool grouped = false;
+    groupbyLeaf.chunk =
+        mergeChunks(std::move(groupbyLeaf.chunk), std::move(input), grouped);
+    if (grouped) {
+      groupbyLeaf.groupedOwner = groupbyLeaf.chunk.owner;
+    }
+    groupbyLeaf.rowCount = groupbyLeaf.chunk.size();
+    checkOwnedLeafChunk(groupbyLeaf.chunk);
+  }
+
+  void compactLeaf(BufferedState& leaf) override {
+    auto& groupbyLeaf = asLeafState(leaf);
+    if (!groupbyLeaf.isResident()) {
+      return;
+    }
+    flushPending(groupbyLeaf);
+    if (holdsGroupedRows(groupbyLeaf)) {
+      return;
+    }
+    const auto stream = groupbyLeaf.chunk.stream;
+    auto merged = owner_.doGroupByAggregation(
+        groupbyLeaf.chunk.view,
+        owner_.groupingKeyOutputChannels_,
+        owner_.intermediateAggregators_,
+        owner_.bufferedResultType_,
+        stream,
+        get_output_mr());
+    // The group-by has read the old chunk when its stream is done.
+    stream.sync();
+    if (!merged) {
+      // Every row was dropped, which only null keys that are ignored can
+      // cause. The leaf is left as it is.
+      return;
+    }
+    groupbyLeaf.chunk =
+        makeOwnedChunk(std::move(merged), owner_.bufferedResultType_);
+    groupbyLeaf.groupedOwner = groupbyLeaf.chunk.owner;
+    groupbyLeaf.rowCount = groupbyLeaf.chunk.size();
+    checkOwnedLeafChunk(groupbyLeaf.chunk);
+    owner_.addRuntimeStat("cudfGroupbyCompactedLeaves", RuntimeCounter(1));
+  }
+
+  bool addInputToSpilledLeaf(BufferedState& leaf, InputChunk& input) override {
+    auto& groupbyLeaf = asLeafState(leaf);
+    if (!appendInputs_ || groupbyLeaf.isResident()) {
+      return false;
+    }
+
+    VELOX_CHECK(!groupbyLeaf.spilledChunks.empty());
+    const auto inputRows = input.size();
+    // A slice of fixed-width columns without nulls is copied to host memory
+    // from where it is. Anything else is copied on the device first.
+    if (auto spilled = SpilledCudfVector::trySpillFlatSlice(
+            input.pool,
+            input.type,
+            input.view,
+            input.stream,
+            input.owner,
+            input.tableOwner,
+            owner_.spillContext_)) {
+      recordSpill(*spilled, inputRows, false);
+      owner_.addRuntimeStat(
+          "cudfGroupbyDirectSpilledInputChunks", RuntimeCounter(1));
+      input = InputChunk{};
+      groupbyLeaf.appendSpilledChunk(
+          SpilledGroupbyChunk{inputRows, false, std::move(*spilled)});
+      groupbyLeaf.rowCount += inputRows;
+      return true;
+    }
+    auto ownedInput = std::move(input).materialize(get_output_mr());
+    input = InputChunk{};
+    auto spilled =
+        SpilledCudfVector::spill(ownedInput.owner, owner_.spillContext_);
+    ownedInput = InputChunk{};
+    recordSpill(spilled, inputRows, false);
+    groupbyLeaf.appendSpilledChunk(
+        SpilledGroupbyChunk{inputRows, false, std::move(spilled)});
+    groupbyLeaf.rowCount += inputRows;
+    return true;
+  }
+
+  bool hasNextDrainChunk(const BufferedState& leaf) const override {
+    const auto& groupbyLeaf = asLeafState(leaf);
+    return appendInputs_ && !groupbyLeaf.isResident() &&
+        !groupbyLeaf.spilledChunks.empty();
+  }
+
+  InputChunk restoreNextDrainChunk(BufferedState& leaf) override {
+    auto& groupbyLeaf = asLeafState(leaf);
+    VELOX_CHECK(hasNextDrainChunk(groupbyLeaf));
+    return restoreNextSpilledChunk(groupbyLeaf);
+  }
+
+  bool supportsBulkSpilledDrain(const BufferedState& leaf) const override {
+    return hasNextDrainChunk(leaf);
+  }
+
+  std::vector<std::unique_ptr<BufferedState>> repartitionSpilledLeaf(
+      BufferedState& leaf,
+      const PartitionSpec& spec) override {
+    auto& source = asLeafState(leaf);
+    VELOX_CHECK(supportsBulkSpilledDrain(source));
+    std::vector<std::unique_ptr<BufferedState>> children(spec.numPartitions);
+    owner_.addRuntimeStat("cudfGroupbyDrainRepartitions", RuntimeCounter(1));
+    while (!source.spilledChunks.empty()) {
+      // One chunk is on the device at a time, with its partitioned copy. The
+      // whole leaf never is.
+      auto input = restoreNextSpilledChunk(source);
+      auto pieces = partitionInput(input, spec);
+      input = InputChunk{};
+      for (size_t i = 0; i < pieces.size(); ++i) {
+        if (pieces[i].empty()) {
+          continue;
+        }
+        auto owned = std::move(pieces[i]).materialize(get_output_mr());
+        const auto rows = owned.size();
+        auto spilled =
+            SpilledCudfVector::spill(owned.owner, owner_.spillContext_);
+        recordSpill(spilled, rows, false);
+        if (!children[i]) {
+          children[i] = std::make_unique<GroupbyLeafState>();
+        }
+        auto& child = asLeafState(*children[i]);
+        child.rowCount += rows;
+        child.appendSpilledChunk(
+            SpilledGroupbyChunk{rows, false, std::move(spilled)});
+      }
+    }
+    return children;
+  }
+
+  std::optional<CudfVectorPtr> tryFinalizeSpilledLeaf(
+      std::unique_ptr<BufferedState>& leaf) override {
+    auto& source = asLeafState(*leaf);
+    VELOX_CHECK(supportsBulkSpilledDrain(source));
+    uint64_t bytes = 0;
+    for (const auto& chunk : source.spilledChunks) {
+      if (chunk.vector.deviceBytes() >
+          std::numeric_limits<uint64_t>::max() / 2 - bytes) {
+        return std::nullopt;
+      }
+      bytes += chunk.vector.deviceBytes();
+    }
+    // Room for the restored pieces and their one concatenation, taken only if
+    // the query's GPU pool has it now. Otherwise no host chunk is consumed
+    // and the caller replays the leaf chunk by chunk.
+    auto* pool = owner_.gpuPool();
+    if (pool == nullptr || !admitWithinHeadroom(*pool, 2 * bytes)) {
+      owner_.addRuntimeStat(
+          "cudfGroupbyBulkDrainAdmissionFailures", RuntimeCounter(1));
+      return std::nullopt;
+    }
+    SCOPE_EXIT {
+      pool->release();
+    };
+    const auto rows = source.rowCount;
+    auto stream = cudfGlobalStreamPool().get_stream();
+
+    // Chunks of fixed-width columns without nulls are restored straight into
+    // one table: one allocation per column and no concatenation.
+    std::unique_ptr<cudf::table> combined;
+    {
+      std::vector<const SpilledCudfVector*> sources;
+      sources.reserve(source.spilledChunks.size());
+      for (const auto& chunk : source.spilledChunks) {
+        sources.push_back(&chunk.vector);
+      }
+      combined = SpilledCudfVector::tryRestoreConcatenated(
+          sources, stream, get_temp_mr());
+    }
+    if (combined) {
+      VELOX_CHECK_EQ(static_cast<size_t>(combined->num_rows()), rows);
+      uint64_t numInputChunks = 0;
+      uint64_t numSnapshots = 0;
+      while (!source.spilledChunks.empty()) {
+        (source.spilledChunks.front().leafSnapshot ? numSnapshots
+                                                   : numInputChunks) += 1;
+        source.popSpilledChunk();
+      }
+      recordRestore(bytes, rows, numSnapshots, numInputChunks);
+      owner_.addRuntimeStat(
+          "cudfGroupbyRestoreConcatLeaves", RuntimeCounter(1));
+    } else {
+      std::vector<InputChunk> restored;
+      std::vector<cudf::table_view> views;
+      std::vector<cuda::stream_ref> streams;
+      restored.reserve(source.spilledChunks.size());
+      while (!source.spilledChunks.empty()) {
+        restored.push_back(restoreNextSpilledChunk(source));
+        views.push_back(restored.back().view);
+        streams.push_back(restored.back().stream);
+      }
+      combined = concatenateViews(views, streams, stream, get_temp_mr());
+      stream.sync();
+      views.clear();
+      restored.clear();
+      for (auto inputStream : streams) {
+        inputStream.sync();
+      }
+    }
+    auto output = aggregateFinal(combined->view(), stream);
+    // The aggregation has read the table when its stream is done.
+    stream.sync();
+    combined.reset();
+    leaf.reset();
+    owner_.addRuntimeStat("cudfGroupbyBulkDrainPartitions", RuntimeCounter(1));
+    owner_.addRuntimeStat(
+        "cudfGroupbyBulkDrainRows", RuntimeCounter(saturateCast(rows)));
+    owner_.addRuntimeStat(
+        "cudfGroupbyBulkDrainBytes",
+        RuntimeCounter(saturateCast(bytes), RuntimeCounter::Unit::kBytes));
+    return std::optional<CudfVectorPtr>{std::move(output)};
+  }
+
+  size_t leafRowCount(const BufferedState& leaf) const override {
+    return asLeafState(leaf).rowCount;
+  }
+
+  uint64_t leafFlatSize(const BufferedState& leaf) const override {
+    const auto& groupbyLeaf = asLeafState(leaf);
+    if (!groupbyLeaf.isResident()) {
+      VELOX_CHECK(!groupbyLeaf.spilledChunks.empty());
+      return 0;
+    }
+    uint64_t bytes = 0;
+    if (groupbyLeaf.chunk.owner != nullptr) {
+      bytes += groupbyLeaf.chunk.owner->estimateFlatSize();
+    }
+    for (const auto& input : groupbyLeaf.pending) {
+      bytes += input.owner->estimateFlatSize();
+    }
+    return bytes;
+  }
+
+  uint64_t leafReclaimableBytes(const BufferedState& leaf) const override {
+    return leafFlatSize(leaf);
+  }
+
+  void spillLeaf(BufferedState& leaf) override {
+    auto& groupbyLeaf = asLeafState(leaf);
+    VELOX_CHECK(groupbyLeaf.isResident());
+    VELOX_CHECK(groupbyLeaf.spilledChunks.empty());
+    const auto leafRows = groupbyLeaf.rowCount;
+
+    // The chunk goes first, as a snapshot of the leaf, then each pending
+    // input by itself. Nothing is concatenated or aggregated here: that would
+    // allocate device memory while it is short.
+    if (!groupbyLeaf.chunk.empty()) {
+      checkOwnedLeafChunk(groupbyLeaf.chunk);
+      const auto rows = groupbyLeaf.chunk.size();
+      try {
+        auto spilled = SpilledCudfVector::spill(
+            groupbyLeaf.chunk.owner, owner_.spillContext_);
+        recordSpill(spilled, rows, true);
+        groupbyLeaf.chunk = InputChunk{};
+        groupbyLeaf.appendSpilledChunk(
+            SpilledGroupbyChunk{rows, true, std::move(spilled)});
+      } catch (...) {
+        // A failed spill puts the table back into a new vector. The old view
+        // referred to the table that was taken apart.
+        if (groupbyLeaf.chunk.owner) {
+          groupbyLeaf.chunk.view = groupbyLeaf.chunk.owner->getTableView();
+          groupbyLeaf.chunk.stream = groupbyLeaf.chunk.owner->stream();
+        }
+        throw;
+      }
+    }
+    // The order of a leaf's pieces does not matter: they are aggregated
+    // together when the leaf is drained.
+    while (!groupbyLeaf.pending.empty()) {
+      auto& input = groupbyLeaf.pending.back();
+      checkOwnedLeafChunk(input);
+      const auto rows = input.size();
+      try {
+        auto spilled =
+            SpilledCudfVector::spill(input.owner, owner_.spillContext_);
+        recordSpill(spilled, rows, false);
+        groupbyLeaf.appendSpilledChunk(
+            SpilledGroupbyChunk{rows, false, std::move(spilled)});
+      } catch (...) {
+        if (input.owner) {
+          input.view = input.owner->getTableView();
+          input.stream = input.owner->stream();
+        }
+        throw;
+      }
+      groupbyLeaf.pending.pop_back();
+    }
+    VELOX_CHECK_EQ(groupbyLeaf.spilledQueuedRows, leafRows);
+  }
+
+  void restoreLeaf(BufferedState& leaf) override {
+    auto& groupbyLeaf = asLeafState(leaf);
+    if (groupbyLeaf.isResident()) {
+      return;
+    }
+    VELOX_CHECK(!groupbyLeaf.spilledChunks.empty());
+    // True if the last chunk restored was merged with the ones before it. A
+    // single restored chunk may be unmerged input and is not marked.
+    bool grouped = false;
+    while (!groupbyLeaf.spilledChunks.empty()) {
+      auto restored = restoreNextSpilledChunk(groupbyLeaf);
+      grouped = false;
+      groupbyLeaf.chunk = groupbyLeaf.chunk.empty()
+          ? std::move(restored)
+          : mergeChunks(
+                std::move(groupbyLeaf.chunk), std::move(restored), grouped);
+    }
+    if (grouped) {
+      groupbyLeaf.groupedOwner = groupbyLeaf.chunk.owner;
+    }
+    groupbyLeaf.rowCount = groupbyLeaf.chunk.size();
+    checkOwnedLeafChunk(groupbyLeaf.chunk);
+  }
+
+  std::vector<InputChunk> partitionInput(
+      const InputChunk& input,
+      const PartitionSpec& spec) override {
+    if (input.empty()) {
+      return std::vector<InputChunk>(spec.numPartitions);
+    }
+
+    auto [partitionedTable, partitionOffsets] = cudf::hash_partition(
+        input.view,
+        spec.keyIndices,
+        spec.numPartitions,
+        spec.hashId,
+        spec.seed,
+        input.stream,
+        get_output_mr());
+
+    VELOX_CHECK_EQ(partitionOffsets.size(), spec.numPartitions + 1);
+    VELOX_CHECK_EQ(partitionOffsets.front(), 0);
+
+    partitionOffsets.erase(partitionOffsets.begin());
+    partitionOffsets.pop_back();
+
+    auto partitionedTableOwner =
+        std::shared_ptr<cudf::table>(std::move(partitionedTable));
+    auto partitionViews = cudf::split(
+        partitionedTableOwner->view(), partitionOffsets, input.stream);
+    std::vector<InputChunk> chunks(spec.numPartitions);
+    for (int32_t i = 0; i < spec.numPartitions; ++i) {
+      auto partition = partitionViews[i];
+      if (partition.num_rows() > 0) {
+        chunks[i] = InputChunk{
+            input.pool,
+            input.type,
+            partition,
+            input.stream,
+            nullptr,
+            partitionedTableOwner,
+            InputChunkStorage::kBorrowed};
+      }
+    }
+    return chunks;
+  }
+
+  std::vector<InputChunk> partitionLeaf(
+      const BufferedState& leaf,
+      const PartitionSpec& spec) override {
+    auto& mutableLeaf = const_cast<GroupbyLeafState&>(asLeafState(leaf));
+    flushPending(mutableLeaf);
+    return partitionInput(mutableLeaf.chunk, spec);
+  }
+
+  CudfVectorPtr finalizeLeaf(std::unique_ptr<BufferedState> leaf) override {
+    auto groupbyLeaf = std::unique_ptr<GroupbyLeafState>(
+        static_cast<GroupbyLeafState*>(leaf.release()));
+    flushPending(*groupbyLeaf);
+    // A leaf that holds one merged state for each key is finalized without
+    // grouping its rows once more. Appended and restored rows were not
+    // merged and take the group-by below.
+    if (holdsGroupedRows(*groupbyLeaf)) {
+      if (auto output = finalizeGrouped(*groupbyLeaf)) {
+        return std::move(*output);
+      }
+    }
+    const auto stream = groupbyLeaf->chunk.stream;
+    auto output = aggregateFinal(groupbyLeaf->chunk.view, stream);
+    // The aggregation has read the leaf when its stream is done.
+    stream.sync();
+    return output;
+  }
+
+  const std::vector<cudf::size_type>& keyIndices() const override {
+    return keyIndices_;
+  }
+
+ private:
+  static GroupbyLeafState& asLeafState(BufferedState& leaf) {
+    return static_cast<GroupbyLeafState&>(leaf);
+  }
+
+  static const GroupbyLeafState& asLeafState(const BufferedState& leaf) {
+    return static_cast<const GroupbyLeafState&>(leaf);
+  }
+
+  static InputChunk makeOwnedChunk(CudfVectorPtr owner, const TypePtr& type) {
+    return InputChunk{
+        owner->pool(),
+        type,
+        owner->getTableView(),
+        owner->stream(),
+        std::move(owner),
+        nullptr,
+        InputChunkStorage::kOwned};
+  }
+
+  static InputChunk makeBorrowedChunk(
+      CudfVectorPtr owner,
+      const TypePtr& type,
+      cudf::table_view view) {
+    return InputChunk{
+        owner->pool(),
+        type,
+        view,
+        owner->stream(),
+        std::move(owner),
+        nullptr,
+        InputChunkStorage::kBorrowed};
+  }
+
+  // Reserves 'bytes' in 'pool' if the query's GPU root has that much room
+  // below its limit now. The caller releases the reservation. A request that
+  // does not fit is refused here, since reserving it would start arbitration
+  // and pause the task.
+  static bool admitWithinHeadroom(memory::MemoryPool& pool, uint64_t bytes) {
+    auto* root = pool.root();
+    const auto headroom = root->maxCapacity() - root->reservedBytes();
+    if (headroom <= 0 || bytes > static_cast<uint64_t>(headroom)) {
+      return false;
+    }
+    return pool.maybeReserve(bytes);
+  }
+
+  // Returns true if 'leaf' holds exactly one already-merged row for each of
+  // its keys: its chunk is still the vector a group-by over the keys made,
+  // and nothing was appended to or spilled from the leaf since.
+  static bool holdsGroupedRows(const GroupbyLeafState& leaf) {
+    return leaf.chunk.owner != nullptr && leaf.pending.empty() &&
+        leaf.spilledChunks.empty() && !leaf.groupedOwner.expired() &&
+        !leaf.groupedOwner.owner_before(leaf.chunk.owner) &&
+        !leaf.chunk.owner.owner_before(leaf.groupedOwner);
+  }
+
+  // Makes the final output of a leaf for which holdsGroupedRows() is true:
+  // keeps its key columns and replaces each state column with its
+  // aggregate's result. Returns nullopt, with the leaf untouched, if the leaf
+  // is not the keys-then-states table the aggregators expect.
+  std::optional<CudfVectorPtr> finalizeGrouped(GroupbyLeafState& leaf) {
+    auto& finalAggregators =
+        owner_.isSingleStep_ ? owner_.finalAggregators_ : owner_.aggregators_;
+    const auto numKeys = owner_.groupingKeyOutputChannels_.size();
+    if (!leaf.chunk.ownsFullTable() || leaf.chunk.owner.use_count() != 1 ||
+        !leaf.chunk.owner->hasOwnedTable() ||
+        static_cast<size_t>(leaf.chunk.view.num_columns()) !=
+            numKeys + finalAggregators.size()) {
+      return std::nullopt;
+    }
+    for (size_t i = 0; i < numKeys; ++i) {
+      if (owner_.groupingKeyOutputChannels_[i] != i) {
+        return std::nullopt;
+      }
+    }
+
+    const auto stream = leaf.chunk.stream;
+    const auto numRows = leaf.chunk.size();
+    auto vector = std::move(leaf.chunk.owner);
+    leaf.chunk = InputChunk{};
+    leaf.groupedOwner.reset();
+    leaf.rowCount = 0;
+    auto columns = vector->release()->release();
+    vector.reset();
+    for (size_t i = 0; i < finalAggregators.size(); ++i) {
+      columns[numKeys + i] = finalAggregators[i]->finalize(
+          std::move(columns[numKeys + i]), stream, get_output_mr());
+    }
+    // finalize() releases the state it decoded and its temporaries. Their
+    // readers finish before the output leaves the operator.
+    stream.sync();
+    owner_.addRuntimeStat(
+        "cudfGroupbyDirectFinalizedLeaves", RuntimeCounter(1));
+    if (numRows == 0) {
+      // Velox expects nullptr instead of a table with 0 rows.
+      return CudfVectorPtr{};
+    }
+    return std::make_shared<CudfVector>(
+        owner_.pool(),
+        owner_.outputType_,
+        numRows,
+        std::make_unique<cudf::table>(std::move(columns)),
+        stream);
+  }
+
+  // Groups the buffered rows of one leaf and returns its final output.
+  CudfVectorPtr aggregateFinal(cudf::table_view view, cuda::stream_ref stream) {
+    auto& finalAggregators =
+        owner_.isSingleStep_ ? owner_.finalAggregators_ : owner_.aggregators_;
+    return owner_.doGroupByAggregation(
+        view,
+        owner_.groupingKeyOutputChannels_,
+        finalAggregators,
+        owner_.outputType_,
+        stream,
+        get_output_mr());
+  }
+
+  // Concatenates a leaf's pending inputs into its chunk without aggregating.
+  void flushPending(GroupbyLeafState& leaf) const {
+    if (leaf.pending.empty()) {
+      return;
+    }
+    std::vector<cudf::table_view> views;
+    std::vector<cuda::stream_ref> inputStreams;
+    if (!leaf.chunk.empty()) {
+      views.push_back(leaf.chunk.view);
+      inputStreams.push_back(leaf.chunk.stream);
+    }
+    for (const auto& input : leaf.pending) {
+      views.push_back(input.view);
+      inputStreams.push_back(input.stream);
+    }
+    auto stream = inputStreams.front();
+    auto type =
+        leaf.chunk.empty() ? leaf.pending.front().type : leaf.chunk.type;
+    auto table = concatenateViews(views, inputStreams, stream, get_output_mr());
+    stream.sync();
+    views.clear();
+    leaf.chunk = InputChunk{};
+    leaf.pending.clear();
+    for (auto inputStream : inputStreams) {
+      inputStream.sync();
+    }
+    const auto numRows = table->num_rows();
+    leaf.chunk = makeOwnedChunk(
+        std::make_shared<CudfVector>(
+            owner_.pool(), type, numRows, std::move(table), stream),
+        type);
+    leaf.rowCount = leaf.chunk.size();
+    checkOwnedLeafChunk(leaf.chunk);
+    owner_.addRuntimeStat("cudfGroupbyAppendFlushes", RuntimeCounter(1));
+  }
+
+  InputChunk restoreNextSpilledChunk(GroupbyLeafState& leaf) const {
+    VELOX_CHECK(!leaf.spilledChunks.empty());
+    auto& spilledChunk = leaf.spilledChunks.front();
+    const auto restoredBytes = spilledChunk.vector.deviceBytes();
+    const auto restoredRows = spilledChunk.rowCount;
+    const auto leafSnapshot = spilledChunk.leafSnapshot;
+    auto restored = makeOwnedChunk(
+        spilledChunk.vector.restore(get_output_mr()),
+        owner_.bufferedResultType_);
+    leaf.popSpilledChunk();
+    recordRestore(
+        restoredBytes,
+        restoredRows,
+        leafSnapshot ? 1 : 0,
+        leafSnapshot ? 0 : 1);
+    return restored;
+  }
+
+  // 'leafSnapshot' is true for a leaf's chunk and false for one input.
+  void recordSpill(
+      const SpilledCudfVector& spilled,
+      size_t rows,
+      bool leafSnapshot) const {
+    owner_.addRuntimeStat(
+        std::string(CudfGroupby::kSpilledBytes),
+        RuntimeCounter(
+            saturateCast(spilled.deviceBytes()), RuntimeCounter::Unit::kBytes));
+    owner_.addRuntimeStat(
+        std::string(CudfGroupby::kSpilledHostBytes),
+        RuntimeCounter(
+            saturateCast(spilled.hostBytes()), RuntimeCounter::Unit::kBytes));
+    owner_.addRuntimeStat(
+        std::string(CudfGroupby::kSpilledRows),
+        RuntimeCounter(saturateCast(rows)));
+    owner_.addRuntimeStat(
+        std::string(
+            leafSnapshot ? CudfGroupby::kSpilledLeaves
+                         : CudfGroupby::kSpilledInputChunks),
+        RuntimeCounter(1));
+  }
+
+  void recordRestore(
+      uint64_t bytes,
+      uint64_t rows,
+      uint64_t numSnapshots,
+      uint64_t numInputChunks) const {
+    owner_.addRuntimeStat(
+        std::string(CudfGroupby::kRestoredBytes),
+        RuntimeCounter(saturateCast(bytes), RuntimeCounter::Unit::kBytes));
+    owner_.addRuntimeStat(
+        std::string(CudfGroupby::kRestoredRows),
+        RuntimeCounter(saturateCast(rows)));
+    if (numSnapshots != 0) {
+      owner_.addRuntimeStat(
+          std::string(CudfGroupby::kRestoredLeaves),
+          RuntimeCounter(saturateCast(numSnapshots)));
+    }
+    if (numInputChunks != 0) {
+      owner_.addRuntimeStat(
+          std::string(CudfGroupby::kRestoredInputChunks),
+          RuntimeCounter(saturateCast(numInputChunks)));
+    }
+  }
+
+  // Sets 'grouped' to true only if the result is the output of a group-by
+  // over both inputs, which has one row for each key. An empty side returns
+  // the other side as it is and leaves 'grouped' as it was.
+  InputChunk mergeChunks(
+      InputChunk left,
+      InputChunk right,
+      bool& grouped) const {
+    if (left.empty()) {
+      return right;
+    }
+    if (right.empty()) {
+      return left;
+    }
+    owner_.addRuntimeStat("cudfGroupbyIntermediateMerges", RuntimeCounter(1));
+
+    auto stream = left.stream;
+    std::vector<cudf::table_view> views{left.view, right.view};
+    std::vector<cuda::stream_ref> inputStreams{left.stream, right.stream};
+    auto concatenatedTable =
+        concatenateViews(views, inputStreams, stream, get_temp_mr());
+
+    // The concatenation holds everything the group-by below needs. Release
+    // the two inputs first, so that they are not part of its peak, and wait
+    // for their frees, so that an allocation that starts arbitration sees
+    // the lower usage.
+    stream.sync();
+    views.clear();
+    left = InputChunk{};
+    right = InputChunk{};
+    for (auto inputStream : inputStreams) {
+      inputStream.sync();
+    }
+    auto merged = owner_.doGroupByAggregation(
+        concatenatedTable->view(),
+        owner_.groupingKeyOutputChannels_,
+        owner_.intermediateAggregators_,
+        owner_.bufferedResultType_,
+        stream,
+        get_output_mr());
+    if (!merged) {
+      return InputChunk{};
+    }
+    grouped = true;
+    return makeOwnedChunk(std::move(merged), owner_.bufferedResultType_);
+  }
+
+  CudfGroupby& owner_;
+  // True for a final step: input is appended to a leaf and a spilled leaf
+  // stays in host memory until it is drained.
+  const bool appendInputs_;
+  std::vector<cudf::size_type> keyIndices_;
+};
+
 column_index_t StreamingGroupbyAggregator::prepareColumn(
     cudf::table_view input,
     std::vector<cudf::column_view>& preparedColumns,
@@ -1721,6 +2552,8 @@ CudfGroupby::CudfGroupby(
           aggregationNode->step() == core::AggregationNode::Step::kSingle),
       maxPartialAggregationMemoryUsage_(
           driverCtx->queryConfig().maxPartialAggregationMemoryUsage()) {}
+
+CudfGroupby::~CudfGroupby() = default;
 
 bool CudfGroupby::initializeStreamingGroupby(
     const RowTypePtr& inputRowSchema,
@@ -2041,6 +2874,31 @@ void CudfGroupby::initialize() {
       aggregationInput.constants,
       aggregationInput.maskChannels);
 
+  // A final or single step that buffers its result can spill it when the
+  // query has a GPU pool and host spilling is on. Without either it buffers
+  // one merged result as before.
+  const bool isFinalOrSingleStep =
+      aggregationNode_->step() == core::AggregationNode::Step::kFinal ||
+      aggregationNode_->step() == core::AggregationNode::Step::kSingle;
+  if (incrementalAggregationEnabled_ && !streamingGroupbyEnabled_ &&
+      isFinalOrSingleStep && gpuPool() != nullptr) {
+    spillContext_ = cudfSpillContext(*operatorCtx_->task()->queryCtx());
+    if (spillContext_ != nullptr) {
+      const auto& cudfConfig = CudfConfig::getInstance();
+      const auto maxRowsPerLeaf = cudfConfig.batchSizeMaxThreshold.value_or(
+          std::numeric_limits<int32_t>::max());
+      VELOX_CHECK_GT(maxRowsPerLeaf, 0);
+      spillableState_ = std::make_unique<PartitionedBufferedState>(
+          std::make_unique<SpillableStateOps>(*this),
+          maxRowsPerLeaf,
+          kBufferedStateHashSeed,
+          [this](uint64_t bytes) noexcept {
+            publishGpuReclaimableEstimate(bytes);
+          },
+          cudfConfig.spillPartitionFanout);
+    }
+  }
+
   // Check that aggregate result type match the output type.
   // TODO: This is output schema validation. In velox CPU, it's done using
   // output types reported by aggregation functions. We can't do that in cudf
@@ -2212,6 +3070,12 @@ void CudfGroupby::doAddInput(RowVectorPtr input) {
     return;
   }
 
+  if (spillableState_) {
+    spillableState_->addInput(std::move(cudfInput));
+    maybeSelfSpill();
+    return;
+  }
+
   if (incrementalAggregationEnabled_) {
     if (isPartialOutput_) {
       computePartialGroupbyIncrementally(cudfInput);
@@ -2369,6 +3233,15 @@ RowVectorPtr CudfGroupby::doGetOutput() {
     return finalizeStreamingGroupby();
   }
 
+  // The spillable state yields one batch for each of its leaves.
+  if (spillableState_) {
+    auto result = spillableState_->drainNextOutput();
+    if (!result) {
+      finished_ = true;
+    }
+    return result;
+  }
+
   // Streaming finalization: single step uses finalAggregators_ to convert
   // intermediate results to final output; final step uses aggregators_.
   // At this point isPartialOutput_ is false (handled above) and noMoreInput_
@@ -2432,6 +3305,8 @@ void CudfGroupby::doClose() {
   streamingGroupbyAggregators_.clear();
   inputs_.clear();
   bufferedResult_.reset();
+  spillableState_.reset();
+  spillContext_.reset();
   aggregators_.clear();
   intermediateAggregators_.clear();
   partialAggregators_.clear();
@@ -2441,6 +3316,42 @@ void CudfGroupby::doClose() {
 
 bool CudfGroupby::isFinished() {
   return finished_;
+}
+
+bool CudfGroupby::gpuReclaimableBytes(uint64_t& reclaimableBytes) const {
+  reclaimableBytes = spillableState_ ? spillableState_->reclaimableBytes() : 0;
+  return reclaimableBytes != 0;
+}
+
+uint64_t CudfGroupby::spillGpu(uint64_t targetBytes) {
+  return spillableState_ ? spillableState_->reclaim(targetBytes) : 0;
+}
+
+void CudfGroupby::maybeSelfSpill() {
+  const auto& config = CudfConfig::getInstance();
+  const int64_t percent = config.groupbySelfSpillPercent;
+  auto* pool = gpuPool();
+  if (percent <= 0 || percent >= 100 || pool == nullptr) {
+    return;
+  }
+  const int64_t targetPercent = config.groupbySelfSpillTargetPercent > 0 &&
+          config.groupbySelfSpillTargetPercent < percent
+      ? config.groupbySelfSpillTargetPercent
+      : percent;
+  auto* root = pool->root();
+  const int64_t budget = root->maxCapacity();
+  const int64_t trigger = budget / 100 * percent;
+  const int64_t used = root->reservedBytes();
+  if (used <= trigger) {
+    return;
+  }
+  const int64_t target = budget / 100 * targetPercent;
+  const auto released =
+      spillableState_->reclaim(static_cast<uint64_t>(used - target));
+  addRuntimeStat("cudfGroupbySelfSpills", RuntimeCounter(1));
+  addRuntimeStat(
+      "cudfGroupbySelfSpillBytes",
+      RuntimeCounter(saturateCast(released), RuntimeCounter::Unit::kBytes));
 }
 
 } // namespace facebook::velox::cudf_velox

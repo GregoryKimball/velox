@@ -37,6 +37,12 @@ struct CudfConfig {
       "cudf.spill_host_memory_bytes"};
   static constexpr const char* kCudfSpillHostNumaNode{
       "cudf.spill_host_numa_node"};
+  static constexpr const char* kCudfSpillPartitionFanout{
+      "cudf.spill_partition_fanout"};
+  static constexpr const char* kCudfGroupbySelfSpillPercent{
+      "cudf.groupby_self_spill_percent"};
+  static constexpr const char* kCudfGroupbySelfSpillTargetPercent{
+      "cudf.groupby_self_spill_target_percent"};
   static constexpr const char* kCudfFunctionNamePrefix{
       "cudf.function_name_prefix"};
   static constexpr const char* kCudfAstExpressionEnabled{
@@ -154,6 +160,24 @@ struct CudfConfig {
   /// NUMA node of the pinned host memory for spilled data. Negative leaves the
   /// placement to CUDA.
   int32_t spillHostNumaNode{-1};
+
+  /// The least number of hash partitions a spillable group-by makes when one
+  /// of its leaves outgrows the row limit, from 2 to 1024. A wider split
+  /// partitions each buffered row fewer times.
+  int32_t spillPartitionFanout{64};
+
+  /// A spillable final group-by moves its largest leaves to host memory by
+  /// itself, from its driver thread, when the query's GPU pool is fuller than
+  /// this percentage of its capacity after an input. That is cheaper than
+  /// reaching the limit, which pauses the whole task to reclaim. Zero turns
+  /// this off.
+  int32_t groupbySelfSpillPercent{92};
+
+  /// How far a self-spill goes: down to this percentage of the query's GPU
+  /// capacity, which must not exceed groupbySelfSpillPercent. The gap leaves
+  /// room for the transient allocations of other operators between two
+  /// inputs.
+  int32_t groupbySelfSpillTargetPercent{86};
 
   /// Memory resource for output vectors. When set to a value different from
   /// memoryResource, a separate MR is created for output allocations.

@@ -48,9 +48,11 @@ add_library(
   GpuResources.cpp
   HostSpillBudget.cpp
   OperatorAdapters.cpp
+  PartitionedBufferedState.cpp
   PinnedSpillPool.cpp
   PrestoAggregateFunctions.cpp
   SparkAggregateFunctions.cpp
+  SpilledCudfVector.cpp
   ToCudf.cpp
   Utilities.cpp
   VeloxCudfInterop.cpp

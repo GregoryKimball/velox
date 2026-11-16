@@ -512,6 +512,28 @@ void CudfConfig::initialize(
   if (config.find(kCudfSpillHostNumaNode) != config.end()) {
     spillHostNumaNode = folly::to<int32_t>(config[kCudfSpillHostNumaNode]);
   }
+  if (config.find(kCudfSpillPartitionFanout) != config.end()) {
+    const auto fanout =
+        folly::to<int32_t>(config[kCudfSpillPartitionFanout]);
+    VELOX_USER_CHECK_GE(fanout, 2, "cudf.spill_partition_fanout is too small");
+    VELOX_USER_CHECK_LE(
+        fanout, 1024, "cudf.spill_partition_fanout is too large");
+    spillPartitionFanout = fanout;
+  }
+  if (config.find(kCudfGroupbySelfSpillPercent) != config.end()) {
+    const auto percent =
+        folly::to<int32_t>(config[kCudfGroupbySelfSpillPercent]);
+    VELOX_USER_CHECK_GE(percent, 0);
+    VELOX_USER_CHECK_LT(percent, 100);
+    groupbySelfSpillPercent = percent;
+  }
+  if (config.find(kCudfGroupbySelfSpillTargetPercent) != config.end()) {
+    const auto percent =
+        folly::to<int32_t>(config[kCudfGroupbySelfSpillTargetPercent]);
+    VELOX_USER_CHECK_GE(percent, 0);
+    VELOX_USER_CHECK_LT(percent, 100);
+    groupbySelfSpillTargetPercent = percent;
+  }
   if (config.find(kCudfOutputMr) != config.end()) {
     outputMemoryResource = config[kCudfOutputMr];
   }
