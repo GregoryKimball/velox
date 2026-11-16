@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfDefaultStreamOverload.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -29,6 +30,7 @@
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/managed_memory_resource.hpp>
+#include <rmm/mr/per_device_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
 #include <rmm/mr/prefetch_resource_adaptor.hpp>
 
@@ -46,6 +48,7 @@
 #include <optional>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 
 namespace facebook::velox::cudf_velox {
 
@@ -366,8 +369,201 @@ std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>> output_mr_;
 std::optional<rmm::mr::statistics_resource_adaptor> statsMr_;
 std::optional<rmm::mr::statistics_resource_adaptor> outputStatsMr_;
 
+namespace {
+
+thread_local std::optional<rmm::device_async_resource_ref> scopedTempMr;
+thread_local std::optional<rmm::device_async_resource_ref> scopedOutputMr;
+
+// Sends an allocation to the temporary resource of the scope active on the
+// allocating thread and remembers that resource until the deallocation, which
+// may run on another thread. Allocations outside a scope go to the fallback
+// and are not remembered.
+class ThreadLocalTemporaryMemoryResourceImpl {
+ public:
+  explicit ThreadLocalTemporaryMemoryResourceImpl(
+      cuda::mr::any_resource<cuda::mr::device_accessible> fallback)
+      : fallback_(std::move(fallback)) {}
+
+  void* allocate_sync(std::size_t bytes, std::size_t alignment) {
+    if (!scopedTempMr.has_value() || bytes == 0) {
+      return fallback_.allocate_sync(bytes, alignment);
+    }
+    cuda::mr::any_resource<cuda::mr::device_accessible> resource{
+        *scopedTempMr};
+    auto* pointer = resource.allocate_sync(bytes, alignment);
+    try {
+      rememberAllocation(pointer, resource);
+    } catch (...) {
+      resource.deallocate_sync(pointer, bytes, alignment);
+      throw;
+    }
+    return pointer;
+  }
+
+  void deallocate_sync(
+      void* pointer,
+      std::size_t bytes,
+      std::size_t alignment) noexcept {
+    if (auto resource = takeAllocation(pointer, bytes)) {
+      resource->deallocate_sync(pointer, bytes, alignment);
+      return;
+    }
+    fallback_.deallocate_sync(pointer, bytes, alignment);
+  }
+
+  void*
+  allocate(cuda::stream_ref stream, std::size_t bytes, std::size_t alignment) {
+    if (!scopedTempMr.has_value() || bytes == 0) {
+      return fallback_.allocate(stream, bytes, alignment);
+    }
+    cuda::mr::any_resource<cuda::mr::device_accessible> resource{
+        *scopedTempMr};
+    auto* pointer = resource.allocate(stream, bytes, alignment);
+    try {
+      rememberAllocation(pointer, resource);
+    } catch (...) {
+      resource.deallocate(stream, pointer, bytes, alignment);
+      throw;
+    }
+    return pointer;
+  }
+
+  void deallocate(
+      cuda::stream_ref stream,
+      void* pointer,
+      std::size_t bytes,
+      std::size_t alignment) noexcept {
+    if (auto resource = takeAllocation(pointer, bytes)) {
+      resource->deallocate(stream, pointer, bytes, alignment);
+      return;
+    }
+    fallback_.deallocate(stream, pointer, bytes, alignment);
+  }
+
+  bool operator==(
+      const ThreadLocalTemporaryMemoryResourceImpl& other) const noexcept {
+    return this == std::addressof(other);
+  }
+
+  bool operator!=(
+      const ThreadLocalTemporaryMemoryResourceImpl& other) const noexcept {
+    return !(*this == other);
+  }
+
+  friend void get_property(
+      const ThreadLocalTemporaryMemoryResourceImpl&,
+      cuda::mr::device_accessible) noexcept {}
+
+ private:
+  void rememberAllocation(
+      void* pointer,
+      const cuda::mr::any_resource<cuda::mr::device_accessible>& resource) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto inserted = allocations_.emplace(pointer, resource).second;
+    VELOX_CHECK(inserted, "Duplicate outstanding cuDF temporary allocation");
+    numRemembered_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  // Returns the scoped resource 'pointer' was allocated from and forgets it,
+  // or nullopt for a fallback allocation.
+  std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>>
+  takeAllocation(void* pointer, std::size_t bytes) noexcept {
+    // The address of a live scoped allocation cannot be handed out again by
+    // the fallback, so a miss here always means a fallback allocation.
+    if (bytes == 0 || numRemembered_.load(std::memory_order_relaxed) == 0) {
+      return std::nullopt;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = allocations_.find(pointer);
+    if (it == allocations_.end()) {
+      return std::nullopt;
+    }
+    auto resource = std::move(it->second);
+    allocations_.erase(it);
+    numRemembered_.fetch_sub(1, std::memory_order_relaxed);
+    return resource;
+  }
+
+  cuda::mr::any_resource<cuda::mr::device_accessible> fallback_;
+  std::mutex mutex_;
+  // The buffer that holds a scoped allocation owns this dispatcher. The entry
+  // owns the scoped resource the memory came from until it is freed.
+  std::unordered_map<void*, cuda::mr::any_resource<cuda::mr::device_accessible>>
+      allocations_;
+  std::atomic<uint64_t> numRemembered_{0};
+};
+
+class ThreadLocalTemporaryMemoryResource
+    : public cuda::mr::shared_resource<ThreadLocalTemporaryMemoryResourceImpl> {
+  using SharedBase =
+      cuda::mr::shared_resource<ThreadLocalTemporaryMemoryResourceImpl>;
+
+ public:
+  explicit ThreadLocalTemporaryMemoryResource(
+      cuda::mr::any_resource<cuda::mr::device_accessible> fallback)
+      : SharedBase(
+            cuda::mr::make_shared_resource<
+                ThreadLocalTemporaryMemoryResourceImpl>(std::move(fallback))) {}
+
+  friend void get_property(
+      const ThreadLocalTemporaryMemoryResource&,
+      cuda::mr::device_accessible) noexcept {}
+};
+
+static_assert(
+    cuda::mr::resource_with<
+        ThreadLocalTemporaryMemoryResource,
+        cuda::mr::device_accessible>);
+
+} // namespace
+
+rmm::device_async_resource_ref get_temp_mr() {
+  return scopedTempMr.has_value() ? *scopedTempMr
+                                  : rmm::mr::get_current_device_resource_ref();
+}
+
 rmm::device_async_resource_ref get_output_mr() {
+  if (scopedOutputMr.has_value()) {
+    return *scopedOutputMr;
+  }
   return output_mr_.value();
+}
+
+std::shared_ptr<void> get_memory_resource_owner() {
+  return CudfVector::threadAllocationOwner();
+}
+
+cuda::mr::any_resource<cuda::mr::device_accessible>
+createThreadLocalTemporaryMemoryResource(
+    cuda::mr::any_resource<cuda::mr::device_accessible> fallback) {
+  return ThreadLocalTemporaryMemoryResource{std::move(fallback)};
+}
+
+ScopedCudfMemoryResources::ScopedCudfMemoryResources(
+    rmm::device_async_resource_ref tempMr,
+    rmm::device_async_resource_ref outputMr)
+    : ScopedCudfMemoryResources(
+          tempMr,
+          outputMr,
+          CudfVector::threadAllocationOwner()) {}
+
+ScopedCudfMemoryResources::ScopedCudfMemoryResources(
+    rmm::device_async_resource_ref tempMr,
+    rmm::device_async_resource_ref outputMr,
+    std::shared_ptr<void> owner)
+    : installed_(true),
+      previousOwner_(
+          CudfVector::exchangeThreadAllocationOwner(std::move(owner))),
+      previousTempMr_(std::exchange(scopedTempMr, tempMr)),
+      previousOutputMr_(std::exchange(scopedOutputMr, outputMr)) {}
+
+ScopedCudfMemoryResources::~ScopedCudfMemoryResources() {
+  if (!installed_) {
+    return;
+  }
+  scopedOutputMr = previousOutputMr_;
+  scopedTempMr = previousTempMr_;
+  CudfVector::exchangeThreadAllocationOwner(std::move(previousOwner_));
 }
 
 int64_t cudfAllocatedBytes() {

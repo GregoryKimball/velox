@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
+#include "velox/experimental/cudf/exec/CudfMemoryArbitration.h"
 #include "velox/experimental/cudf/exec/CudfNestedLoopJoin.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
 #include "velox/experimental/cudf/exec/GpuCapabilities.h"
@@ -374,7 +375,43 @@ void registerCudf() {
   // cudfAllocatedBytes() can report live device memory.
   statsMr_.emplace(std::move(base));
   mr_ = statsMr_.value();
-  cudf::set_current_device_resource(mr_.value());
+  // cuDF APIs without a temporary-resource parameter allocate from the
+  // current device resource. The dispatcher sends those allocations to the
+  // resources of the operator that is running on the allocating thread, and
+  // to 'mr_' when there is none.
+  cudf::set_current_device_resource(
+      createThreadLocalTemporaryMemoryResource(mr_.value()));
+
+  // The process GPU resource query GPU pools are arbitrated under. It is
+  // created once per process. A later registration keeps its capacity, since
+  // device memory still held from before would shrink a recomputed default.
+  {
+    const auto& config = CudfConfig::getInstance();
+    VELOX_USER_CHECK_GE(config.memoryPercent, 1);
+    VELOX_USER_CHECK_LE(config.memoryPercent, 100);
+    size_t freeBytes{0};
+    size_t totalBytes{0};
+    VELOX_CHECK_EQ(
+        static_cast<int>(cudaSuccess),
+        static_cast<int>(cudaMemGetInfo(&freeBytes, &totalBytes)),
+        "Failed to read the free device memory");
+    const auto existingResource = cudfCustomMemoryResource();
+    VELOX_USER_CHECK(
+        existingResource || config.memoryLimitBytes <= freeBytes,
+        "cudf.memory_limit_bytes exceeds the free GPU memory: {} > {}",
+        config.memoryLimitBytes,
+        freeBytes);
+    const auto gpuCapacity = existingResource
+        ? existingResource->maxCapacity()
+        : config.memoryLimitBytes != 0
+        ? static_cast<int64_t>(config.memoryLimitBytes)
+        : static_cast<int64_t>(
+              freeBytes * static_cast<uint64_t>(config.memoryPercent) / 100);
+    registerCudfMemoryResource(gpuCapacity);
+    LOG(INFO) << "cuDF GPU memory budget: capacity_bytes=" << gpuCapacity
+              << " startup_free_bytes=" << freeBytes
+              << " physical_total_bytes=" << totalBytes;
+  }
 
   const auto& outputMrMode = CudfConfig::getInstance().outputMemoryResource;
   if (!outputMrMode.empty() && outputMrMode != mrMode) {
@@ -457,6 +494,9 @@ void CudfConfig::initialize(
   }
   if (config.find(kCudfMemoryPercent) != config.end()) {
     memoryPercent = folly::to<int32_t>(config[kCudfMemoryPercent]);
+  }
+  if (config.find(kCudfMemoryLimitBytes) != config.end()) {
+    memoryLimitBytes = folly::to<uint64_t>(config[kCudfMemoryLimitBytes]);
   }
   if (config.find(kCudfOutputMr) != config.end()) {
     outputMemoryResource = config[kCudfOutputMr];

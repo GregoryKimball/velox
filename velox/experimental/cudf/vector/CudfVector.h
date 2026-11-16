@@ -43,7 +43,9 @@ namespace facebook::velox::cudf_velox {
 // constructing or rebinding a CudfVector.
 class CudfVector : public RowVector {
  public:
-  /// Constructs a CudfVector from an owned cudf::table.
+  /// Constructs a CudfVector from an owned cudf::table. The vector retains
+  /// 'allocationOwner', or threadAllocationOwner() when it is null, for as
+  /// long as it holds the table.
   /// The table's buffers are freed on 'stream', or on the stream passed to a
   /// later rebindStream().
   CudfVector(
@@ -51,7 +53,8 @@ class CudfVector : public RowVector {
       TypePtr type,
       vector_size_t size,
       std::unique_ptr<cudf::table>&& table,
-      cuda::stream_ref stream);
+      cuda::stream_ref stream,
+      std::shared_ptr<void> allocationOwner = nullptr);
 
   /// Constructs a CudfVector from packed_table.
   /// The packed data is retained and tabView_ references the table view inside
@@ -63,7 +66,17 @@ class CudfVector : public RowVector {
       TypePtr type,
       vector_size_t size,
       std::unique_ptr<cudf::packed_table>&& packedTable,
-      cuda::stream_ref stream);
+      cuda::stream_ref stream,
+      std::shared_ptr<void> allocationOwner = nullptr);
+
+  /// Returns what a vector constructed on this thread retains besides its
+  /// table, or nullptr. The device memory resources that are in effect on the
+  /// thread set it to whatever must outlive memory allocated from them.
+  static std::shared_ptr<void> threadAllocationOwner();
+
+  /// Replaces threadAllocationOwner() and returns the previous value.
+  static std::shared_ptr<void> exchangeThreadAllocationOwner(
+      std::shared_ptr<void> owner);
 
   cuda::stream_ref stream() const {
     return stream_;
@@ -86,8 +99,21 @@ class CudfVector : public RowVector {
 
   uint64_t estimateFlatSize() const override;
 
+  /// Returns true if the vector holds a table it owns. release() then moves
+  /// the table out. For a packed table release() copies it on the device,
+  /// which is not safe to start while memory is being reclaimed.
+  bool hasOwnedTable() const;
+
  private:
   uint64_t retainedSizeImpl(uint64_t& totalStringBufferSize) const override;
+
+  // Declared before the table storage so that they are destroyed after the
+  // table's buffers.
+  std::shared_ptr<void> allocationOwner_;
+  // RowVector keeps only a raw pointer to its pool. A vector that is parked
+  // off the device or handed to another operator can outlive the operator
+  // whose pool it was made with.
+  std::shared_ptr<velox::memory::MemoryPool> cpuPoolOwner_;
 
   // Storage for either an owned table or packed table.
   // Only one is active at a time - using variant enforces this at compile time.

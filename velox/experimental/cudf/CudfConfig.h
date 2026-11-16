@@ -31,6 +31,8 @@ struct CudfConfig {
   static constexpr const char* kCudfDebugEnabled{"cudf.debug_enabled"};
   static constexpr const char* kCudfMemoryResource{"cudf.memory_resource"};
   static constexpr const char* kCudfMemoryPercent{"cudf.memory_percent"};
+  static constexpr const char* kCudfMemoryLimitBytes{
+      "cudf.memory_limit_bytes"};
   static constexpr const char* kCudfFunctionNamePrefix{
       "cudf.function_name_prefix"};
   static constexpr const char* kCudfAstExpressionEnabled{
@@ -131,6 +133,13 @@ struct CudfConfig {
   /// The initial percent of GPU memory to allocate for pool or arena memory
   /// resources.
   int32_t memoryPercent{50};
+
+  /// Capacity in bytes of the process GPU memory resource that query GPU pools
+  /// are arbitrated under. Zero takes memoryPercent of the device memory free
+  /// at registration. A nonzero value must not exceed that free memory. Only
+  /// queries that were given a GPU pool with attachCudfMemoryPool() are
+  /// accounted against it.
+  uint64_t memoryLimitBytes{0};
 
   /// Memory resource for output vectors. When set to a value different from
   /// memoryResource, a separate MR is created for output allocations.
