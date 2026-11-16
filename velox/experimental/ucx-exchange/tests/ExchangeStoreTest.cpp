@@ -487,6 +487,51 @@ TEST_F(ExchangeStoreTest, restoresDeviceTierOnceItHoldsNoTables) {
   EXPECT_EQ(store.stats().hostBytes, 0);
 }
 
+TEST_F(ExchangeStoreTest, releasesHostPoolAfterAnIdlePeriodWithoutSpill) {
+  const auto input = makeInput();
+  const auto type = asRowType(input->type());
+  auto payloads = pack(input, {300, 700}, compressions().back());
+  ExchangeStore store;
+  store.setDeviceCapacity(0);
+
+  // A query spills to the host tier. A check while its table is held keeps
+  // the pool.
+  ASSERT_TRUE(
+      store.add("query1_table", "0", std::move(payloads[0]), 300, {}, stream_));
+  const auto poolBytes = store.stats().hostPoolBytes;
+  ASSERT_GT(poolBytes, 0);
+  store.releaseHostPoolIfUnused();
+  EXPECT_EQ(store.stats().hostPoolBytes, poolBytes);
+
+  // The check after the query keeps it too, and so does the check after the
+  // next run that spills: each run would otherwise pin it again.
+  takeRows(store, "query1_table", "0", type);
+  store.releaseHostPoolIfUnused();
+  EXPECT_EQ(store.stats().hostPoolBytes, poolBytes);
+  ASSERT_TRUE(
+      store.add("query2_table", "0", std::move(payloads[1]), 400, {}, stream_));
+  takeRows(store, "query2_table", "0", type);
+  store.releaseHostPoolIfUnused();
+  EXPECT_EQ(store.stats().hostPoolBytes, poolBytes);
+
+  // After a period without a spill, the pool goes back to the host.
+  store.releaseHostPoolIfUnused();
+  EXPECT_EQ(store.stats().hostPoolBytes, 0);
+
+  // A later spill gets a new pool.
+  ASSERT_TRUE(store.add(
+      "query3_table",
+      "0",
+      std::move(payloads[2]),
+      kNumRows - 700,
+      {},
+      stream_));
+  const auto rows = takeRows(store, "query3_table", "0", type);
+  ASSERT_EQ(rows.size(), 1);
+  velox::test::assertEqualVectors(
+      expectedRows(input, 700, kNumRows - 700), rows[0]);
+}
+
 TEST_F(ExchangeStoreTest, takeOrWaitStreamsATableWhileItIsWritten) {
   const auto input = makeInput();
   auto payloads = pack(input, {500}, compressions().back());

@@ -49,7 +49,8 @@ namespace facebook::velox::ucx_exchange {
 /// device tier is below its capacity and is moved to pinned host memory
 /// otherwise. Nothing is written to disk: adding a payload that fits in neither
 /// tier fails. The host tier has a pinned memory pool of its own, which grows
-/// in large blocks.
+/// in large blocks and goes back to the host after an idle period without a
+/// spill (releaseHostPoolIfUnused()).
 class ExchangeStore {
  public:
   /// How the columns of a payload were encoded before packing.
@@ -181,6 +182,13 @@ class ExchangeStore {
   /// releaseDeviceMemory() in GpuResources.h).
   std::size_t demote(std::size_t bytes);
 
+  /// Releases the host tier's pinned pool when the store holds no tables and no
+  /// payload went to the host tier since the previous call that found the
+  /// store empty. Called at the worker's idle points: pinning host memory is
+  /// slow, so the runs of queries that spill keep the pool, and the first idle
+  /// point after a period without a spill returns it to the host.
+  void releaseHostPoolIfUnused();
+
   struct Stats {
     /// Payload bytes in each tier, keys included.
     uint64_t deviceBytes{0};
@@ -203,7 +211,7 @@ class ExchangeStore {
   // Pinned host memory from the host tier's pool.
   class HostBuffer {
    public:
-    HostBuffer(HostPool& pool, std::size_t bytes);
+    HostBuffer(std::shared_ptr<HostPool> pool, std::size_t bytes);
     ~HostBuffer();
     HostBuffer(const HostBuffer&) = delete;
     HostBuffer& operator=(const HostBuffer&) = delete;
@@ -223,15 +231,17 @@ class ExchangeStore {
     void orderReadsOn(cuda::stream_ref stream) const;
 
    private:
-    HostPool& pool_;
+    // Keeps the pool alive after the store released it, until this buffer
+    // returns to it.
+    const std::shared_ptr<HostPool> pool_;
     void* data_;
     const std::size_t bytes_;
     cudaEvent_t written_{nullptr};
   };
 
-  // Returns the host tier's pool, creating it on first use. Called with
-  // 'mutex_' held.
-  HostPool& hostPool();
+  // Returns the host tier's pool, creating it on first use after the store was
+  // created or the pool released. Called with 'mutex_' held.
+  std::shared_ptr<HostPool> hostPool();
 
   // A payload's metadata, which names its codec, its data in exactly one of
   // the tiers, and the encoding of its columns.
@@ -289,8 +299,11 @@ class ExchangeStore {
   bool isDropped(std::string_view table) const;
 
   mutable std::mutex mutex_;
-  // Declared before 'tables_' so that it outlives the host buffers.
-  std::unique_ptr<HostPool> hostPool_;
+  // Shared with the host buffers allocated from it.
+  std::shared_ptr<HostPool> hostPool_;
+  // Whether a payload went to the host tier since releaseHostPoolIfUnused()
+  // last found the store empty.
+  bool hostTierUsed_{false};
   folly::F14FastMap<std::string, Table> tables_;
   // The queries dropQuery() dropped most recently, oldest first.
   std::deque<std::string> droppedQueries_;

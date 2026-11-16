@@ -52,9 +52,11 @@ struct ExchangeStore::HostPool {
   rmm::mr::pool_memory_resource pool;
 };
 
-ExchangeStore::HostBuffer::HostBuffer(HostPool& pool, std::size_t bytes)
-    : pool_(pool),
-      data_(pool.pool.allocate(
+ExchangeStore::HostBuffer::HostBuffer(
+    std::shared_ptr<HostPool> pool,
+    std::size_t bytes)
+    : pool_(std::move(pool)),
+      data_(pool_->pool.allocate(
           hostPoolStream(), bytes, rmm::CUDA_ALLOCATION_ALIGNMENT)),
       bytes_(bytes) {}
 
@@ -67,7 +69,7 @@ ExchangeStore::HostBuffer::~HostBuffer() {
         << cudaGetErrorString(status);
     cudaEventDestroy(written_);
   }
-  pool_.pool.deallocate(
+  pool_->pool.deallocate(
       hostPoolStream(), data_, bytes_, rmm::CUDA_ALLOCATION_ALIGNMENT);
 }
 
@@ -88,11 +90,11 @@ ExchangeStore::ExchangeStore() = default;
 
 ExchangeStore::~ExchangeStore() = default;
 
-ExchangeStore::HostPool& ExchangeStore::hostPool() {
+std::shared_ptr<ExchangeStore::HostPool> ExchangeStore::hostPool() {
   if (hostPool_ == nullptr) {
-    hostPool_ = std::make_unique<HostPool>();
+    hostPool_ = std::make_shared<HostPool>();
   }
-  return *hostPool_;
+  return hostPool_;
 }
 
 ExchangeStore& ExchangeStore::instance() {
@@ -147,12 +149,13 @@ bool ExchangeStore::place(StoredPayload& stored, cuda::stream_ref stream) {
   // A payload without data, such as one with no columns, takes no memory and
   // stays in the device tier.
   bool toHost;
-  HostPool* pool = nullptr;
+  std::shared_ptr<HostPool> pool;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     toHost = stored.bytes > 0 && deviceBytes_ + stored.bytes > deviceCapacity_;
     if (toHost) {
-      pool = &hostPool();
+      pool = hostPool();
+      hostTierUsed_ = true;
       VELOX_CHECK_LE(
           stored.bytes,
           hostCapacity_ - hostBytes_,
@@ -166,7 +169,7 @@ bool ExchangeStore::place(StoredPayload& stored, cuda::stream_ref stream) {
   }
 
   if (toHost) {
-    stored.host = std::make_unique<HostBuffer>(*pool, stored.bytes);
+    stored.host = std::make_unique<HostBuffer>(std::move(pool), stored.bytes);
     CUDF_CUDA_TRY(cudaMemcpyAsync(
         stored.host->data(),
         stored.device->data(),
@@ -559,6 +562,7 @@ std::size_t ExchangeStore::demote(std::size_t bytes) {
         }
         // The payload's device data is complete (see add()).
         payload.host = std::make_unique<HostBuffer>(hostPool(), payload.bytes);
+        hostTierUsed_ = true;
         CUDF_CUDA_TRY(cudaMemcpy(
             payload.host->data(),
             payload.device->data(),
@@ -584,6 +588,21 @@ std::size_t ExchangeStore::demote(std::size_t bytes) {
                  << " bytes";
   }
   return moved;
+}
+
+void ExchangeStore::releaseHostPoolIfUnused() {
+  // Destroyed after 'mutex_' is unlocked: freeing pinned memory is slow.
+  std::shared_ptr<HostPool> released;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!tables_.empty()) {
+      return;
+    }
+    if (!hostTierUsed_) {
+      released = std::move(hostPool_);
+    }
+    hostTierUsed_ = false;
+  }
 }
 
 ExchangeStore::Stats ExchangeStore::stats() const {

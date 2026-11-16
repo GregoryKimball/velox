@@ -1225,20 +1225,33 @@ class ExchangeStoreTaskListener : public exec::TaskListener {
       exec::TaskStats /*stats*/) override {
     // Completes the tables this task wrote, waking readers that wait for them.
     ExchangeStore::instance().endWrites(taskId);
-    if (state == exec::TaskState::kFinished) {
-      logOccupancy(taskId, state);
-      return;
-    }
-    // A Presto task id starts with the query id, which every temporary table
-    // name of the query contains.
-    const auto queryId = std::string_view{taskId}.substr(0, taskId.find('.'));
-    if (!queryId.empty()) {
-      ExchangeStore::instance().dropQuery(queryId);
+    if (state != exec::TaskState::kFinished) {
+      // A Presto task id starts with the query id, which every temporary table
+      // name of the query contains.
+      const auto queryId =
+          std::string_view{taskId}.substr(0, taskId.find('.'));
+      if (!queryId.empty()) {
+        ExchangeStore::instance().dropQuery(queryId);
+      }
     }
     logOccupancy(taskId, state);
+    if (isWorkerIdle()) {
+      ExchangeStore::instance().releaseHostPoolIfUnused();
+    }
   }
 
  private:
+  // Whether no task runs on this worker, as in the busy periods that
+  // MemoryPeakLogger reports.
+  static bool isWorkerIdle() {
+    for (const auto& task : exec::Task::getRunningTasks()) {
+      if (task->isRunning()) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   // What a query leaves in the store shows here: the next query has that much
   // less memory.
   static void logOccupancy(const std::string& taskId, exec::TaskState state) {
