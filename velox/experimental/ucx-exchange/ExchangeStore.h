@@ -117,7 +117,12 @@ class ExchangeStore {
   /// the device, in the order in which they were added. Payloads in the host
   /// tier, and the keys they refer to, are copied to device memory from 'mr'
   /// on 'stream'. Returns nothing for a file without payloads. Adds what it
-  /// took from each tier to 'stats' when given.
+  /// took from each tier to 'stats' when given. With 'minRows', takes the
+  /// first payloads that hold at least that many rows and leaves the others
+  /// in the store, in their tier, for the next call.
+  /// take() without a row limit.
+  static constexpr uint64_t kAllRows = std::numeric_limits<uint64_t>::max();
+
   struct TakeStats {
     uint64_t deviceBytes{0};
     uint64_t hostBytes{0};
@@ -130,7 +135,8 @@ class ExchangeStore {
       std::string_view file,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr,
-      TakeStats* stats = nullptr);
+      TakeStats* stats = nullptr,
+      uint64_t minRows = kAllRows);
 
   /// Records that the task 'taskId' writes 'table' on this worker. The table
   /// is complete once every task that began writing it has ended its writes
@@ -148,14 +154,16 @@ class ExchangeStore {
   /// complete (the files got no rows or were taken already); and std::nullopt
   /// with 'future' set when there are none yet: it completes on the table's
   /// next payload or when the table completes. Several readers may read the
-  /// same files: each payload goes to one of them.
+  /// same files: each payload goes to one of them. 'minRows' limits what one
+  /// call takes as in take().
   std::optional<std::vector<TakenPayload>> takeOrWait(
       std::string_view table,
       const std::vector<std::string>& files,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr,
       ContinueFuture& future,
-      TakeStats* stats = nullptr);
+      TakeStats* stats = nullptr,
+      uint64_t minRows = kAllRows);
 
   /// Frees the payloads of every file of 'table' that was not taken.
   void drop(std::string_view table);

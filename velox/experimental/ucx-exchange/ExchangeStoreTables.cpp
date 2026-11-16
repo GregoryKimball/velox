@@ -933,9 +933,10 @@ class ExchangeStoreDataSource : public connector::DataSource {
     allColumns_ = columns_ == allColumns;
   }
 
-  // Takes the payloads of the split's files written so far. A file that is
-  // still being written (its table is read while the producer runs) is read
-  // further in next(), which waits for the rest.
+  // Takes the first batch of the payloads of the split's files written so far
+  // (see takeMore()). The rest, and a file that is still being written (its
+  // table is read while the producer runs), are read in next(), which waits
+  // for what is not written yet.
   void addSplit(std::shared_ptr<connector::ConnectorSplit> split) override {
     VELOX_CHECK_EQ(next_, payloads_.size(), "The previous split is not done");
     std::string file;
@@ -998,8 +999,8 @@ class ExchangeStoreDataSource : public connector::DataSource {
   }
 
   // Takes over a source that the scan created to preload the next split. Its
-  // addSplit() has already taken the split's payloads from the store and
-  // copied the host tier's ones to the device.
+  // addSplit() has already taken the split's first batch from the store and
+  // copied the host tier's payloads of it to the device.
   void setFromDataSource(std::unique_ptr<DataSource> source) override {
     auto* preloaded = dynamic_cast<ExchangeStoreDataSource*>(source.get());
     VELOX_CHECK_NOT_NULL(preloaded);
@@ -1111,12 +1112,21 @@ class ExchangeStoreDataSource : public connector::DataSource {
         pool_, outputType_, numRows, std::move(table), stream_);
   }
 
-  // Replaces the taken payloads with the next ones of the split's file. Returns
-  // false with 'future' set when the file has none yet and is still being
-  // written; sets splitDone_ when it has none and is complete.
+  // Replaces the taken payloads with the next ones of the split's files, one
+  // batch of CudfConfig::batchSizeMinThreshold rows: the others stay in the
+  // store, which can still move them to host memory, so the scan holds one
+  // batch on the device instead of the whole split. Returns false with
+  // 'future' set when the files have none yet and are still being written;
+  // sets splitDone_ when they have none and are complete.
   bool takeMore(ContinueFuture& future) {
     auto taken = ExchangeStore::instance().takeOrWait(
-        table_, files_, stream_, cudf_velox::get_output_mr(), future, &takeStats_);
+        table_,
+        files_,
+        stream_,
+        cudf_velox::get_output_mr(),
+        future,
+        &takeStats_,
+        cudf_velox::CudfConfig::getInstance().batchSizeMinThreshold);
     if (!taken.has_value()) {
       return false;
     }

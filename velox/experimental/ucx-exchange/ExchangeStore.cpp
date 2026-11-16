@@ -247,7 +247,8 @@ std::vector<ExchangeStore::TakenPayload> ExchangeStore::take(
     std::string_view file,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr,
-    TakeStats* stats) {
+    TakeStats* stats,
+    uint64_t minRows) {
   std::vector<StoredPayload> payloads;
   // The keys each payload refers to, in its column order.
   std::vector<std::vector<std::shared_ptr<const StoredPayload>>> payloadKeys;
@@ -262,8 +263,23 @@ std::vector<ExchangeStore::TakenPayload> ExchangeStore::take(
     if (it == files.end()) {
       return {};
     }
-    payloads = std::move(it->second);
-    files.erase(it);
+    // The first payloads that hold 'minRows' rows, at least one.
+    auto& filePayloads = it->second;
+    size_t count = 0;
+    for (uint64_t rows = 0;
+         count < filePayloads.size() && (count == 0 || rows < minRows);
+         ++count) {
+      rows += filePayloads[count].numRows;
+    }
+    if (count == filePayloads.size()) {
+      payloads = std::move(filePayloads);
+      files.erase(it);
+    } else {
+      payloads.assign(
+          std::make_move_iterator(filePayloads.begin()),
+          std::make_move_iterator(filePayloads.begin() + count));
+      filePayloads.erase(filePayloads.begin(), filePayloads.begin() + count);
+    }
     forget(payloads);
     auto& tableKeys = tableIt->second.keys;
     for (const auto& payload : payloads) {
@@ -428,7 +444,8 @@ ExchangeStore::takeOrWait(
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr,
     ContinueFuture& future,
-    TakeStats* stats) {
+    TakeStats* stats,
+    uint64_t minRows) {
   for (;;) {
     std::vector<std::string_view> written;
     {
@@ -460,9 +477,16 @@ ExchangeStore::takeOrWait(
       }
     }
     std::vector<TakenPayload> result;
+    uint64_t rows = 0;
     for (const auto file : written) {
-      auto taken = take(table, file, stream, mr, stats);
-      std::move(taken.begin(), taken.end(), std::back_inserter(result));
+      if (rows >= minRows) {
+        break;
+      }
+      auto taken = take(table, file, stream, mr, stats, minRows - rows);
+      for (auto& payload : taken) {
+        rows += payload.data->numRows;
+        result.push_back(std::move(payload));
+      }
     }
     // Another reader of the same files may have taken them in between.
     if (!result.empty()) {

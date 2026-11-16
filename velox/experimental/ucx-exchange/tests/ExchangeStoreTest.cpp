@@ -149,17 +149,20 @@ class ExchangeStoreTest : public testing::Test,
     std::vector<RowVectorPtr> rows;
     for (auto& taken :
          store.take(table, file, stream_, memoryResource(), stats)) {
-      EXPECT_THAT(taken.encoding.columns, testing::IsEmpty());
-      auto& payload = taken.data;
-      joinExchangeLanes(*payload, memoryResource());
-      const auto view = payload->table != nullptr
-          ? payload->table->view()
-          : payload->packedTable->table;
-      rows.push_back(
-          cudf_velox::with_arrow::toVeloxColumn(
-              view, pool(), type, "", stream_, memoryResource()));
+      rows.push_back(toRows(taken, type));
     }
     return rows;
+  }
+
+  // Converts a taken payload to a Velox vector of 'type'.
+  RowVectorPtr toRows(ExchangeStore::TakenPayload& taken, const RowTypePtr& type) {
+    EXPECT_THAT(taken.encoding.columns, testing::IsEmpty());
+    auto& payload = taken.data;
+    joinExchangeLanes(*payload, memoryResource());
+    const auto view = payload->table != nullptr ? payload->table->view()
+                                                : payload->packedTable->table;
+    return cudf_velox::with_arrow::toVeloxColumn(
+        view, pool(), type, "", stream_, memoryResource());
   }
 
   rmm::cuda_stream stream_;
@@ -585,6 +588,45 @@ TEST_F(ExchangeStoreTest, takeOrWaitTakesAnyFileOfASet) {
   ASSERT_TRUE(done.has_value());
   EXPECT_THAT(*done, testing::IsEmpty());
   EXPECT_EQ(store.stats().payloads, 1);
+}
+
+TEST_F(ExchangeStoreTest, takeOrWaitTakesAFileABatchAtATime) {
+  // A reader asks for a batch of 300 rows from a file of five 200-row
+  // payloads. Each call returns the next payloads in order until they hold 300
+  // rows, and the others stay in the store until the reader asks again.
+  const auto input = makeInput();
+  const auto type = asRowType(input->type());
+  auto payloads = pack(input, {200, 400, 600, 800}, compressions().back());
+  ExchangeStore store;
+  store.setDeviceCapacity(kUnlimited);
+  store.beginWrite("table", "query.1.0.0.0");
+  for (auto& payload : payloads) {
+    store.add("table", "0", std::move(payload), 200, {}, stream_);
+  }
+  store.endWrites("query.1.0.0.0");
+
+  std::vector<size_t> taken;
+  std::vector<uint64_t> kept;
+  vector_size_t offset = 0;
+  auto future = ContinueFuture::makeEmpty();
+  for (;;) {
+    auto batch = store.takeOrWait(
+        "table", {"0"}, stream_, memoryResource(), future, nullptr, 300);
+    ASSERT_TRUE(batch.has_value());
+    if (batch->empty()) {
+      break;
+    }
+    taken.push_back(batch->size());
+    kept.push_back(store.stats().payloads);
+    for (auto& payload : *batch) {
+      velox::test::assertEqualVectors(
+          expectedRows(input, offset, 200), toRows(payload, type));
+      offset += 200;
+    }
+  }
+  EXPECT_THAT(taken, testing::ElementsAre(2, 2, 1));
+  EXPECT_THAT(kept, testing::ElementsAre(3, 1, 0));
+  EXPECT_EQ(offset, kNumRows);
 }
 
 TEST_F(ExchangeStoreTest, dropWakesReadersWaitingForTheTable) {
