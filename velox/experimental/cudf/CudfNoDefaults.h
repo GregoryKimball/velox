@@ -47,10 +47,8 @@ __attribute__((
     error("cudf default stream argument used. Pass stream explicitly."),
     noinline)) cuda::stream_ref const get_default_stream();
 
-__attribute__((
-    error("cudf default memory resource argument used. Pass mr explicitly."),
-    noinline)) rmm::device_async_resource_ref
-get_current_device_resource_ref();
+// No mr guard: cudf::memory_resources captures the current resource for
+// temporaries even when the output mr is passed explicitly.
 
 #endif
 

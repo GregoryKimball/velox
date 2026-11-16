@@ -26,6 +26,22 @@ namespace facebook::velox::exec::test {
 
 namespace {
 
+/// Parses literals such as 0.05 as DECIMAL so they compare with DECIMAL columns.
+const parse::ParseOptions& decimalParseOptions() {
+  static const parse::ParseOptions options = [] {
+    parse::ParseOptions result;
+    result.parseDecimalAsDouble = false;
+    return result;
+  }();
+  return options;
+}
+
+/// Q11's FRACTION is 0.0001 / SF. TPCH_Q11_FRACTION overrides the SF1 value.
+std::string q11Fraction() {
+  const char* fraction = std::getenv("TPCH_Q11_FRACTION");
+  return fraction != nullptr ? fraction : "0.0001";
+}
+
 /// DWRF does not support Date type and Varchar is used.
 /// Return the Date filter expression as per data format.
 std::string formatDateFilter(
@@ -221,6 +237,7 @@ TpchPlan TpchQueryBuilder::getQ1Plan() const {
 
   auto plan =
       PlanBuilder(pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kLineitem, selectedRowType, fileColumnNames, {filter})
           .captureScanNodeId(lineitemPlanNodeId)
@@ -306,6 +323,7 @@ TpchPlan TpchQueryBuilder::getQ2Plan() const {
   core::PlanNodeId regionScanId;
 
   auto regionSubQuery = PlanBuilder(planNodeIdGenerator)
+.setParseOptions(decimalParseOptions())
                             .filtersAsNode(filtersAsNode_)
                             .tableScan(
                                 kRegion,
@@ -317,6 +335,7 @@ TpchPlan TpchQueryBuilder::getQ2Plan() const {
 
   auto nationJoinRegionSubQuery =
       PlanBuilder(planNodeIdGenerator)
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(
               kNation, nationSelectedRowTypeSubQuery, nationFileColumnsSubQuery)
@@ -331,6 +350,7 @@ TpchPlan TpchQueryBuilder::getQ2Plan() const {
 
   auto supplierJoinNationJoinRegionSubQuery =
       PlanBuilder(planNodeIdGenerator)
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(
               kSupplier,
@@ -346,6 +366,7 @@ TpchPlan TpchQueryBuilder::getQ2Plan() const {
           .planNode();
 
   auto part = PlanBuilder(planNodeIdGenerator)
+.setParseOptions(decimalParseOptions())
                   .filtersAsNode(filtersAsNode_)
                   .tableScan(
                       kPart,
@@ -358,6 +379,7 @@ TpchPlan TpchQueryBuilder::getQ2Plan() const {
                   .planNode();
 
   auto region = PlanBuilder(planNodeIdGenerator)
+.setParseOptions(decimalParseOptions())
                     .filtersAsNode(filtersAsNode_)
                     .tableScan(
                         kRegion,
@@ -369,6 +391,7 @@ TpchPlan TpchQueryBuilder::getQ2Plan() const {
 
   auto nationJoinRegion =
       PlanBuilder(planNodeIdGenerator)
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kNation, nationSelectedRowType, nationFileColumns)
           .captureScanNodeId(nationScanId)
@@ -382,6 +405,7 @@ TpchPlan TpchQueryBuilder::getQ2Plan() const {
 
   auto supplierJoinNationJoinRegion =
       PlanBuilder(planNodeIdGenerator)
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kSupplier, supplierSelectedRowType, supplierFileColumns)
           .captureScanNodeId(supplierScanId)
@@ -395,6 +419,7 @@ TpchPlan TpchQueryBuilder::getQ2Plan() const {
 
   auto partsuppJoinPartJoinSupplierJoinNationJoinRegion =
       PlanBuilder(planNodeIdGenerator)
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kPartsupp, partsuppSelectedRowType, partsuppFileColumns)
           .captureScanNodeId(partsuppScanId)
@@ -416,6 +441,7 @@ TpchPlan TpchQueryBuilder::getQ2Plan() const {
 
   auto plan =
       PlanBuilder(planNodeIdGenerator)
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kPartsupp, partsuppSelectedRowType, partsuppFileColumns)
           .captureScanNodeId(partsuppScanIdSubQuery)
@@ -492,6 +518,7 @@ TpchPlan TpchQueryBuilder::getQ3Plan() const {
   core::PlanNodeId customerPlanNodeId;
 
   auto customers = PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
                        .filtersAsNode(filtersAsNode_)
                        .tableScan(
                            kCustomer,
@@ -503,6 +530,7 @@ TpchPlan TpchQueryBuilder::getQ3Plan() const {
 
   auto custkeyJoinNode =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .filtersAsNode(filtersAsNode_)
           .tableScan(
@@ -521,6 +549,7 @@ TpchPlan TpchQueryBuilder::getQ3Plan() const {
 
   auto plan =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(
               kLineitem,
@@ -575,6 +604,7 @@ TpchPlan TpchQueryBuilder::getQ4Plan() const {
   core::PlanNodeId ordersPlanNodeId;
 
   auto orders = PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
                     .filtersAsNode(filtersAsNode_)
                     .tableScan(
                         kOrders,
@@ -586,6 +616,7 @@ TpchPlan TpchQueryBuilder::getQ4Plan() const {
 
   auto plan =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(
               kLineitem,
@@ -655,6 +686,7 @@ TpchPlan TpchQueryBuilder::getQ5Plan() const {
   core::PlanNodeId regionScanNodeId;
 
   auto region = PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
                     .filtersAsNode(filtersAsNode_)
                     .tableScan(
                         kRegion,
@@ -665,6 +697,7 @@ TpchPlan TpchQueryBuilder::getQ5Plan() const {
                     .planNode();
 
   auto orders = PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
                     .filtersAsNode(filtersAsNode_)
                     .tableScan(
                         kOrders,
@@ -676,6 +709,7 @@ TpchPlan TpchQueryBuilder::getQ5Plan() const {
 
   auto customer =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kCustomer, customerSelectedRowType, customerFileColumns)
           .captureScanNodeId(customerScanNodeId)
@@ -683,6 +717,7 @@ TpchPlan TpchQueryBuilder::getQ5Plan() const {
 
   auto nationJoinRegion =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kNation, nationSelectedRowType, nationFileColumns)
           .captureScanNodeId(nationScanNodeId)
@@ -696,6 +731,7 @@ TpchPlan TpchQueryBuilder::getQ5Plan() const {
 
   auto supplierJoinNationRegion =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kSupplier, supplierSelectedRowType, supplierFileColumns)
           .captureScanNodeId(supplierScanNodeId)
@@ -709,6 +745,7 @@ TpchPlan TpchQueryBuilder::getQ5Plan() const {
 
   auto plan =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kLineitem, lineitemSelectedRowType, lineitemFileColumns)
           .captureScanNodeId(lineitemScanNodeId)
@@ -766,14 +803,15 @@ TpchPlan TpchQueryBuilder::getQ6Plan() const {
 
   core::PlanNodeId lineitemPlanNodeId;
   auto plan = PlanBuilder(pool_.get())
+.setParseOptions(decimalParseOptions())
                   .filtersAsNode(filtersAsNode_)
                   .tableScan(
                       kLineitem,
                       selectedRowType,
                       fileColumnNames,
                       {shipDateFilter,
-                       "l_discount between 0.05 and 0.07",
-                       "l_quantity < 24.0"})
+                       "l_discount between cast(0.05 as DECIMAL(15, 2)) and cast(0.07 as DECIMAL(15, 2))",
+                       "l_quantity < cast(24 as DECIMAL(15, 2))"})
                   .captureScanNodeId(lineitemPlanNodeId)
                   .project({"l_extendedprice * l_discount"})
                   .partialAggregation({}, {"sum(p0)"})
@@ -820,6 +858,7 @@ TpchPlan TpchQueryBuilder::getQ7Plan() const {
 
   auto custNation =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(
               kNation, nationSelectedRowType, nationFileColumns, {nationFilter})
@@ -828,6 +867,7 @@ TpchPlan TpchQueryBuilder::getQ7Plan() const {
 
   auto customerJoinNation =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kCustomer, customerSelectedRowType, customerFileColumns)
           .captureScanNodeId(customerScanNodeId)
@@ -842,6 +882,7 @@ TpchPlan TpchQueryBuilder::getQ7Plan() const {
 
   auto ordersJoinCustomer =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kOrders, ordersSelectedRowType, ordersFileColumns)
           .captureScanNodeId(ordersScanNodeId)
@@ -855,6 +896,7 @@ TpchPlan TpchQueryBuilder::getQ7Plan() const {
 
   auto suppNation =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(
               kNation, nationSelectedRowType, nationFileColumns, {nationFilter})
@@ -863,6 +905,7 @@ TpchPlan TpchQueryBuilder::getQ7Plan() const {
 
   auto supplierJoinNation =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kSupplier, supplierSelectedRowType, supplierFileColumns)
           .captureScanNodeId(supplierScanNodeId)
@@ -877,6 +920,7 @@ TpchPlan TpchQueryBuilder::getQ7Plan() const {
 
   auto plan =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(
               kLineitem,
@@ -976,6 +1020,7 @@ TpchPlan TpchQueryBuilder::getQ8Plan() const {
 
   auto nationWithName =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(
               kNation, nationSelectedRowTypeWithName, nationFileColumnsWithName)
@@ -983,6 +1028,7 @@ TpchPlan TpchQueryBuilder::getQ8Plan() const {
           .planNode();
 
   auto region = PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
                     .filtersAsNode(filtersAsNode_)
                     .tableScan(
                         kRegion,
@@ -993,6 +1039,7 @@ TpchPlan TpchQueryBuilder::getQ8Plan() const {
                     .planNode();
 
   auto part = PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
                   .filtersAsNode(filtersAsNode_)
                   .tableScan(
                       kPart,
@@ -1004,6 +1051,7 @@ TpchPlan TpchQueryBuilder::getQ8Plan() const {
 
   auto nationJoinRegion =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kNation, nationSelectedRowType, nationFileColumns)
           .captureScanNodeId(nationScanNodeId)
@@ -1013,6 +1061,7 @@ TpchPlan TpchQueryBuilder::getQ8Plan() const {
 
   auto customerJoinNationJoinRegion =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kCustomer, customerSelectedRowType, customerFileColumns)
           .captureScanNodeId(customerScanNodeId)
@@ -1026,6 +1075,7 @@ TpchPlan TpchQueryBuilder::getQ8Plan() const {
 
   auto ordersJoinCustomerJoinNationJoinRegion =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(
               kOrders,
@@ -1043,6 +1093,7 @@ TpchPlan TpchQueryBuilder::getQ8Plan() const {
 
   auto supplierJoinNation =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kSupplier, supplierSelectedRowType, supplierFileColumns)
           .captureScanNodeId(supplierScanNodeId)
@@ -1056,6 +1107,7 @@ TpchPlan TpchQueryBuilder::getQ8Plan() const {
 
   auto plan =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kLineitem, lineitemSelectedRowType, lineitemFileColumns)
           .captureScanNodeId(lineitemScanNodeId)
@@ -1091,7 +1143,7 @@ TpchPlan TpchQueryBuilder::getQ8Plan() const {
                "o_orderdate"})
           .project(
               {"volume",
-               "(CASE WHEN n_name = 'BRAZIL' THEN volume ELSE 0.0 END) as brazil_volume",
+               "(CASE WHEN n_name = 'BRAZIL' THEN volume ELSE cast(0 as DECIMAL(31, 4)) END) as brazil_volume",
                "year(o_orderdate) AS o_year"})
           .partialAggregation(
               {"o_year"},
@@ -1158,6 +1210,7 @@ TpchPlan TpchQueryBuilder::getQ9Plan(const std::string& partFilter) const {
 
   auto part =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(
               kPart, partSelectedRowType, partFileColumns, {}, partFilter)
@@ -1166,6 +1219,7 @@ TpchPlan TpchQueryBuilder::getQ9Plan(const std::string& partFilter) const {
 
   auto supplier =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kSupplier, supplierSelectedRowType, supplierFileColumns)
           .captureScanNodeId(supplierScanNodeId)
@@ -1173,6 +1227,7 @@ TpchPlan TpchQueryBuilder::getQ9Plan(const std::string& partFilter) const {
 
   auto nation =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kNation, nationSelectedRowType, nationFileColumns)
           .captureScanNodeId(nationScanNodeId)
@@ -1180,6 +1235,7 @@ TpchPlan TpchQueryBuilder::getQ9Plan(const std::string& partFilter) const {
 
   auto lineitemJoinPartJoinSupplier =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kLineitem, lineitemSelectedRowType, lineitemFileColumns)
           .captureScanNodeId(lineitemScanNodeId)
@@ -1194,6 +1250,7 @@ TpchPlan TpchQueryBuilder::getQ9Plan(const std::string& partFilter) const {
 
   auto partsuppJoinLineitemJoinPartJoinSupplier =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kPartsupp, partsuppSelectedRowType, partsuppFileColumns)
           .captureScanNodeId(partsuppScanNodeId)
@@ -1209,6 +1266,7 @@ TpchPlan TpchQueryBuilder::getQ9Plan(const std::string& partFilter) const {
 
   auto plan =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kOrders, ordersSelectedRowType, ordersFileColumns)
           .captureScanNodeId(ordersScanNodeId)
@@ -1291,12 +1349,14 @@ TpchPlan TpchQueryBuilder::getQ10Plan() const {
 
   auto nation =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kNation, nationSelectedRowType, nationFileColumns)
           .captureScanNodeId(nationScanNodeId)
           .planNode();
 
   auto orders = PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
                     .filtersAsNode(filtersAsNode_)
                     .tableScan(
                         kOrders,
@@ -1308,6 +1368,7 @@ TpchPlan TpchQueryBuilder::getQ10Plan() const {
 
   auto partialPlan =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kCustomer, customerSelectedRowType, customerFileColumns)
           .captureScanNodeId(customerScanNodeId)
@@ -1327,6 +1388,7 @@ TpchPlan TpchQueryBuilder::getQ10Plan() const {
           .planNode();
 
   auto plan = PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
                   .filtersAsNode(filtersAsNode_)
                   .tableScan(
                       kLineitem,
@@ -1418,6 +1480,7 @@ TpchPlan TpchQueryBuilder::getQ11Plan() const {
   // Subquery plan to calculate filter cost.
   auto nationSubQuery =
       PlanBuilder(planNodeIdGenerator)
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(
               kNation, nationRowType, nationFileColumns, {nationNameFilter})
@@ -1426,6 +1489,7 @@ TpchPlan TpchQueryBuilder::getQ11Plan() const {
 
   auto supplierJoinNationSubQuery =
       PlanBuilder(planNodeIdGenerator)
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kSupplier, supplierRowType, supplierFileColumns)
           .captureScanNodeId(supplierScanIdSubQuery)
@@ -1439,6 +1503,7 @@ TpchPlan TpchQueryBuilder::getQ11Plan() const {
 
   auto subQueryPlan =
       PlanBuilder(planNodeIdGenerator)
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(
               kPartsupp, partsuppRowTypeSubQuery, partsuppFileColumnsSubQuery)
@@ -1449,16 +1514,17 @@ TpchPlan TpchQueryBuilder::getQ11Plan() const {
               supplierJoinNationSubQuery,
               "",
               {"ps_availqty", "ps_suppkey", "ps_supplycost"})
-          .project({"ps_supplycost * ps_availqty AS product_cost_qty"})
+          .project({"ps_supplycost * cast(ps_availqty as DECIMAL(10, 0)) AS product_cost_qty"})
           .partialAggregation({}, {"sum(product_cost_qty) AS sum_cost_qty"})
           .localPartition({})
           .finalAggregation()
-          .project({"sum_cost_qty * 0.0001 AS filter_cost_qty"})
+          .project({fmt::format("cast(sum_cost_qty * {} as DECIMAL(38, 6)) AS filter_cost_qty", q11Fraction())})
           .planNode();
 
   // Query plan.
   auto nation =
       PlanBuilder(planNodeIdGenerator)
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(
               kNation, nationRowType, nationFileColumns, {nationNameFilter})
@@ -1467,6 +1533,7 @@ TpchPlan TpchQueryBuilder::getQ11Plan() const {
 
   auto supplierJoinNation =
       PlanBuilder(planNodeIdGenerator)
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kSupplier, supplierRowType, supplierFileColumns)
           .captureScanNodeId(supplierScanId)
@@ -1475,6 +1542,7 @@ TpchPlan TpchQueryBuilder::getQ11Plan() const {
 
   auto plan =
       PlanBuilder(planNodeIdGenerator)
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kPartsupp, partsuppRowType, partsuppFileColumns)
           .captureScanNodeId(partsuppScanId)
@@ -1485,14 +1553,14 @@ TpchPlan TpchQueryBuilder::getQ11Plan() const {
               "",
               {"ps_partkey", "ps_availqty", "ps_supplycost"})
           .project(
-              {"ps_supplycost * ps_availqty AS product_cost_qty", "ps_partkey"})
+              {"ps_supplycost * cast(ps_availqty as DECIMAL(10, 0)) AS product_cost_qty", "ps_partkey"})
           .partialAggregation(
               {"ps_partkey"}, {"sum(product_cost_qty) AS value"})
           .localPartition({"ps_partkey"})
           .finalAggregation()
           .nestedLoopJoin(
               subQueryPlan, {"ps_partkey", "value", "filter_cost_qty"})
-          .filter("value > filter_cost_qty")
+          .filter("cast(value as DECIMAL(38, 6)) > filter_cost_qty")
           .project({"ps_partkey", "value"})
           .orderBy({"value DESC"}, false)
           .planNode();
@@ -1536,6 +1604,7 @@ TpchPlan TpchQueryBuilder::getQ12Plan() const {
       "l_commitdate", lineitemSelectedRowType, "", "'1995-01-01'");
 
   auto lineitem = PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
                       .filtersAsNode(filtersAsNode_)
                       .tableScan(
                           kLineitem,
@@ -1552,6 +1621,7 @@ TpchPlan TpchQueryBuilder::getQ12Plan() const {
 
   auto plan =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kOrders, ordersSelectedRowType, ordersFileColumns, {})
           .captureScanNodeId(ordersScanNodeId)
@@ -1599,6 +1669,7 @@ TpchPlan TpchQueryBuilder::getQ13Plan() const {
 
   auto customers =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kCustomer, customerSelectedRowType, customerFileColumns)
           .captureScanNodeId(customerScanNodeId)
@@ -1606,6 +1677,7 @@ TpchPlan TpchQueryBuilder::getQ13Plan() const {
 
   auto plan =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(
               kOrders,
@@ -1655,6 +1727,7 @@ TpchPlan TpchQueryBuilder::getQ14Plan() const {
   core::PlanNodeId partScanNodeId;
 
   auto part = PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
                   .filtersAsNode(filtersAsNode_)
                   .tableScan(kPart, partSelectedRowType, partFileColumns)
                   .captureScanNodeId(partScanNodeId)
@@ -1662,6 +1735,7 @@ TpchPlan TpchQueryBuilder::getQ14Plan() const {
 
   auto plan =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(
               kLineitem,
@@ -1681,7 +1755,7 @@ TpchPlan TpchQueryBuilder::getQ14Plan() const {
               "",
               {"part_revenue", "p_type"})
           .project(
-              {"(CASE WHEN (p_type LIKE 'PROMO%') THEN part_revenue ELSE 0.0 END) as filter_revenue",
+              {"(CASE WHEN (p_type LIKE 'PROMO%') THEN part_revenue ELSE cast(0 as DECIMAL(31, 4)) END) as filter_revenue",
                "part_revenue"})
           .partialAggregation(
               {},
@@ -1722,6 +1796,7 @@ TpchPlan TpchQueryBuilder::getQ15Plan() const {
 
   auto maxRevenue =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(
               kLineitem,
@@ -1741,6 +1816,7 @@ TpchPlan TpchQueryBuilder::getQ15Plan() const {
 
   auto supplierWithMaxRevenue =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(
               kLineitem,
@@ -1765,6 +1841,7 @@ TpchPlan TpchQueryBuilder::getQ15Plan() const {
 
   auto plan =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kSupplier, supplierSelectedRowType, supplierFileColumns)
           .captureScanNodeId(supplierScanNodeId)
@@ -1810,6 +1887,7 @@ TpchPlan TpchQueryBuilder::getQ16Plan() const {
   parse::ParseOptions parseOptions;
   parseOptions.parseIntegerAsBigint = false;
   auto part = PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
                   .setParseOptions(parseOptions)
                   .filtersAsNode(filtersAsNode_)
                   .tableScan(
@@ -1825,6 +1903,7 @@ TpchPlan TpchQueryBuilder::getQ16Plan() const {
                   .planNode();
 
   auto supplier = PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
                       .filtersAsNode(filtersAsNode_)
                       .tableScan(
                           kSupplier,
@@ -1837,6 +1916,7 @@ TpchPlan TpchQueryBuilder::getQ16Plan() const {
 
   auto plan =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kPartsupp, partsuppSelectedRowType, partsuppFileColumns)
           .captureScanNodeId(partsuppScanNodeId)
@@ -1897,6 +1977,7 @@ TpchPlan TpchQueryBuilder::getQ17Plan() const {
   core::PlanNodeId partAggScanId;
 
   auto part = PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
                   .filtersAsNode(filtersAsNode_)
                   .tableScan(
                       kPart,
@@ -1907,6 +1988,7 @@ TpchPlan TpchQueryBuilder::getQ17Plan() const {
                   .planNode();
 
   auto partAgg = PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
                      .filtersAsNode(filtersAsNode_)
                      .tableScan(kPart, partRowType, partFileColumns, {})
                      .captureScanNodeId(partAggScanId)
@@ -1914,6 +1996,7 @@ TpchPlan TpchQueryBuilder::getQ17Plan() const {
 
   auto lineitemJoinPart =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kLineitem, lineitemRowType, lineitemFileColumns)
           .captureScanNodeId(lineitemScanId)
@@ -1927,6 +2010,7 @@ TpchPlan TpchQueryBuilder::getQ17Plan() const {
 
   auto plan =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kLineitem, lineitemRowType, lineitemFileColumns)
           .captureScanNodeId(lineitemAggScanId)
@@ -1943,7 +2027,7 @@ TpchPlan TpchQueryBuilder::getQ17Plan() const {
               {"l_partkey"},
               {"p_partkey"},
               lineitemJoinPart,
-              "l_quantity < 0.2 * avg_",
+              "cast(l_quantity as DECIMAL(17, 3)) < 0.2 * avg_",
               {"l_extendedprice"})
           .partialAggregation({}, {"sum(l_extendedprice) as partial_sum"})
           .localPartition(std::vector<std::string>{})
@@ -1983,17 +2067,19 @@ TpchPlan TpchQueryBuilder::getQ18Plan() const {
 
   auto bigOrders =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kLineitem, lineitemSelectedRowType, lineitemFileColumns)
           .captureScanNodeId(lineitemScanNodeId)
           .partialAggregation({"l_orderkey"}, {"sum(l_quantity) AS quantity"})
           .localPartition({"l_orderkey"})
           .finalAggregation()
-          .filter("quantity > 300.0")
+          .filter("quantity > cast(300 as DECIMAL(38, 2))")
           .planNode();
 
   auto plan =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kOrders, ordersSelectedRowType, ordersFileColumns)
           .captureScanNodeId(ordersScanNodeId)
@@ -2012,6 +2098,7 @@ TpchPlan TpchQueryBuilder::getQ18Plan() const {
               {"o_custkey"},
               {"c_custkey"},
               PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
                   .filtersAsNode(filtersAsNode_)
                   .tableScan(
                       kCustomer, customerSelectedRowType, customerFileColumns)
@@ -2063,25 +2150,27 @@ TpchPlan TpchQueryBuilder::getQ19Plan() const {
       "(l_shipinstruct = 'DELIVER IN PERSON')";
   const std::string joinFilterExpr =
       "     ((p_brand = 'Brand#12')"
-      "     AND (l_quantity between 1.0 and 11.0)"
+      "     AND (l_quantity between cast(1 as DECIMAL(15, 2)) and cast(11 as DECIMAL(15, 2)))"
       "     AND (p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG'))"
       "     AND (p_size BETWEEN 1 AND 5))"
       " OR  ((p_brand ='Brand#23')"
       "     AND (p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK'))"
-      "     AND (l_quantity between 10.0 and 20.0)"
+      "     AND (l_quantity between cast(10 as DECIMAL(15, 2)) and cast(20 as DECIMAL(15, 2)))"
       "     AND (p_size BETWEEN 1 AND 10))"
       " OR  ((p_brand = 'Brand#34')"
       "     AND (p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG'))"
-      "     AND (l_quantity between 20.0 and 30.0)"
+      "     AND (l_quantity between cast(20 as DECIMAL(15, 2)) and cast(30 as DECIMAL(15, 2)))"
       "     AND (p_size BETWEEN 1 AND 15))";
 
   auto part = PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
                   .filtersAsNode(filtersAsNode_)
                   .tableScan(kPart, partSelectedRowType, partFileColumns)
                   .captureScanNodeId(partScanNodeId)
                   .planNode();
 
   auto plan = PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
                   .filtersAsNode(filtersAsNode_)
                   .tableScan(
                       kLineitem,
@@ -2147,6 +2236,7 @@ TpchPlan TpchQueryBuilder::getQ20Plan() const {
   core::PlanNodeId nationScanId;
 
   auto part = PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
                   .filtersAsNode(filtersAsNode_)
                   .tableScan(
                       kPart,
@@ -2158,6 +2248,7 @@ TpchPlan TpchQueryBuilder::getQ20Plan() const {
                   .planNode();
 
   auto partAgg = PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
                      .filtersAsNode(filtersAsNode_)
                      .tableScan(
                          kPart,
@@ -2169,6 +2260,7 @@ TpchPlan TpchQueryBuilder::getQ20Plan() const {
                      .planNode();
 
   auto nation = PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
                     .filtersAsNode(filtersAsNode_)
                     .tableScan(
                         kNation,
@@ -2180,6 +2272,7 @@ TpchPlan TpchQueryBuilder::getQ20Plan() const {
 
   auto partsuppJoinPart =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kPartsupp, partsuppSelectedRowType, partsuppFileColumns)
           .captureScanNodeId(partsuppScanId)
@@ -2194,6 +2287,7 @@ TpchPlan TpchQueryBuilder::getQ20Plan() const {
 
   auto supplierJoinNation =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kSupplier, supplierSelectedRowType, supplierFileColumns)
           .captureScanNodeId(supplierScanId)
@@ -2207,6 +2301,7 @@ TpchPlan TpchQueryBuilder::getQ20Plan() const {
 
   auto plan =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(
               kLineitem,
@@ -2229,7 +2324,7 @@ TpchPlan TpchQueryBuilder::getQ20Plan() const {
               {"l_partkey", "l_suppkey"},
               {"ps_partkey", "ps_suppkey"},
               partsuppJoinPart,
-              "ps_availqty > filter_qty",
+              "cast(ps_availqty as DECIMAL(38, 3)) > filter_qty",
               {"ps_suppkey"})
           .hashJoin(
               {"ps_suppkey"},
@@ -2284,8 +2379,51 @@ TpchPlan TpchQueryBuilder::getQ21Plan() const {
   core::PlanNodeId nationScanNodeId;
   const std::string receiptCommitFilter = "l_receiptdate > l_commitdate";
 
+  // Order keys of the late lineitems of SAUDI ARABIA suppliers: every order
+  // that can qualify. Semi joins on these keep the lineitem inputs of the
+  // EXISTS and NOT EXISTS joins to those orders, a few million rows instead of
+  // the whole table.
+  std::vector<core::PlanNodeId> keyLineitemScanNodeIds;
+  std::vector<core::PlanNodeId> keySupplierScanNodeIds;
+  std::vector<core::PlanNodeId> keyNationScanNodeIds;
+  auto candidateOrderKeys = [&](const std::string& name) {
+    auto nationKeys = PlanBuilder(planNodeIdGenerator, pool_.get())
+                          .setParseOptions(decimalParseOptions())
+                          .filtersAsNode(filtersAsNode_)
+                          .tableScan(
+                              kNation,
+                              nationRowType,
+                              nationFileColumns,
+                              {"n_name = 'SAUDI ARABIA'"})
+                          .captureScanNodeId(keyNationScanNodeIds.emplace_back())
+                          .planNode();
+    auto suppliers =
+        PlanBuilder(planNodeIdGenerator, pool_.get())
+            .setParseOptions(decimalParseOptions())
+            .filtersAsNode(filtersAsNode_)
+            .tableScan(kSupplier, supplierRowType, supplierFileColumns)
+            .captureScanNodeId(keySupplierScanNodeIds.emplace_back())
+            .hashJoin(
+                {"s_nationkey"}, {"n_nationkey"}, nationKeys, "", {"s_suppkey"})
+            .planNode();
+    return PlanBuilder(planNodeIdGenerator, pool_.get())
+        .setParseOptions(decimalParseOptions())
+        .filtersAsNode(filtersAsNode_)
+        .tableScan(
+            kLineitem,
+            lineitem1RowType,
+            lineitem1FileColumns,
+            {},
+            receiptCommitFilter)
+        .captureScanNodeId(keyLineitemScanNodeIds.emplace_back())
+        .hashJoin({"l_suppkey"}, {"s_suppkey"}, suppliers, "", {"l_orderkey"})
+        .project({fmt::format("l_orderkey as {}", name)})
+        .planNode();
+  };
+
   auto lineitem3 =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(
               kLineitem,
@@ -2295,9 +2433,17 @@ TpchPlan TpchQueryBuilder::getQ21Plan() const {
               receiptCommitFilter)
           .captureScanNodeId(lineitem3ScanNodeId)
           .project({"l_orderkey as l_orderkey_3", "l_suppkey as l_suppkey_3"})
+          .hashJoin(
+              {"l_orderkey_3"},
+              {"key_3"},
+              candidateOrderKeys("key_3"),
+              "",
+              {"l_orderkey_3", "l_suppkey_3"},
+              core::JoinType::kLeftSemiFilter)
           .planNode();
 
   auto nation = PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
                     .filtersAsNode(filtersAsNode_)
                     .tableScan(
                         kNation,
@@ -2309,6 +2455,7 @@ TpchPlan TpchQueryBuilder::getQ21Plan() const {
 
   auto supplierJoinNation =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kSupplier, supplierRowType, supplierFileColumns)
           .captureScanNodeId(supplierScanNodeId)
@@ -2322,6 +2469,7 @@ TpchPlan TpchQueryBuilder::getQ21Plan() const {
 
   auto lineitemJoinSupplier =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(
               kLineitem,
@@ -2341,6 +2489,7 @@ TpchPlan TpchQueryBuilder::getQ21Plan() const {
 
   auto ordersJoinLineitem1 =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(
               kOrders,
@@ -2358,10 +2507,18 @@ TpchPlan TpchQueryBuilder::getQ21Plan() const {
 
   auto plan =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kLineitem, lineitem2RowType, lineitem2FileColumns)
           .captureScanNodeId(lineitem2ScanNodeId)
           .project({"l_orderkey as l_orderkey_2", "l_suppkey as l_suppkey_2"})
+          .hashJoin(
+              {"l_orderkey_2"},
+              {"key_2"},
+              candidateOrderKeys("key_2"),
+              "",
+              {"l_orderkey_2", "l_suppkey_2"},
+              core::JoinType::kLeftSemiFilter)
           .hashJoin(
               {"l_orderkey_2"},
               {"l_orderkey_1"},
@@ -2392,6 +2549,15 @@ TpchPlan TpchQueryBuilder::getQ21Plan() const {
   context.dataFiles[lineitem3ScanNodeId] = getTableFilePaths(kLineitem);
   context.dataFiles[ordersScanNodeId] = getTableFilePaths(kOrders);
   context.dataFiles[nationScanNodeId] = getTableFilePaths(kNation);
+  for (const auto& id : keyLineitemScanNodeIds) {
+    context.dataFiles[id] = getTableFilePaths(kLineitem);
+  }
+  for (const auto& id : keySupplierScanNodeIds) {
+    context.dataFiles[id] = getTableFilePaths(kSupplier);
+  }
+  for (const auto& id : keyNationScanNodeIds) {
+    context.dataFiles[id] = getTableFilePaths(kNation);
+  }
   context.dataFileFormat = format_;
   return context;
 }
@@ -2420,6 +2586,7 @@ TpchPlan TpchQueryBuilder::getQ22Plan() const {
 
   auto orders =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kOrders, ordersSelectedRowType, ordersFileColumns)
           .captureScanNodeId(ordersScanNodeId)
@@ -2427,12 +2594,13 @@ TpchPlan TpchQueryBuilder::getQ22Plan() const {
 
   auto customerAvgAccountBalance =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(
               kCustomer,
               customerSelectedRowType,
               customerFileColumns,
-              {"c_acctbal > 0.0"},
+              {"c_acctbal > cast(0 as DECIMAL(15, 2))"},
               phoneFilter)
           .captureScanNodeId(customerScanNodeId)
           .partialAggregation({}, {"avg(c_acctbal) as avg_acctbal"})
@@ -2442,6 +2610,7 @@ TpchPlan TpchQueryBuilder::getQ22Plan() const {
 
   auto plan =
       PlanBuilder(planNodeIdGenerator, pool_.get())
+.setParseOptions(decimalParseOptions())
           .filtersAsNode(filtersAsNode_)
           .tableScan(
               kCustomer,
@@ -2516,6 +2685,7 @@ TpchPlan TpchQueryBuilder::getIoMeterPlan(int columnPct) const {
     aliases[name] = name;
   }
   auto plan = PlanBuilder(pool_.get())
+.setParseOptions(decimalParseOptions())
                   .filtersAsNode(filtersAsNode_)
                   .tableScan(kLineitem, selectedRowType, aliases, {filter})
                   .captureScanNodeId(lineitemPlanNodeId)
