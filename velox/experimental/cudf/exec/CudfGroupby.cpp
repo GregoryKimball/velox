@@ -2885,8 +2885,9 @@ void CudfGroupby::initialize() {
     spillContext_ = cudfSpillContext(*operatorCtx_->task()->queryCtx());
     if (spillContext_ != nullptr) {
       const auto& cudfConfig = CudfConfig::getInstance();
-      const auto maxRowsPerLeaf = cudfConfig.batchSizeMaxThreshold.value_or(
-          std::numeric_limits<int32_t>::max());
+      // Not batchSizeMaxThreshold: that also caps the tables a join build is
+      // made of, and a run leaves it unset to keep each build in one table.
+      const auto maxRowsPerLeaf = cudfConfig.spillGroupbyMaxRowsPerLeaf;
       VELOX_CHECK_GT(maxRowsPerLeaf, 0);
       spillableState_ = std::make_unique<PartitionedBufferedState>(
           std::make_unique<SpillableStateOps>(*this),

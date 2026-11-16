@@ -46,6 +46,9 @@ class GroupbySpillTest : public OperatorTestBase {
     savedConfig_ = config;
     config.streamingGroupbyEnabled = false;
     config.allowCpuFallback = false;
+    // No test here caps batches globally. The leaf bound of the spillable
+    // state is cudf.spill_groupby_max_rows_per_leaf and nothing else.
+    config.batchSizeMaxThreshold.reset();
     config.spillHostBytes = kHostSpillBytes;
     config.groupbySelfSpillPercent = 1;
     config.groupbySelfSpillTargetPercent = 0;
@@ -149,10 +152,15 @@ TEST_F(GroupbySpillTest, finalStepSpillsAndDrainsFromHost) {
 
 // With a small leaf limit the buffered state splits into hash partitions, and
 // leaves that outgrew the limit in host memory are partitioned again when
-// they are drained.
+// they are drained. The limit comes from its own setting: with the default of
+// 16M rows these 1,024 rows would stay in one leaf.
 TEST_F(GroupbySpillTest, finalStepRepartitionsSpilledLeaves) {
-  cudf_velox::CudfConfig::getInstance().batchSizeMaxThreshold = 64;
-  cudf_velox::CudfConfig::getInstance().spillPartitionFanout = 4;
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  ASSERT_FALSE(config.batchSizeMaxThreshold.has_value());
+  config.spillGroupbyMaxRowsPerLeaf = 64;
+  config.spillPartitionFanout = 4;
+  // Keeps the inputs at 32 rows also if batch concatenation is on.
+  config.batchSizeMinThreshold = 32;
   const auto vectors = makeInput(32, 32, 20'000);
   createDuckDbTable(vectors);
 
@@ -183,7 +191,11 @@ TEST_F(GroupbySpillTest, finalStepRepartitionsSpilledLeaves) {
 // when it outgrows the leaf limit of 8 rows. The leaf is aggregated in place
 // instead, and the result is one group.
 TEST_F(GroupbySpillTest, finalStepWithOneKey) {
-  cudf_velox::CudfConfig::getInstance().batchSizeMaxThreshold = 8;
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  ASSERT_FALSE(config.batchSizeMaxThreshold.has_value());
+  config.spillGroupbyMaxRowsPerLeaf = 8;
+  // Keeps the inputs at 8 rows also if batch concatenation is on.
+  config.batchSizeMinThreshold = 8;
   const auto vectors = makeInput(24, 8, 1, false);
   createDuckDbTable(vectors);
 

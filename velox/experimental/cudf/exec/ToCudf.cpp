@@ -520,6 +520,21 @@ void CudfConfig::initialize(
         fanout, 1024, "cudf.spill_partition_fanout is too large");
     spillPartitionFanout = fanout;
   }
+  if (config.find(kCudfSpillGroupbyMaxRowsPerLeaf) != config.end()) {
+    // tryTo so that a malformed or too large value is a user error, not a
+    // folly::ConversionError.
+    const auto& value = config[kCudfSpillGroupbyMaxRowsPerLeaf];
+    const auto maxRows = folly::tryTo<int32_t>(value);
+    VELOX_USER_CHECK(
+        maxRows.hasValue(),
+        "cudf.spill_groupby_max_rows_per_leaf must be a 32-bit integer: {}",
+        value);
+    VELOX_USER_CHECK_GT(
+        maxRows.value(),
+        0,
+        "cudf.spill_groupby_max_rows_per_leaf must be positive");
+    spillGroupbyMaxRowsPerLeaf = maxRows.value();
+  }
   if (config.find(kCudfSpillJoinPartitionBytes) != config.end()) {
     spillJoinPartitionBytes =
         folly::to<uint64_t>(config[kCudfSpillJoinPartitionBytes]);

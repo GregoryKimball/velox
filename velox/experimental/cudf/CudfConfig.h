@@ -39,6 +39,8 @@ struct CudfConfig {
       "cudf.spill_host_numa_node"};
   static constexpr const char* kCudfSpillPartitionFanout{
       "cudf.spill_partition_fanout"};
+  static constexpr const char* kCudfSpillGroupbyMaxRowsPerLeaf{
+      "cudf.spill_groupby_max_rows_per_leaf"};
   static constexpr const char* kCudfSpillJoinPartitionBytes{
       "cudf.spill_join_partition_bytes"};
   static constexpr const char* kCudfGroupbySelfSpillPercent{
@@ -164,9 +166,17 @@ struct CudfConfig {
   int32_t spillHostNumaNode{-1};
 
   /// The least number of hash partitions a spillable group-by makes when one
-  /// of its leaves outgrows the row limit, from 2 to 1024. A wider split
-  /// partitions each buffered row fewer times.
+  /// of its leaves outgrows spillGroupbyMaxRowsPerLeaf, from 2 to 1024. A
+  /// wider split partitions each buffered row fewer times.
   int32_t spillPartitionFanout{64};
+
+  /// The most rows one leaf of a spillable final or single group-by holds,
+  /// which must be positive. A leaf that outgrows it is split into hash
+  /// partitions. A leaf moves to host memory and is aggregated on the device
+  /// as a whole, so this bounds the device memory either takes. Only the
+  /// spillable state reads it. It does not depend on batchSizeMaxThreshold,
+  /// which caps the tables other operators concatenate and may be unset.
+  int32_t spillGroupbyMaxRowsPerLeaf{1 << 24};
 
   /// A hash join build whose estimated device memory exceeds this many bytes
   /// is split into hash partitions that are joined one after the other. Zero,
