@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/exec/AggregationRegistry.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/CudfGroupby.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/PrestoAggregateFunctions.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 
@@ -28,6 +29,10 @@
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/type/Timestamp.h"
+
+#include <cudf/utilities/memory_resource.hpp>
+
+#include <rmm/mr/statistics_resource_adaptor.hpp>
 
 #include <cmath>
 
@@ -1097,6 +1102,50 @@ TEST_F(AggregationTest, finalAggregationStreamsOnAddInput) {
   const auto planStats = toPlanStats(task->taskStats());
   EXPECT_GT(planStats.at(partialAggId).customStats.at("flushRowCount").sum, 0);
   EXPECT_GT(planStats.at(finalAggId).outputRows, 0);
+}
+
+// A final distinct keeps the distinct keys of the batches so far, so its
+// device memory follows the number of distinct keys, not the number of input
+// batches.
+TEST_F(AggregationTest, finalDistinctKeepsOnlyTheDistinctKeys) {
+  // Batches of the conversion's minimum size reach the aggregations one by
+  // one.
+  const vector_size_t rows =
+      cudf_velox::CudfConfig::getInstance().batchSizeMinThreshold;
+  auto keys = makeRowVector(
+      {makeFlatVector<int64_t>(rows, [](auto row) { return row; })});
+  // The aggregations' device allocations are counted by an adaptor of the
+  // test's own, which outlives the buffers it allocated.
+  std::vector<rmm::mr::statistics_resource_adaptor> counters;
+  counters.reserve(2);
+  // Returns the most device bytes a partial and a final distinct allocate
+  // over 'numBatches' batches of the same keys.
+  auto peakBytes = [&](int numBatches) {
+    auto& counting = counters.emplace_back(cudf_velox::mr_.value());
+    auto previous = cudf::set_current_device_resource(counting);
+    auto previousOutput = cudf_velox::output_mr_;
+    cudf_velox::output_mr_ = counting;
+    SCOPE_EXIT {
+      cudf::set_current_device_resource(std::move(previous));
+      cudf_velox::output_mr_ = std::move(previousOutput);
+    };
+    // The partial distinct flushes every batch, so the final one receives
+    // 'numBatches' batches.
+    AssertQueryBuilder(
+        PlanBuilder()
+            .values(std::vector<RowVectorPtr>(numBatches, keys))
+            .partialAggregation({"c0"}, {})
+            .finalAggregation()
+            .planNode())
+        .config(QueryConfig::kMaxPartialAggregationMemory, 1)
+        .assertResults(keys);
+    return static_cast<int64_t>(counting.get_bytes_counter().peak);
+  };
+  const auto fewBatchesBytes = peakBytes(4);
+  const auto manyBatchesBytes = peakBytes(20);
+  VLOG(1) << "Peak device bytes of a distinct: 4 batches " << fewBatchesBytes
+          << ", 20 batches " << manyBatchesBytes;
+  EXPECT_LT(manyBatchesBytes, 2 * fewBatchesBytes);
 }
 
 DEBUG_ONLY_TEST_F(

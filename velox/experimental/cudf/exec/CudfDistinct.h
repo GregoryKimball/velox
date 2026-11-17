@@ -56,7 +56,8 @@ class CudfDistinct : public CudfOperatorBase {
 
   CudfVectorPtr releaseAndResetBufferedResult();
 
-  void computePartialDistinctStreaming(CudfVectorPtr tbl);
+  // Merges the distinct keys of 'tbl' into bufferedResult_.
+  void computeDistinctStreaming(CudfVectorPtr tbl);
 
   std::vector<column_index_t> groupingKeyInputChannels_;
   std::vector<column_index_t> groupingKeyOutputChannels_;
@@ -69,8 +70,6 @@ class CudfDistinct : public CudfOperatorBase {
 
   bool finished_ = false;
 
-  std::vector<CudfVectorPtr> inputs_;
-  TypePtr inputType_;
   CudfVectorPtr bufferedResult_;
 };
 

@@ -53,14 +53,13 @@ CudfDistinct::CudfDistinct(
 void CudfDistinct::initialize() {
   Operator::initialize();
 
-  inputType_ = aggregationNode_->sources()[0]->outputType();
   setupGroupingKeyChannelProjections(
       *aggregationNode_, groupingKeyInputChannels_, groupingKeyOutputChannels_);
 
   aggregationNode_.reset();
 }
 
-void CudfDistinct::computePartialDistinctStreaming(CudfVectorPtr tbl) {
+void CudfDistinct::computeDistinctStreaming(CudfVectorPtr tbl) {
   // For every input, we'll concat with existing distinct results and then do a
   // distinct on the concatenated results.
 
@@ -109,12 +108,7 @@ void CudfDistinct::doAddInput(RowVectorPtr input) {
   auto cudfInput = std::dynamic_pointer_cast<cudf_velox::CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
 
-  if (isPartialOutput_) {
-    computePartialDistinctStreaming(cudfInput);
-    return;
-  }
-
-  inputs_.push_back(std::move(cudfInput));
+  computeDistinctStreaming(cudfInput);
 }
 
 CudfVectorPtr CudfDistinct::getDistinctKeys(
@@ -181,47 +175,23 @@ RowVectorPtr CudfDistinct::doGetOutput() {
     return releaseAndResetBufferedResult();
   }
 
-  if (finished_) {
+  // A final distinct holds the distinct keys of all batches so far and returns
+  // them once every batch has arrived.
+  if (finished_ || !noMoreInput_) {
     return nullptr;
   }
-
-  if (!noMoreInput_) {
-    // Final aggregation has to wait for all batches to arrive so we cannot
-    // return any results here.
-    return nullptr;
-  }
-
-  if (inputs_.empty() && !noMoreInput_) {
-    return nullptr;
-  }
-
-  auto stream = cudfGlobalStreamPool().get_stream();
-
-  auto tbl = getConcatenatedTable(
-      std::exchange(inputs_, {}), inputType_, stream, get_output_mr());
-
-  // Release input data after synchronizing.
-  stream.sync();
-  inputs_.clear();
-
-  if (noMoreInput_) {
-    finished_ = true;
-  }
-
-  VELOX_CHECK_NOT_NULL(tbl);
-
-  return getDistinctKeys(tbl->view(), groupingKeyInputChannels_, stream);
+  finished_ = true;
+  return std::move(bufferedResult_);
 }
 
 void CudfDistinct::doNoMoreInput() {
   Operator::noMoreInput();
-  if (isPartialOutput_ && inputs_.empty()) {
+  if (isPartialOutput_) {
     finished_ = true;
   }
 }
 
 void CudfDistinct::doClose() {
-  inputs_.clear();
   bufferedResult_.reset();
   Operator::close();
 }
