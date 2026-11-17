@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfAggregation.h"
+#include "velox/experimental/cudf/exec/CudfAggregationNode.h"
 #include "velox/experimental/cudf/exec/CudfGroupby.h"
 #include "velox/experimental/cudf/exec/CudfReduce.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -225,6 +226,8 @@ std::vector<ResolvedAggregateInfo> resolveAggregateInfos(
     std::vector<VectorPtr> const& constants,
     std::vector<std::optional<uint32_t>> const& maskChannels) {
   const auto numKeys = aggregationNode.groupingKeys().size();
+  const auto* cudfNode =
+      dynamic_cast<const CudfAggregationNode*>(&aggregationNode);
 
   std::vector<ResolvedAggregateInfo> params;
   params.reserve(aggregationNode.aggregates().size());
@@ -232,9 +235,17 @@ std::vector<ResolvedAggregateInfo> resolveAggregateInfos(
     auto const& aggregate = aggregationNode.aggregates()[i];
     auto const companionStep = getCompanionStep(aggregate.call->name(), step);
     const auto originalName = getOriginalName(aggregate.call->name());
-    const auto resultType = exec::isPartialOutput(companionStep)
-        ? exec::resolveIntermediateType(originalName, aggregate.rawInputTypes)
-        : outputType->childAt(numKeys + i);
+    const bool compactDecimalSum =
+        cudfNode != nullptr && cudfNode->usesCompactDecimalSum(i);
+    TypePtr resultType;
+    if (!exec::isPartialOutput(companionStep)) {
+      resultType = outputType->childAt(numKeys + i);
+    } else if (compactDecimalSum) {
+      resultType = cudfNode->intermediateType(i);
+    } else {
+      resultType =
+          exec::resolveIntermediateType(originalName, aggregate.rawInputTypes);
+    }
     const auto isDecimalAggregate = aggregate.rawInputTypes.size() == 1 &&
         aggregate.rawInputTypes[0]->isDecimal();
 
@@ -255,7 +266,8 @@ std::vector<ResolvedAggregateInfo> resolveAggregateInfos(
             ? std::make_optional(getCountInputKind(aggregate, constants[i]))
             : std::nullopt,
         maskIndex,
-        isDecimalAggregate);
+        isDecimalAggregate,
+        compactDecimalSum);
   }
   return params;
 }
@@ -337,8 +349,14 @@ RowTypePtr getBufferedResultType(core::AggregationNode const& aggregationNode) {
   VELOX_CHECK_EQ(names.size(), types.size());
   VELOX_CHECK_GE(types.size(), numKeys + aggregationNode.aggregates().size());
 
+  const auto* cudfNode =
+      dynamic_cast<const CudfAggregationNode*>(&aggregationNode);
   for (auto i = 0; i < aggregationNode.aggregates().size(); ++i) {
     auto const& aggregate = aggregationNode.aggregates()[i];
+    if (cudfNode != nullptr && cudfNode->usesCompactDecimalSum(i)) {
+      types[numKeys + i] = cudfNode->intermediateType(i);
+      continue;
+    }
     const auto originalName = getOriginalName(aggregate.call->name());
     types[numKeys + i] =
         exec::resolveIntermediateType(originalName, aggregate.rawInputTypes);

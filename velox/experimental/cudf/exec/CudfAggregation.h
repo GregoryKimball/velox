@@ -101,6 +101,9 @@ struct ResolvedAggregateInfo {
   // Routing keys off the function family, not the physical batch type (which is
   // VARBINARY/STRING on intermediate and final steps).
   bool isDecimalAggregate;
+  // True if the plan, a CudfAggregationNode, declares the DECIMAL(38, scale)
+  // intermediate state for this decimal SUM in place of the VARBINARY state.
+  bool compactDecimalSum;
 };
 
 // Parse aggregate inputs from the aggregation node and resolve companion steps,

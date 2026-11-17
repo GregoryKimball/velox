@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/CudfAggregationNode.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfMemoryArbitration.h"
@@ -42,6 +43,8 @@
 
 #include <cuda.h>
 
+#include <algorithm>
+
 static const std::string kCudfAdapterName = "cuDF";
 
 namespace facebook::velox::cudf_velox {
@@ -51,6 +54,13 @@ namespace {
 template <class... Deriveds, class Base>
 bool isAnyOf(const Base* p) {
   return ((dynamic_cast<const Deriveds*>(p) != nullptr) || ...);
+}
+
+// Returns true if 'node' is an aggregation that exchanges the compact decimal
+// SUM state. Only cuDF operators read and write that state: the CPU sum
+// function would take it for, or replace it with, the VARBINARY state.
+bool isCompactAggregation(const core::PlanNodePtr& node) {
+  return isAnyOf<CudfAggregationNode>(node.get());
 }
 
 } // namespace
@@ -271,6 +281,12 @@ bool CompileState::compile(bool allowCpuFallback) {
                 << "] = " << thisOpProps.producesGpuOutput
                 << ", planNode = " << bool(planNode);
     }
+    if (isPureCpuOperator && isCompactAggregation(planNode) &&
+        oper->planNodeId() == planNode->id()) {
+      VELOX_USER_FAIL(
+          "An aggregation with the compact decimal SUM state must run in cuDF, but its operator stays on the CPU: {}",
+          planNode->id());
+    }
     if (isPureCpuOperator) {
       LOG(WARNING) << "Replacement with cuDF operator failed. "
                    << (allowCpuFallback ? "Falling back to CPU execution"
@@ -329,6 +345,16 @@ struct CudfDriverAdapter {
     if (!queryConfig.get<bool>(
             CudfConfig::kCudfEnabled, CudfConfig::getInstance().enabled) &&
         allowCpuFallback) {
+      // The driver stays on the CPU.
+      VELOX_USER_CHECK(
+          std::none_of(
+              factory.planNodes.begin(),
+              factory.planNodes.end(),
+              isCompactAggregation),
+          "Compact decimal SUM state requires cuDF to be enabled");
+      VELOX_USER_CHECK(
+          !isCompactAggregation(factory.consumerNode),
+          "Compact decimal SUM state requires cuDF to be enabled");
       return false;
     }
     auto state = CompileState(factory, driver);

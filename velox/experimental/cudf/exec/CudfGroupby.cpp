@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
+#include "velox/experimental/cudf/exec/CudfAggregationNode.h"
 #include "velox/experimental/cudf/exec/CudfGroupby.h"
 #include "velox/experimental/cudf/exec/CudfSpillContext.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationHostOps.h"
@@ -467,20 +468,60 @@ void addDecimalRawPartialSingleSumRequest(
   }
 }
 
+// Checks that 'actual', the type of a state column, is the DECIMAL128 sum the
+// plan declares as the compact state of a decimal SUM. An aggregation that did
+// not produce the compact state would deliver a STRING column.
+void checkCompactDecimalSumState(
+    cudf::data_type actual,
+    const TypePtr& stateType) {
+  VELOX_CHECK(
+      actual == cudf_velox::veloxToCudfDataType(stateType),
+      "Compact decimal SUM state must be the DECIMAL128 sum of its plan type: got cudf type id {} for {}",
+      static_cast<int32_t>(actual.id()),
+      stateType->toString());
+}
+
 struct GroupbyDecimalSumAggregator : GroupbyAggregator {
+  // With 'compactDecimalSum' the intermediate state is the DECIMAL128 sum
+  // column itself, not the serialized VARBINARY (sum, count, overflow) state.
   GroupbyDecimalSumAggregator(
       core::AggregationNode::Step step,
       uint32_t inputIndex,
       VectorPtr constant,
       const TypePtr& resultType,
-      std::optional<uint32_t> maskIndex)
-      : GroupbyAggregator(step, inputIndex, constant, resultType, maskIndex) {}
+      std::optional<uint32_t> maskIndex,
+      bool compactDecimalSum)
+      : GroupbyAggregator(step, inputIndex, constant, resultType, maskIndex),
+        compactDecimalSum_(compactDecimalSum) {}
 
   void addGroupbyRequest(
       cudf::table_view const& tbl,
       std::vector<cudf::groupby::aggregation_request>& requests,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
+    if (compactDecimalSum_) {
+      if (step == core::AggregationNode::Step::kPartial) {
+        // Raw DECIMAL64 input, summed in 128 bits. No count is kept: a NULL
+        // sum is the state of a group without non-NULL input.
+        addDecimalRawPartialSingleSumRequest(
+            materializeMaskedInput(tbl, inputIndex, stream, mr),
+            requests,
+            false,
+            stream,
+            sumIdx_,
+            castedInput_);
+        return;
+      }
+      // Every other step sums the state column itself.
+      const auto state = tbl.column(inputIndex);
+      checkCompactDecimalSumState(state.type(), resultType);
+      sumIdx_ = requests.size();
+      auto& request = requests.emplace_back();
+      request.values = state;
+      request.aggregations.push_back(
+          cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+      return;
+    }
     if (step == core::AggregationNode::Step::kIntermediate) {
       addDecimalDecodedSumCountRequests(
           tbl,
@@ -515,16 +556,18 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
     auto col = std::move(results[sumIdx_].results[0]);
-    if (step == core::AggregationNode::Step::kPartial) {
+    if (!compactDecimalSum_ && step == core::AggregationNode::Step::kPartial) {
       auto count = std::move(results[sumIdx_].results[1]);
       return serializeDecimalPartialOrIntermediateState(
           std::move(col), std::move(count), stream, mr);
     }
-    if (step == core::AggregationNode::Step::kIntermediate) {
+    if (!compactDecimalSum_ &&
+        step == core::AggregationNode::Step::kIntermediate) {
       auto count = std::move(results[countIdx_].results[0]);
       return serializeDecimalPartialOrIntermediateState(
           std::move(col), std::move(count), stream, mr);
     }
+    // The FINAL result, or the compact state of any step: the sum itself.
     auto const cudfResType = cudf_velox::veloxToCudfDataType(resultType);
     if (col->type() != cudfResType) {
       col = cudf::cast(*col, cudfResType, stream, mr);
@@ -537,6 +580,12 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
     VELOX_CHECK_EQ(step, core::AggregationNode::Step::kFinal);
+    if (compactDecimalSum_) {
+      // The state is the sum. A NULL state stays NULL, as the sum over that
+      // one state would be.
+      checkCompactDecimalSumState(state->type(), resultType);
+      return state;
+    }
     const auto scale = getDecimalPrecisionScale(*resultType).second;
     auto decoded = cudf_velox::deserializeDecimalSumState(
         state->view(), scale, stream, mr);
@@ -562,6 +611,8 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
   // Holds the DECIMAL64->DECIMAL128 cast of raw input (kPartial/kSingle), kept
   // alive while the groupby request references its view.
   std::unique_ptr<cudf::column> castedInput_;
+  // True if the plan declares the compact state for this aggregate.
+  const bool compactDecimalSum_;
 };
 
 struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
@@ -1404,7 +1455,8 @@ std::unique_ptr<GroupbyAggregator> createGroupbyAggregator(
           aggregate.inputIndex,
           aggregate.constant,
           aggregate.resultType,
-          aggregate.maskIndex);
+          aggregate.maskIndex,
+          aggregate.compactDecimalSum);
     }
     return std::make_unique<GroupbySumAggregator>(
         aggregate.companionStep,
@@ -1484,6 +1536,11 @@ std::unique_ptr<StreamingGroupbyAggregator> createStreamingGroupbyAggregator(
     const TypePtr& inputType,
     const TypePtr& resultType) {
   if (aggregate.constant != nullptr || aggregate.maskIndex.has_value()) {
+    return nullptr;
+  }
+  // The streaming decimal aggregator decodes the VARBINARY state. A node with
+  // the compact state takes the other group-by path.
+  if (aggregate.compactDecimalSum) {
     return nullptr;
   }
 
@@ -2490,10 +2547,18 @@ bool canGroupbyBeEvaluatedByCudf(
   // Get the aggregation step from the node
   auto step = aggregationNode.step();
 
+  const auto* cudfNode =
+      dynamic_cast<const CudfAggregationNode*>(&aggregationNode);
   // Check supported aggregation functions using step-aware aggregation registry
-  for (const auto& aggregate : aggregationNode.aggregates()) {
-    // Use step-aware validation that handles partial/final/intermediate steps
-    if (!canGroupbyAggregationBeEvaluatedByCudf(
+  for (size_t i = 0; i < aggregationNode.aggregates().size(); ++i) {
+    const auto& aggregate = aggregationNode.aggregates()[i];
+    // Use step-aware validation that handles partial/final/intermediate steps.
+    // The registry knows a decimal SUM with its VARBINARY state only, and
+    // CudfAggregationNode has validated a call with the compact state.
+    const bool compactDecimalSum =
+        cudfNode != nullptr && cudfNode->usesCompactDecimalSum(i);
+    if (!compactDecimalSum &&
+        !canGroupbyAggregationBeEvaluatedByCudf(
             *aggregate.call, step, aggregate.rawInputTypes, queryCtx)) {
       return false;
     }
