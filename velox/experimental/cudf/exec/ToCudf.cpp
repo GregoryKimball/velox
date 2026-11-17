@@ -80,6 +80,10 @@ int64_t takeHostPeakResidentBytes() {
   return kilobytes < 0 ? -1 : kilobytes * 1'024;
 }
 
+// The worker is short of device memory when less than this share of the
+// memory available at its start is free: the share a Parquet pass may take.
+constexpr int64_t kShortOfDeviceMemoryShare = 16;
+
 // Logs the device and host memory peaks of each busy period of the worker:
 // from the first task that starts while no task runs to the completion of the
 // last running one. With one query at a time, these are the query's peaks (one
@@ -97,6 +101,12 @@ class MemoryPeakLogger : public exec::TaskListener {
         return;
       }
     }
+    // A device short of free memory needs the memory the pool keeps for the
+    // next query.
+    trimDeviceMemoryPoolWhenShort(
+        static_cast<std::size_t>(
+            gpuCapabilities().availableMemoryBytes /
+            kShortOfDeviceMemoryShare));
     // What stays once the worker is idle: memory still allocated through the
     // cuDF memory resource, and device memory free for the next query.
     std::size_t freeBytes{0};
@@ -545,6 +555,7 @@ void unregisterCudf() {
   }
   // Reset the any_resource copies before the adaptors they were copied from,
   // so that the wrapped upstream resources are released here.
+  forgetDeviceMemoryPools();
   output_mr_.reset();
   mr_.reset();
   outputStatsMr_.reset();

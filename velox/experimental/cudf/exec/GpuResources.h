@@ -74,6 +74,19 @@ bool admitSplitGroup(
     uint32_t numCompletedSplitGroups,
     double fraction);
 
+/// Returns the device memory that the pool of an "async" memory resource keeps
+/// for reuse to the device when less than 'minFreeBytes' of the device is
+/// free, and returns whether it did. Called when the worker goes idle: the pool
+/// keeps everything it ever reserved, and on a device with little memory to
+/// spare the next query then fails although no query holds the memory. A
+/// device with memory to spare keeps the pool, which saves each query growing
+/// it again. A no-op for the other memory resource modes.
+bool trimDeviceMemoryPoolWhenShort(std::size_t minFreeBytes);
+
+/// Forgets the pools trimDeviceMemoryPoolWhenShort() trims. Called when the
+/// memory resources that own them are destroyed.
+void forgetDeviceMemoryPools();
+
 /// Registers a function that frees device memory its owner holds outside the
 /// cuDF memory resource (e.g. a cache), given the size of a failed allocation.
 /// It returns whether it freed any.

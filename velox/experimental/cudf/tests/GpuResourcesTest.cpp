@@ -25,6 +25,8 @@
 #include <rmm/device_buffer.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -150,6 +152,34 @@ TEST_F(GpuResourcesTest, admitsASplitGroupWhileItsShareFits) {
   // Unknown memory admits nothing.
   EXPECT_FALSE(admitSplitGroup(-1, kAvailableBytes, 1, 1, 0.8));
   EXPECT_FALSE(admitSplitGroup(10, 0, 1, 1, 0.8));
+}
+
+// The pool of the "async" memory resource keeps a freed buffer's memory for
+// reuse. The worker returns it to the device only when the device is short of
+// free memory.
+TEST_F(GpuResourcesTest, trimsTheAsyncPoolOnlyWhenTheDeviceIsShort) {
+  CudfConfig::getInstance().memoryResource = "async";
+  registerCudf();
+  constexpr std::size_t kBytes = std::size_t{512} << 20;
+  auto freeBytes = [] {
+    std::size_t free{0};
+    std::size_t total{0};
+    EXPECT_EQ(cudaMemGetInfo(&free, &total), cudaSuccess);
+    return free;
+  };
+  auto stream = cudfGlobalStreamPool().get_stream();
+  {
+    rmm::device_buffer buffer(
+        kBytes, stream, cudf::get_current_device_resource_ref());
+  }
+  stream.sync();
+
+  const auto freeBefore = freeBytes();
+  EXPECT_FALSE(trimDeviceMemoryPoolWhenShort(0));
+  EXPECT_LT(freeBytes(), freeBefore + kBytes / 2);
+
+  EXPECT_TRUE(trimDeviceMemoryPoolWhenShort(freeBefore + kBytes));
+  EXPECT_GE(freeBytes(), freeBefore + kBytes / 2);
 }
 
 TEST_F(GpuResourcesTest, allocatedBytesIncludesSeparateOutputResource) {

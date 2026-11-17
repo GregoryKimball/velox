@@ -33,6 +33,7 @@
 #include <cuda_runtime.h>
 
 #include <common/base/Exceptions.h>
+#include <glog/logging.h>
 
 #include <cstdlib>
 #include <mutex>
@@ -40,6 +41,13 @@
 #include <string_view>
 
 namespace facebook::velox::cudf_velox {
+
+namespace {
+// Pools of the "async" memory resources createMemoryResource() made, for
+// trimDeviceMemoryPoolWhenShort().
+std::mutex asyncPoolsMutex;
+std::vector<cudaMemPool_t> asyncPools;
+} // namespace
 
 cuda::mr::any_resource<cuda::mr::device_accessible> createMemoryResource(
     std::string_view mode,
@@ -51,7 +59,10 @@ cuda::mr::any_resource<cuda::mr::device_accessible> createMemoryResource(
         rmm::mr::cuda_memory_resource{},
         rmm::percent_of_free_device_memory(percent));
   } else if (mode == "async") {
-    return rmm::mr::cuda_async_memory_resource{};
+    rmm::mr::cuda_async_memory_resource resource{};
+    std::lock_guard<std::mutex> lock(asyncPoolsMutex);
+    asyncPools.push_back(resource.pool_handle());
+    return resource;
   } else if (mode == "arena") {
     return rmm::mr::arena_memory_resource(
         rmm::mr::cuda_memory_resource{},
@@ -83,6 +94,33 @@ cuda::mr::any_resource<cuda::mr::device_accessible> createMemoryResource(
       "Unknown memory resource mode: " + std::string(mode) +
       "\nExpecting: cuda, pool, async, arena, managed, prefetch_managed, " +
       "managed_pool, prefetch_managed_pool, managed_async, prefetch_managed_async");
+}
+
+bool trimDeviceMemoryPoolWhenShort(std::size_t minFreeBytes) {
+  std::size_t freeBytes{0};
+  std::size_t totalBytes{0};
+  if (cudaMemGetInfo(&freeBytes, &totalBytes) != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  if (freeBytes >= minFreeBytes) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(asyncPoolsMutex);
+  for (auto pool : asyncPools) {
+    // Keeps nothing: memory in use is not trimmed. Called from a task listener,
+    // so a failure is logged rather than thrown.
+    const auto status = cudaMemPoolTrimTo(pool, 0);
+    LOG_IF(WARNING, status != cudaSuccess)
+        << "Failed to trim the async memory pool: "
+        << cudaGetErrorString(status);
+  }
+  return !asyncPools.empty();
+}
+
+void forgetDeviceMemoryPools() {
+  std::lock_guard<std::mutex> lock(asyncPoolsMutex);
+  asyncPools.clear();
 }
 
 cudf::detail::cuda_stream_pool& cudfGlobalStreamPool() {
