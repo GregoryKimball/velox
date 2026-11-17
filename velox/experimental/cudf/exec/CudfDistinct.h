@@ -16,6 +16,7 @@
 #pragma once
 
 #include "velox/experimental/cudf/exec/CudfAggregation.h"
+#include "velox/experimental/cudf/exec/CudfBatchConcat.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
 
 namespace facebook::velox::cudf_velox {
@@ -59,6 +60,9 @@ class CudfDistinct : public CudfOperatorBase {
   // Merges the distinct keys of 'tbl' into bufferedResult_.
   void computeDistinctStreaming(CudfVectorPtr tbl);
 
+  // Merges the batches a final distinct holds into bufferedResult_.
+  void mergePendingInputs();
+
   std::vector<column_index_t> groupingKeyInputChannels_;
   std::vector<column_index_t> groupingKeyOutputChannels_;
 
@@ -66,10 +70,19 @@ class CudfDistinct : public CudfOperatorBase {
 
   const bool isPartialOutput_;
   const int64_t maxPartialAggregationMemoryUsage_;
+  // Size of the input a final distinct holds before it merges it into
+  // bufferedResult_: merging every small batch would hash the distinct keys
+  // so far again for each one.
+  const BatchConcatTarget mergeTarget_;
   int64_t numInputRows_ = 0;
 
   bool finished_ = false;
 
+  // Input batches a final distinct has not merged into bufferedResult_ yet.
+  std::vector<CudfVectorPtr> pendingInputs_;
+  size_t numPendingRows_{0};
+  uint64_t numPendingBytes_{0};
+  TypePtr inputType_;
   CudfVectorPtr bufferedResult_;
 };
 

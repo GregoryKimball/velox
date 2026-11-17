@@ -48,11 +48,13 @@ CudfDistinct::CudfDistinct(
           exec::isPartialOutput(aggregationNode->step()) &&
           !hasFinalAggs(aggregationNode->aggregates())),
       maxPartialAggregationMemoryUsage_(
-          driverCtx->queryConfig().maxPartialAggregationMemoryUsage()) {}
+          driverCtx->queryConfig().maxPartialAggregationMemoryUsage()),
+      mergeTarget_(aggregationNode->sources()[0]->outputType()) {}
 
 void CudfDistinct::initialize() {
   Operator::initialize();
 
+  inputType_ = aggregationNode_->sources()[0]->outputType();
   setupGroupingKeyChannelProjections(
       *aggregationNode_, groupingKeyInputChannels_, groupingKeyOutputChannels_);
 
@@ -108,7 +110,34 @@ void CudfDistinct::doAddInput(RowVectorPtr input) {
   auto cudfInput = std::dynamic_pointer_cast<cudf_velox::CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
 
-  computeDistinctStreaming(cudfInput);
+  if (isPartialOutput_) {
+    computeDistinctStreaming(cudfInput);
+    return;
+  }
+
+  numPendingRows_ += cudfInput->size();
+  if (mergeTarget_.countsBytes()) {
+    numPendingBytes_ += cudfInput->estimateFlatSize();
+  }
+  pendingInputs_.push_back(std::move(cudfInput));
+  if (mergeTarget_.isMet(numPendingRows_, numPendingBytes_)) {
+    mergePendingInputs();
+  }
+}
+
+void CudfDistinct::mergePendingInputs() {
+  if (pendingInputs_.empty()) {
+    return;
+  }
+  auto stream = cudfGlobalStreamPool().get_stream();
+  auto table = getConcatenatedTable(
+      std::exchange(pendingInputs_, {}), inputType_, stream, get_output_mr());
+  numPendingRows_ = 0;
+  numPendingBytes_ = 0;
+  const auto numRows = table->num_rows();
+  computeDistinctStreaming(
+      std::make_shared<CudfVector>(
+          pool(), inputType_, numRows, std::move(table), stream));
 }
 
 CudfVectorPtr CudfDistinct::getDistinctKeys(
@@ -175,11 +204,11 @@ RowVectorPtr CudfDistinct::doGetOutput() {
     return releaseAndResetBufferedResult();
   }
 
-  // A final distinct holds the distinct keys of all batches so far and returns
-  // them once every batch has arrived.
+  // A final distinct returns its distinct keys once every batch has arrived.
   if (finished_ || !noMoreInput_) {
     return nullptr;
   }
+  mergePendingInputs();
   finished_ = true;
   return std::move(bufferedResult_);
 }
@@ -192,6 +221,7 @@ void CudfDistinct::doNoMoreInput() {
 }
 
 void CudfDistinct::doClose() {
+  pendingInputs_.clear();
   bufferedResult_.reset();
   Operator::close();
 }
