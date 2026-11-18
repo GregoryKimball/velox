@@ -22,6 +22,7 @@
 #include "velox/common/caching/AsyncDataCache.h"
 #include "velox/connectors/common/BufferedInputBuilder.h"
 #include "velox/connectors/hive/FileHandle.h"
+#include "velox/dwio/common/BufferedInput.h"
 #include "velox/dwio/nimble/common/SchemaReader.h"
 #include "velox/dwio/nimble/common/SchemaSerialization.h"
 #include "velox/dwio/nimble/tablet/Constants.h"
@@ -56,6 +57,53 @@ folly::Executor* readExecutor() {
   return executor;
 }
 
+// Serves reads through a BufferedInput, so that the tablet footer, schema and
+// stripe group metadata, like the streams, come from the AsyncDataCache when
+// hot instead of costing object store round trips on every split open.
+class BufferedReadFile : public ReadFile {
+ public:
+  BufferedReadFile(
+      std::shared_ptr<dwio::common::BufferedInput> input,
+      std::shared_ptr<ReadFile> file)
+      : input_(std::move(input)), file_(std::move(file)) {}
+
+  std::string_view pread(
+      uint64_t offset,
+      uint64_t length,
+      void* buf,
+      const FileIoContext& /*context*/ = {}) const override {
+    if (length > 0) {
+      input_->read(offset, length, dwio::common::LogType::FILE)
+          ->readFully(static_cast<char*>(buf), length);
+    }
+    return {static_cast<char*>(buf), length};
+  }
+
+  bool shouldCoalesce() const override {
+    return file_->shouldCoalesce();
+  }
+
+  uint64_t size() const override {
+    return file_->size();
+  }
+
+  uint64_t memoryUsage() const override {
+    return file_->memoryUsage();
+  }
+
+  std::string getName() const override {
+    return file_->getName();
+  }
+
+  uint64_t getNaturalReadSize() const override {
+    return file_->getNaturalReadSize();
+  }
+
+ private:
+  const std::shared_ptr<dwio::common::BufferedInput> input_;
+  const std::shared_ptr<ReadFile> file_;
+};
+
 } // namespace
 
 CudfNimbleSplitReader::~CudfNimbleSplitReader() {
@@ -79,9 +127,8 @@ void CudfNimbleSplitReader::prepareSplitInternal(
       fileHandleKey, &fileProperties, ioStats_ ? ioStats_.get() : nullptr);
   VELOX_CHECK_NOT_NULL(fileHandle.get());
   readFile_ = fileHandle->file;
-  bufferedInput_.reset();
   if (cache::AsyncDataCache::getInstance() != nullptr) {
-    bufferedInput_ =
+    std::shared_ptr<dwio::common::BufferedInput> input =
         velox::connector::BufferedInputBuilder::getInstance()->create(
             *fileHandle,
             baseReaderOptions(),
@@ -89,6 +136,10 @@ void CudfNimbleSplitReader::prepareSplitInternal(
             ioStatistics_,
             ioStats_,
             executor_);
+    if (input != nullptr) {
+      readFile_ =
+          std::make_shared<BufferedReadFile>(std::move(input), readFile_);
+    }
   }
 
   facebook::nimble::TabletReader::Options tabletOptions;
@@ -244,18 +295,8 @@ CudfNimbleSplitReader::startBatch() {
       pieces.push_back(
           folly::via(
               readExecutor(),
-              [file = readFile_,
-               input = bufferedInput_,
-               fileOffset,
-               size,
-               out] {
-                if (input == nullptr) {
-                  file->pread(fileOffset, size, out);
-                  return;
-                }
-                auto stream = input->read(
-                    fileOffset, size, dwio::common::LogType::FILE);
-                stream->readFully(reinterpret_cast<char*>(out), size);
+              [file = readFile_, fileOffset, size, out] {
+                file->pread(fileOffset, size, out);
               })
               .semi());
     }
@@ -332,7 +373,6 @@ CudfNimbleSplitReader::readNextChunk() {
 void CudfNimbleSplitReader::resetSplit() {
   dropPending();
   tablet_.reset();
-  bufferedInput_.reset();
   readFile_.reset();
   streamIds_.clear();
   cudfTypes_.clear();
