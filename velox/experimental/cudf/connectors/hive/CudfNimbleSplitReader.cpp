@@ -35,7 +35,9 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <algorithm>
 #include <cstdlib>
+#include <numeric>
 #include <string>
 
 namespace facebook::velox::cudf_velox::connector::hive {
@@ -175,31 +177,67 @@ CudfNimbleSplitReader::startBatch() {
     decodedBytes += stripeDecoded;
   }
 
-  // The streams are read straight into the pinned buffer that goes to the
+  // Each request to an object store costs about as much as megabytes of
+  // transfer, and stores throttle the request rate per key prefix, so streams
+  // that lie close together in the file are read as one range, gap included.
+  static const uint64_t kGapBytes = [] {
+    const char* kb = std::getenv("NIMBLE_GPU_READ_GAP_KB");
+    return uint64_t{kb != nullptr ? std::stoul(kb) : 1024} << 10;
+  }();
+  static const uint64_t kPieceBytes = [] {
+    const char* mb = std::getenv("NIMBLE_GPU_READ_PIECE_MB");
+    return uint64_t{mb != nullptr ? std::stoul(mb) : 16} << 20;
+  }();
+  std::vector<size_t> order(reads.size());
+  std::iota(order.begin(), order.end(), 0);
+  std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+    return reads[a].fileOffset < reads[b].fileOffset;
+  });
+  struct Range {
+    uint64_t fileOffset;
+    uint64_t size;
+    size_t hostOffset;
+  };
+  std::vector<Range> ranges;
+  std::vector<size_t> hostOffsets(reads.size());
+  size_t hostBytes = 0;
+  for (const auto index : order) {
+    const auto& read = reads[index];
+    if (ranges.empty() ||
+        read.fileOffset > ranges.back().fileOffset + ranges.back().size +
+                kGapBytes) {
+      ranges.push_back({read.fileOffset, 0, hostBytes});
+    }
+    auto& range = ranges.back();
+    const auto end =
+        std::max(range.fileOffset + range.size, read.fileOffset + read.size);
+    hostBytes += end - (range.fileOffset + range.size);
+    range.size = end - range.fileOffset;
+    hostOffsets[index] = range.hostOffset + (read.fileOffset - range.fileOffset);
+  }
+
+  // The ranges are read straight into the pinned buffer that goes to the
   // device, in pieces spread over the read threads.
   PendingBatch pending;
-  pending.pinned =
-      std::make_unique<NimbleGpuDecoder::PinnedBuffer>(batchBytes);
-  pending.bytes = batchBytes;
+  pending.pinned = std::make_unique<NimbleGpuDecoder::PinnedBuffer>(hostBytes);
+  pending.bytes = hostBytes;
   auto* host = pending.pinned->data();
-  constexpr uint64_t kPieceBytes = uint64_t{4} << 20;
   std::vector<folly::SemiFuture<folly::Unit>> pieces;
-  size_t offset = 0;
+  for (const auto& range : ranges) {
+    for (uint64_t done = 0; done < range.size; done += kPieceBytes) {
+      const auto size = std::min(kPieceBytes, range.size - done);
+      auto* out = host + range.hostOffset + done;
+      const auto fileOffset = range.fileOffset + done;
+      pieces.push_back(
+          folly::via(readExecutor(), [this, fileOffset, size, out] {
+            readFile_->pread(fileOffset, size, out);
+          }).semi());
+    }
+  }
   size_t next = 0;
   for (auto& entry : batch) {
-    for (size_t i = 0; i < streamIds_.size(); ++i) {
-      const auto& read = reads[next++];
-      for (uint64_t done = 0; done < read.size; done += kPieceBytes) {
-        const auto size = std::min(kPieceBytes, read.size - done);
-        auto* out = host + offset + done;
-        const auto fileOffset = read.fileOffset + done;
-        pieces.push_back(
-            folly::via(readExecutor(), [this, fileOffset, size, out] {
-              readFile_->pread(fileOffset, size, out);
-            }).semi());
-      }
-      entry.streams.emplace_back(host + offset, read.size);
-      offset += read.size;
+    for (size_t i = 0; i < streamIds_.size(); ++i, ++next) {
+      entry.streams.emplace_back(host + hostOffsets[next], reads[next].size);
     }
   }
   pending.stripes = std::move(batch);
