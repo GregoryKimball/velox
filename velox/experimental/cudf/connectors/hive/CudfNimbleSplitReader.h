@@ -20,7 +20,6 @@
 #include "velox/experimental/cudf/connectors/hive/NimbleGpuDecoder.h"
 
 #include "velox/common/file/File.h"
-#include "velox/dwio/common/BufferedInput.h"
 
 #include <folly/futures/Future.h>
 
@@ -68,10 +67,9 @@ class CudfNimbleSplitReader : public CudfSplitReader {
   // Waits for the reads of the pending batch, ignoring their errors.
   void dropPending();
 
+  // Reads through the AsyncDataCache and its SSD tier when the process has a
+  // cache.
   std::shared_ptr<ReadFile> readFile_;
-  // Reads stream bytes through the AsyncDataCache and its SSD tier when the
-  // process has a cache; null otherwise.
-  std::shared_ptr<dwio::common::BufferedInput> bufferedInput_;
   std::shared_ptr<facebook::nimble::TabletReader> tablet_;
   // The stream id of each read column.
   std::vector<uint32_t> streamIds_;
