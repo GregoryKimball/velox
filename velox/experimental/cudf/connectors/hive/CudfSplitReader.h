@@ -138,6 +138,12 @@ class CudfSplitReader : public NvtxHelper {
     return *cudfHiveConfig_;
   }
 
+  // Returns the reader options, with the Hive load quantum and coalescing
+  // limits applied, that a BufferedInput for the split is built with.
+  const dwio::common::ReaderOptions& baseReaderOptions() const {
+    return baseReaderOpts_;
+  }
+
   // Performs split-specific setup after the Parquet footer is loaded.
   virtual void prepareSplitInternal(dwio::common::RuntimeStats& runtimeStats);
 
