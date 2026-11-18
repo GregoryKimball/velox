@@ -2041,6 +2041,15 @@ void CudfGroupby::initialize() {
       aggregationInput.constants,
       aggregationInput.maskChannels);
 
+  const auto& cudfConfig = CudfConfig::getInstance();
+  if (aggregationNode_->step() == core::AggregationNode::Step::kFinal &&
+      !aggregationNode_->groupingKeys().empty() &&
+      cudfConfig.finalAggregationSpillMb > 0) {
+    spillBytes_ = static_cast<uint64_t>(cudfConfig.finalAggregationSpillMb)
+        << 20;
+    streamingGroupbyEnabled_ = false;
+  }
+
   // Check that aggregate result type match the output type.
   // TODO: This is output schema validation. In velox CPU, it's done using
   // output types reported by aggregation functions. We can't do that in cudf
@@ -2198,6 +2207,88 @@ void CudfGroupby::computeSingleGroupbyIncrementally(CudfVectorPtr tbl) {
   }
 }
 
+void CudfGroupby::spillInputs() {
+  if (!spill_) {
+    std::vector<cudf::size_type> keys;
+    for (auto channel : groupingKeyOutputChannels_) {
+      keys.push_back(aggregationInputChannels_[channel]);
+    }
+    spill_ = std::make_unique<HostPartitionedSpill>(
+        std::move(keys),
+        CudfConfig::getInstance().finalAggregationSpillPartitions);
+  }
+  auto stream = cudfGlobalStreamPool().get_stream();
+  auto tbl = getConcatenatedTable(
+      std::exchange(inputs_, {}), inputType_, stream, get_temp_mr());
+  inputBytes_ = 0;
+  spill_->spill(tbl->view(), stream, get_temp_mr());
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        "spilledHostBytes",
+        RuntimeCounter(spill_->bytes(), RuntimeCounter::Unit::kBytes));
+  }
+}
+
+CudfVectorPtr CudfGroupby::aggregateFinalInput(
+    cudf::table_view input,
+    cuda::stream_ref stream) {
+  auto permutedInputView = input.select(
+      aggregationInputChannels_.begin(), aggregationInputChannels_.end());
+  if (!incrementalAggregationEnabled_) {
+    return doGroupByAggregation(
+        permutedInputView,
+        groupingKeyOutputChannels_,
+        aggregators_,
+        outputType_,
+        stream,
+        get_output_mr());
+  }
+  // As computeFinalGroupbyIncrementally() does for a single batch: merge the
+  // intermediate states per key, then finalize them.
+  bufferedResult_ = doGroupByAggregation(
+      permutedInputView,
+      groupingKeyOutputChannels_,
+      intermediateAggregators_,
+      bufferedResultType_,
+      stream,
+      get_output_mr());
+  if (!bufferedResult_) {
+    return nullptr;
+  }
+  return finalizeGroupedStates(aggregators_);
+}
+
+RowVectorPtr CudfGroupby::getSpilledOutput() {
+  auto stream = cudfGlobalStreamPool().get_stream();
+  if (!spill_) {
+    finished_ = true;
+    if (inputs_.empty()) {
+      return nullptr;
+    }
+    auto tbl = getConcatenatedTable(
+        std::exchange(inputs_, {}), inputType_, stream, get_temp_mr());
+    inputBytes_ = 0;
+    return aggregateFinalInput(tbl->view(), stream);
+  }
+  if (!inputs_.empty()) {
+    spillInputs();
+  }
+  while (nextSpillPartition_ < spill_->numPartitions()) {
+    auto tbl = spill_->read(nextSpillPartition_++, stream, get_temp_mr());
+    if (!tbl) {
+      continue;
+    }
+    auto result = aggregateFinalInput(tbl->view(), stream);
+    if (result) {
+      return result;
+    }
+  }
+  finished_ = true;
+  spill_.reset();
+  return nullptr;
+}
+
 void CudfGroupby::doAddInput(RowVectorPtr input) {
   if (input->size() == 0) {
     return;
@@ -2206,6 +2297,15 @@ void CudfGroupby::doAddInput(RowVectorPtr input) {
 
   auto cudfInput = std::dynamic_pointer_cast<cudf_velox::CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
+
+  if (spillBytes_ > 0) {
+    inputBytes_ += cudfInput->estimateFlatSize();
+    inputs_.push_back(std::move(cudfInput));
+    if (inputBytes_ >= spillBytes_) {
+      spillInputs();
+    }
+    return;
+  }
 
   if (streamingGroupbyEnabled_) {
     computeFinalGroupbyStreaming(std::move(cudfInput));
@@ -2364,6 +2464,10 @@ RowVectorPtr CudfGroupby::doGetOutput() {
     return nullptr;
   }
 
+  if (spillBytes_ > 0) {
+    return getSpilledOutput();
+  }
+
   if (streamingGroupbyEnabled_) {
     finished_ = true;
     return finalizeStreamingGroupby();
@@ -2432,6 +2536,7 @@ void CudfGroupby::doClose() {
   streamingGroupbyAggregators_.clear();
   inputs_.clear();
   bufferedResult_.reset();
+  spill_.reset();
   aggregators_.clear();
   intermediateAggregators_.clear();
   partialAggregators_.clear();

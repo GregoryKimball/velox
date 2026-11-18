@@ -43,6 +43,7 @@ add_library(
   DecimalAggregationState.cpp
   GpuCapabilities.cpp
   GpuResources.cpp
+  HostPartitionedSpill.cpp
   OperatorAdapters.cpp
   PrestoAggregateFunctions.cpp
   SparkAggregateFunctions.cpp

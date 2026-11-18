@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfDistinct.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
@@ -57,7 +58,53 @@ void CudfDistinct::initialize() {
   setupGroupingKeyChannelProjections(
       *aggregationNode_, groupingKeyInputChannels_, groupingKeyOutputChannels_);
 
+  const auto& config = CudfConfig::getInstance();
+  if (!isPartialOutput_ && config.finalAggregationSpillMb > 0 &&
+      !groupingKeyInputChannels_.empty()) {
+    spillBytes_ = static_cast<uint64_t>(config.finalAggregationSpillMb) << 20;
+  }
+
   aggregationNode_.reset();
+}
+
+void CudfDistinct::spillInputs() {
+  if (!spill_) {
+    spill_ = std::make_unique<HostPartitionedSpill>(
+        std::vector<cudf::size_type>(
+            groupingKeyInputChannels_.begin(), groupingKeyInputChannels_.end()),
+        CudfConfig::getInstance().finalAggregationSpillPartitions);
+  }
+  auto stream = cudfGlobalStreamPool().get_stream();
+  auto tbl = getConcatenatedTable(
+      std::exchange(inputs_, {}), inputType_, stream, get_temp_mr());
+  inputBytes_ = 0;
+  spill_->spill(tbl->view(), stream, get_temp_mr());
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        "spilledHostBytes", RuntimeCounter(spill_->bytes(), RuntimeCounter::Unit::kBytes));
+  }
+}
+
+RowVectorPtr CudfDistinct::getSpilledOutput() {
+  if (!inputs_.empty()) {
+    spillInputs();
+  }
+  auto stream = cudfGlobalStreamPool().get_stream();
+  while (nextSpillPartition_ < spill_->numPartitions()) {
+    auto tbl = spill_->read(nextSpillPartition_++, stream, get_temp_mr());
+    if (!tbl) {
+      continue;
+    }
+    auto result =
+        getDistinctKeys(tbl->view(), groupingKeyInputChannels_, stream);
+    if (result) {
+      return result;
+    }
+  }
+  finished_ = true;
+  spill_.reset();
+  return nullptr;
 }
 
 void CudfDistinct::computePartialDistinctStreaming(CudfVectorPtr tbl) {
@@ -114,7 +161,11 @@ void CudfDistinct::doAddInput(RowVectorPtr input) {
     return;
   }
 
+  inputBytes_ += cudfInput->estimateFlatSize();
   inputs_.push_back(std::move(cudfInput));
+  if (spillBytes_ > 0 && inputBytes_ >= spillBytes_) {
+    spillInputs();
+  }
 }
 
 CudfVectorPtr CudfDistinct::getDistinctKeys(
@@ -191,6 +242,10 @@ RowVectorPtr CudfDistinct::doGetOutput() {
     return nullptr;
   }
 
+  if (spill_) {
+    return getSpilledOutput();
+  }
+
   if (inputs_.empty() && !noMoreInput_) {
     return nullptr;
   }
@@ -223,6 +278,7 @@ void CudfDistinct::doNoMoreInput() {
 void CudfDistinct::doClose() {
   inputs_.clear();
   bufferedResult_.reset();
+  spill_.reset();
   Operator::close();
 }
 

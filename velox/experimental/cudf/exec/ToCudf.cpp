@@ -487,6 +487,21 @@ void CudfConfig::initialize(
         kCudfHashJoinLoadFactor,
         hashJoinLoadFactor);
   }
+  if (config.find(kCudfFinalAggregationSpillMb) != config.end()) {
+    finalAggregationSpillMb =
+        folly::to<int64_t>(config[kCudfFinalAggregationSpillMb]);
+    VELOX_USER_CHECK_GE(
+        finalAggregationSpillMb, 0, "{}", kCudfFinalAggregationSpillMb);
+  }
+  if (config.find(kCudfFinalAggregationSpillPartitions) != config.end()) {
+    finalAggregationSpillPartitions =
+        folly::to<int32_t>(config[kCudfFinalAggregationSpillPartitions]);
+    VELOX_USER_CHECK_GT(
+        finalAggregationSpillPartitions,
+        0,
+        "{}",
+        kCudfFinalAggregationSpillPartitions);
+  }
   if (config.find(kCudfBatchSizeMaxThreshold) != config.end()) {
     batchSizeMaxThreshold =
         folly::to<int32_t>(config[kCudfBatchSizeMaxThreshold]);

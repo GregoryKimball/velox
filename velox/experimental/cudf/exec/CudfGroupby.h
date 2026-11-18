@@ -17,6 +17,7 @@
 
 #include "velox/experimental/cudf/exec/CudfAggregation.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
+#include "velox/experimental/cudf/exec/HostPartitionedSpill.h"
 
 #include <cudf/groupby.hpp>
 
@@ -246,6 +247,18 @@ class CudfGroupby : public CudfOperatorBase {
   void computeFinalGroupbyIncrementally(CudfVectorPtr tbl);
   void computeSingleGroupbyIncrementally(CudfVectorPtr tbl);
 
+  // Moves 'inputs_' to 'spill_'.
+  void spillInputs();
+
+  // Aggregates the buffered final input: all of 'inputs_' when nothing was
+  // spilled, else the next non-empty spill partition.
+  RowVectorPtr getSpilledOutput();
+
+  // Aggregates final-step input 'input', laid out as the operator input.
+  CudfVectorPtr aggregateFinalInput(
+      cudf::table_view input,
+      cuda::stream_ref stream);
+
   std::vector<column_index_t> groupingKeyInputChannels_;
   std::vector<column_index_t> groupingKeyOutputChannels_;
   std::vector<column_index_t> aggregationInputChannels_;
@@ -282,6 +295,14 @@ class CudfGroupby : public CudfOperatorBase {
   std::optional<cuda::stream_ref> streamingGroupbyStream_;
   std::unique_ptr<CudaEvent> streamingGroupbyEvent_;
   size_t streamingGroupbyCapacity_{0};
+
+  // Final step only: buffered bytes in 'inputs_' that trigger a spill, 0 when
+  // spilling is off. When positive the final step buffers its input instead of
+  // aggregating it incrementally.
+  uint64_t spillBytes_{0};
+  uint64_t inputBytes_{0};
+  std::unique_ptr<HostPartitionedSpill> spill_;
+  int32_t nextSpillPartition_{0};
 };
 
 } // namespace facebook::velox::cudf_velox
