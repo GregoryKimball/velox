@@ -176,7 +176,7 @@ DeviceColumn::DeviceColumn(
           host.nullMask.bytes == 0 ? cudf::mask_state::UNALLOCATED
                                    : cudf::mask_state::UNINITIALIZED,
           stream,
-          mr));
+          cudf::memory_resources{mr, get_temp_mr()}));
   children.reserve(host.children.size());
   for (const auto& child : host.children) {
     children.emplace_back(child, stream, mr);
@@ -660,7 +660,10 @@ std::unique_ptr<cudf::table> SpilledCudfVector::tryRestoreConcatenated(
             static_cast<cudf::size_type>(totalRows),
             std::move(*buffers[c]),
             cudf::create_null_mask(
-                0, cudf::mask_state::UNALLOCATED, stream, mr),
+                0,
+                cudf::mask_state::UNALLOCATED,
+                stream,
+                cudf::memory_resources{mr, get_temp_mr()}),
             0));
   }
   return std::make_unique<cudf::table>(std::move(columns));
