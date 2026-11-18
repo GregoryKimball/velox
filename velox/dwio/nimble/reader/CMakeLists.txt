@@ -41,6 +41,7 @@ target_link_libraries(
   nimble_velox_field_reader
   nimble_velox_schema_reader
   nimble_common
+  nimble_encodings
   Folly::folly
   absl::flat_hash_map
   protobuf::libprotobuf
