@@ -17,6 +17,7 @@
 
 #include "velox/experimental/cudf/exec/CudfAggregation.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
+#include "velox/experimental/cudf/exec/PartitionedBufferedState.h"
 
 #include <cudf/groupby.hpp>
 
@@ -31,6 +32,7 @@ class QueryConfig;
 namespace facebook::velox::cudf_velox {
 
 class CudaEvent;
+class GroupbyBufferedStateOps;
 
 inline constexpr std::string_view kStreamingGroupbyUsedStat{
     "streamingGroupbyUsed"};
@@ -211,6 +213,8 @@ class CudfGroupby : public CudfOperatorBase {
   void doClose() override;
 
  private:
+  friend class GroupbyBufferedStateOps;
+
   CudfVectorPtr doGroupByAggregation(
       cudf::table_view tableView,
       std::vector<column_index_t> const& groupByKeys,
@@ -219,12 +223,13 @@ class CudfGroupby : public CudfOperatorBase {
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr);
 
-  // Converts the merged per-key states in 'bufferedResult_' to final output
+  // Converts the merged per-key states in 'groupedStates' to final output
   // without regrouping. Keeps key columns as-is.
   CudfVectorPtr finalizeGroupedStates(
+      CudfVectorPtr groupedStates,
       std::vector<std::unique_ptr<GroupbyAggregator>>& aggregators);
 
-  CudfVectorPtr releaseAndResetBufferedResult();
+  void recordPartialFlushStats(const CudfVector& output);
 
   bool initializeStreamingGroupby(
       const RowTypePtr& inputRowSchema,
@@ -274,7 +279,8 @@ class CudfGroupby : public CudfOperatorBase {
   std::vector<CudfVectorPtr> inputs_;
   TypePtr inputType_;
   RowTypePtr bufferedResultType_;
-  CudfVectorPtr bufferedResult_;
+  std::unique_ptr<FlushableBufferedState> flushableBufferedState_;
+  std::unique_ptr<PartitionedBufferedState> partitionedBufferedState_;
 
   std::vector<std::unique_ptr<StreamingGroupbyAggregator>>
       streamingGroupbyAggregators_;
