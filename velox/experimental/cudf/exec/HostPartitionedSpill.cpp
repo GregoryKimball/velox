@@ -61,7 +61,11 @@ void HostPartitionedSpill::spill(
       kSpillHashSeed,
       stream,
       mr);
-  std::vector<cudf::size_type> splits(offsets.begin() + 1, offsets.end());
+  // 'offsets' starts with each partition's first row and may end with the
+  // row count; the splits are the starts of partitions 1 to N - 1.
+  VELOX_CHECK_GE(offsets.size(), partitions_.size());
+  std::vector<cudf::size_type> splits(
+      offsets.begin() + 1, offsets.begin() + partitions_.size());
   auto packed = cudf::contiguous_split(partitioned->view(), splits, stream, mr);
   partitioned.reset();
   VELOX_CHECK_EQ(packed.size(), partitions_.size());
