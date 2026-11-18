@@ -19,6 +19,8 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
+#include "velox/common/caching/AsyncDataCache.h"
+#include "velox/connectors/common/BufferedInputBuilder.h"
 #include "velox/connectors/hive/FileHandle.h"
 #include "velox/dwio/nimble/common/SchemaReader.h"
 #include "velox/dwio/nimble/common/SchemaSerialization.h"
@@ -77,6 +79,17 @@ void CudfNimbleSplitReader::prepareSplitInternal(
       fileHandleKey, &fileProperties, ioStats_ ? ioStats_.get() : nullptr);
   VELOX_CHECK_NOT_NULL(fileHandle.get());
   readFile_ = fileHandle->file;
+  bufferedInput_.reset();
+  if (cache::AsyncDataCache::getInstance() != nullptr) {
+    bufferedInput_ =
+        velox::connector::BufferedInputBuilder::getInstance()->create(
+            *fileHandle,
+            baseReaderOptions(),
+            connectorQueryCtx_,
+            ioStatistics_,
+            ioStats_,
+            executor_);
+  }
 
   facebook::nimble::TabletReader::Options tabletOptions;
   tabletOptions.ioOptions.emplace(connectorQueryCtx_->memoryPool())
@@ -229,9 +242,22 @@ CudfNimbleSplitReader::startBatch() {
       auto* out = host + range.hostOffset + done;
       const auto fileOffset = range.fileOffset + done;
       pieces.push_back(
-          folly::via(readExecutor(), [this, fileOffset, size, out] {
-            readFile_->pread(fileOffset, size, out);
-          }).semi());
+          folly::via(
+              readExecutor(),
+              [file = readFile_,
+               input = bufferedInput_,
+               fileOffset,
+               size,
+               out] {
+                if (input == nullptr) {
+                  file->pread(fileOffset, size, out);
+                  return;
+                }
+                auto stream = input->read(
+                    fileOffset, size, dwio::common::LogType::FILE);
+                stream->readFully(reinterpret_cast<char*>(out), size);
+              })
+              .semi());
     }
   }
   size_t next = 0;
@@ -306,6 +332,7 @@ CudfNimbleSplitReader::readNextChunk() {
 void CudfNimbleSplitReader::resetSplit() {
   dropPending();
   tablet_.reset();
+  bufferedInput_.reset();
   readFile_.reset();
   streamIds_.clear();
   cudfTypes_.clear();
