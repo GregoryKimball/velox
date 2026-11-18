@@ -41,8 +41,14 @@
 namespace facebook::velox::cudf_velox::connector::hive {
 namespace {
 
+// Object stores need many concurrent ranged reads to reach line rate; the
+// S3 client's connection limit (hive.s3.max-connections) must allow as many.
 folly::Executor* readExecutor() {
-  static auto* executor = new folly::CPUThreadPoolExecutor(16);
+  static auto* executor = [] {
+    const char* threads = std::getenv("NIMBLE_GPU_READ_THREADS");
+    return new folly::CPUThreadPoolExecutor(
+        threads != nullptr ? std::stoul(threads) : 64);
+  }();
   return executor;
 }
 
