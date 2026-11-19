@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfAggregationNode.h"
 #include "velox/experimental/cudf/exec/CudfGroupby.h"
+#include "velox/experimental/cudf/exec/CudfPlanNodeConversion.h"
 #include "velox/experimental/cudf/exec/CudfSpillContext.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationHostOps.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationState.h"
@@ -2477,7 +2478,7 @@ cudf::column_view GroupbyAggregator::materializeMaskedInput(
 }
 
 std::vector<std::unique_ptr<GroupbyAggregator>> toGroupbyAggregators(
-    core::AggregationNode const& aggregationNode,
+    const CudfAggregationNode& aggregationNode,
     core::AggregationNode::Step step,
     TypePtr const& outputType,
     std::vector<VectorPtr> const& constants,
@@ -2496,7 +2497,7 @@ std::vector<std::unique_ptr<GroupbyAggregator>> toGroupbyAggregators(
 
 std::optional<std::vector<std::unique_ptr<StreamingGroupbyAggregator>>>
 toStreamingGroupbyAggregators(
-    const core::AggregationNode& aggregationNode,
+    const CudfAggregationNode& aggregationNode,
     const RowTypePtr& inputType,
     const std::vector<column_index_t>& aggregationInputChannels,
     const TypePtr& outputType,
@@ -2547,16 +2548,16 @@ bool canGroupbyBeEvaluatedByCudf(
   // Get the aggregation step from the node
   auto step = aggregationNode.step();
 
-  const auto* cudfNode =
-      dynamic_cast<const CudfAggregationNode*>(&aggregationNode);
+  const auto* compactNode =
+      dynamic_cast<const CudfCompactAggregationNode*>(&aggregationNode);
   // Check supported aggregation functions using step-aware aggregation registry
   for (size_t i = 0; i < aggregationNode.aggregates().size(); ++i) {
     const auto& aggregate = aggregationNode.aggregates()[i];
     // Use step-aware validation that handles partial/final/intermediate steps.
     // The registry knows a decimal SUM with its VARBINARY state only, and
-    // CudfAggregationNode has validated a call with the compact state.
+    // CudfCompactAggregationNode has validated a call with the compact state.
     const bool compactDecimalSum =
-        cudfNode != nullptr && cudfNode->usesCompactDecimalSum(i);
+        compactNode != nullptr && compactNode->usesCompactDecimalSum(i);
     if (!compactDecimalSum &&
         !canGroupbyAggregationBeEvaluatedByCudf(
             *aggregate.call, step, aggregate.rawInputTypes, queryCtx)) {
@@ -2604,6 +2605,15 @@ CudfGroupby::CudfGroupby(
     int32_t operatorId,
     exec::DriverCtx* driverCtx,
     std::shared_ptr<core::AggregationNode const> const& aggregationNode)
+    : CudfGroupby(
+          operatorId,
+          driverCtx,
+          toCudfPlanNode<CudfAggregationNode>(aggregationNode)) {}
+
+CudfGroupby::CudfGroupby(
+    int32_t operatorId,
+    exec::DriverCtx* driverCtx,
+    std::shared_ptr<const CudfAggregationNode> aggregationNode)
     : CudfOperatorBase(
           operatorId,
           driverCtx,

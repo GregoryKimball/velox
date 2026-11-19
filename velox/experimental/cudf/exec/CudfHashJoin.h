@@ -20,6 +20,7 @@
 #include "velox/experimental/cudf/exec/CudfJoinBuild.h"
 #include "velox/experimental/cudf/exec/CudfJoinSpillState.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
+#include "velox/experimental/cudf/exec/CudfPlanNodes.h"
 #include "velox/experimental/cudf/expression/AstExpression.h"
 #include "velox/experimental/cudf/expression/AstExpressionUtils.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
@@ -162,6 +163,11 @@ class CudfHashJoinBuild : public CudfJoinBuild {
       exec::DriverCtx* driverCtx,
       std::shared_ptr<const core::HashJoinNode> joinNode);
 
+  CudfHashJoinBuild(
+      int32_t operatorId,
+      exec::DriverCtx* driverCtx,
+      std::shared_ptr<const CudfHashJoinNode> joinNode);
+
  protected:
   void recordInputStats(const CudfVector& input) override;
   void buildAndPublish(std::vector<CudfVectorPtr> inputs) override;
@@ -181,7 +187,7 @@ class CudfHashJoinBuild : public CudfJoinBuild {
   // Restores the build rows of one partition and publishes their hash tables.
   void publishPartition(std::unique_ptr<CudfJoinSpillState> data);
 
-  std::shared_ptr<const core::HashJoinNode> joinNode_;
+  std::shared_ptr<const CudfHashJoinNode> joinNode_;
   // True for the driver that partitioned the build. It stays until the last
   // round to build each partition's hash tables.
   bool partitionedBuild_{false};
@@ -206,6 +212,11 @@ class CudfHashJoinProbe : public CudfOperatorBase {
       int32_t operatorId,
       exec::DriverCtx* driverCtx,
       std::shared_ptr<const core::HashJoinNode> joinNode);
+
+  CudfHashJoinProbe(
+      int32_t operatorId,
+      exec::DriverCtx* driverCtx,
+      std::shared_ptr<const CudfHashJoinNode> joinNode);
 
   void initialize() override;
 
@@ -278,7 +289,7 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   // Reports the counters of probe rows moved to host memory and back.
   void recordSpillStats();
 
-  std::shared_ptr<const core::HashJoinNode> joinNode_;
+  std::shared_ptr<const CudfHashJoinNode> joinNode_;
   /** @brief Hash tables and join objects received from build operator */
   std::optional<hash_type> hashObject_;
 

@@ -34,12 +34,12 @@ namespace facebook::velox::cudf_velox {
 /// The node has the shape of a core::AggregationNode but must not run as a
 /// CPU aggregation: the CPU sum function reads and writes the VARBINARY state.
 /// The cuDF driver adapter fails the query instead of falling back.
-class CudfAggregationNode final : public core::AggregationNode {
+class CudfCompactAggregationNode final : public core::AggregationNode {
  public:
   /// 'node' already has the calls and the source of the compact plan. Each
   /// entry of 'compactIntermediateTypes' belongs to the aggregate at the same
   /// position; nullptr keeps that aggregate's ordinary intermediate type.
-  CudfAggregationNode(
+  CudfCompactAggregationNode(
       const core::AggregationNode& node,
       std::vector<TypePtr> compactIntermediateTypes);
 

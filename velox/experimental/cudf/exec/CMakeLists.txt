@@ -37,6 +37,11 @@ add_library(
   CudfNestedLoopJoin.cpp
   CudfOperator.cpp
   CudfOrderBy.cpp
+  CudfPlanNode.cpp
+  CudfPlanNodeConversion.cpp
+  CudfPlanNodeDefinitions.cpp
+  CudfPlanNodeTranslator.cpp
+  CudfPlanRewriter.cpp
   CudfReduce.cpp
   CudfSpillContext.cpp
   CudfTopN.cpp
@@ -47,6 +52,7 @@ add_library(
   DecimalAggregationHostOps.cpp
   DecimalAggregationState.cpp
   GpuCapabilities.cpp
+  GpuPlacement.cpp
   GpuResources.cpp
   HostPartitionedSpill.cpp
   HostSpillBudget.cpp

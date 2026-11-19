@@ -50,11 +50,11 @@ void collectNodeIds(
 // first.
 void collectCompactAggregations(
     const core::PlanNodePtr& plan,
-    std::vector<const CudfAggregationNode*>& nodes) {
+    std::vector<const CudfCompactAggregationNode*>& nodes) {
   for (const auto& source : plan->sources()) {
     collectCompactAggregations(source, nodes);
   }
-  if (const auto* node = dynamic_cast<const CudfAggregationNode*>(plan.get())) {
+  if (const auto* node = dynamic_cast<const CudfCompactAggregationNode*>(plan.get())) {
     nodes.push_back(node);
   }
 }
@@ -62,7 +62,7 @@ void collectCompactAggregations(
 // Rewrites the FINAL aggregation 'plan' ends with and fails the test if the
 // rewrite did not apply.
 core::PlanNodePtr toCompactDecimalSum(const core::PlanNodePtr& plan) {
-  auto rewritten = CudfAggregationNode::rewriteFinalAggregation(plan);
+  auto rewritten = CudfCompactAggregationNode::rewriteFinalAggregation(plan);
   EXPECT_NE(rewritten, plan) << "The compact decimal SUM rewrite did not apply";
   return rewritten;
 }
@@ -139,10 +139,10 @@ TEST_F(CudfAggregationNodeTest, rewriteKeepsPlanShape) {
           .finalAggregation()
           .planNode();
 
-  auto rewritten = CudfAggregationNode::rewriteFinalAggregation(original);
+  auto rewritten = CudfCompactAggregationNode::rewriteFinalAggregation(original);
   ASSERT_NE(rewritten, original);
   const auto* finalNode =
-      dynamic_cast<const CudfAggregationNode*>(rewritten.get());
+      dynamic_cast<const CudfCompactAggregationNode*>(rewritten.get());
   ASSERT_NE(finalNode, nullptr);
   // The same node ids and the same result type: only the state column changes.
   EXPECT_EQ(finalNode->id(), original->id());
@@ -156,7 +156,7 @@ TEST_F(CudfAggregationNodeTest, rewriteKeepsPlanShape) {
   const auto& local = finalNode->sources()[0];
   EXPECT_EQ(local->id(), original->sources()[0]->id());
   const auto* partialNode =
-      dynamic_cast<const CudfAggregationNode*>(local->sources()[0].get());
+      dynamic_cast<const CudfCompactAggregationNode*>(local->sources()[0].get());
   ASSERT_NE(partialNode, nullptr);
   EXPECT_EQ(partialNode->id(), original->sources()[0]->sources()[0]->id());
   EXPECT_TRUE(partialNode->usesCompactDecimalSum(0));
@@ -174,7 +174,7 @@ TEST_F(CudfAggregationNodeTest, rewriteKeepsPlanShape) {
   }
 
   // The rewrite does not apply twice.
-  EXPECT_EQ(CudfAggregationNode::rewriteFinalAggregation(rewritten), rewritten);
+  EXPECT_EQ(CudfCompactAggregationNode::rewriteFinalAggregation(rewritten), rewritten);
 }
 
 TEST_F(CudfAggregationNodeTest, rewriteSkipsIneligiblePlans) {
@@ -187,7 +187,7 @@ TEST_F(CudfAggregationNodeTest, rewriteSkipsIneligiblePlans) {
           makeFlatVector<bool>({true, false}),
       });
   const auto expectUnchanged = [](const core::PlanNodePtr& plan) {
-    EXPECT_EQ(CudfAggregationNode::rewriteFinalAggregation(plan), plan)
+    EXPECT_EQ(CudfCompactAggregationNode::rewriteFinalAggregation(plan), plan)
         << plan->toString(true, true);
   };
 
@@ -234,7 +234,7 @@ TEST_F(CudfAggregationNodeTest, rewriteSkipsIneligiblePlans) {
   unregisterCudf();
   expectUnchanged(eligible);
   registerCudf();
-  EXPECT_NE(CudfAggregationNode::rewriteFinalAggregation(eligible), eligible);
+  EXPECT_NE(CudfCompactAggregationNode::rewriteFinalAggregation(eligible), eligible);
 }
 
 TEST_F(CudfAggregationNodeTest, constructorRejectsStatesItDoesNotSupport) {
@@ -257,16 +257,16 @@ TEST_F(CudfAggregationNodeTest, constructorRejectsStatesItDoesNotSupport) {
             .partialAggregation({"k"}, {"sum(d) AS s"})
             .planNode());
     VELOX_ASSERT_USER_THROW(
-        CudfAggregationNode(*partial, {DECIMAL(38, 2)}),
+        CudfCompactAggregationNode(*partial, {DECIMAL(38, 2)}),
         "Compact decimal SUM result must have the type of the state: "
         "VARBINARY");
     VELOX_ASSERT_USER_THROW(
-        CudfAggregationNode(*partial, {DECIMAL(38, 4)}),
+        CudfCompactAggregationNode(*partial, {DECIMAL(38, 4)}),
         "Compact decimal SUM state must be DECIMAL(38, scale of the input): "
         "DECIMAL(38, 4)");
     VELOX_ASSERT_USER_THROW(
-        CudfAggregationNode(*partial, {nullptr}),
-        "CudfAggregationNode must have an aggregate with the compact state");
+        CudfCompactAggregationNode(*partial, {nullptr}),
+        "CudfCompactAggregationNode must have an aggregate with the compact state");
   }
   {
     const auto partial = asAggregation(
@@ -275,7 +275,7 @@ TEST_F(CudfAggregationNodeTest, constructorRejectsStatesItDoesNotSupport) {
             .partialAggregation({"k"}, {"sum(w) AS s"})
             .planNode());
     VELOX_ASSERT_USER_THROW(
-        CudfAggregationNode(*partial, {DECIMAL(38, 2)}),
+        CudfCompactAggregationNode(*partial, {DECIMAL(38, 2)}),
         "Aggregate is not eligible for the compact decimal SUM state");
   }
   {
@@ -285,7 +285,7 @@ TEST_F(CudfAggregationNodeTest, constructorRejectsStatesItDoesNotSupport) {
             .singleAggregation({"k"}, {"sum(d) AS s"})
             .planNode());
     VELOX_ASSERT_USER_THROW(
-        CudfAggregationNode(*single, {DECIMAL(38, 2)}),
+        CudfCompactAggregationNode(*single, {DECIMAL(38, 2)}),
         "A single-step aggregation has no intermediate state to make compact");
   }
 }
@@ -320,9 +320,9 @@ TEST_F(CudfAggregationNodeTest, rewritePlanReachesNestedAggregations) {
                       .orderBy({"label"}, false)
                       .planNode();
 
-  const auto rewritten = CudfAggregationNode::rewritePlan(original);
+  const auto rewritten = CudfCompactAggregationNode::rewritePlan(original);
   ASSERT_NE(rewritten, original);
-  std::vector<const CudfAggregationNode*> compactNodes;
+  std::vector<const CudfCompactAggregationNode*> compactNodes;
   collectCompactAggregations(rewritten, compactNodes);
   // The PARTIAL and the FINAL aggregation over 'd'. The sum over 's', a long
   // decimal, keeps its VARBINARY state.
@@ -338,9 +338,9 @@ TEST_F(CudfAggregationNodeTest, rewritePlanReachesNestedAggregations) {
   EXPECT_TRUE(*rewritten->outputType() == *original->outputType());
 
   // A plan without an eligible aggregation comes back as it is.
-  EXPECT_EQ(CudfAggregationNode::rewritePlan(build), build);
+  EXPECT_EQ(CudfCompactAggregationNode::rewritePlan(build), build);
   // So does a plan that was rewritten before.
-  EXPECT_EQ(CudfAggregationNode::rewritePlan(rewritten), rewritten);
+  EXPECT_EQ(CudfCompactAggregationNode::rewritePlan(rewritten), rewritten);
 
   exec::test::AssertQueryBuilder(rewritten, duckDbQueryRunner_)
       .maxDrivers(3)
@@ -465,7 +465,7 @@ TEST_F(CudfAggregationNodeTest, withOtherAggregates) {
               {"", "", "", "", "m"})
           .finalAggregation()
           .planNode());
-  const auto* finalNode = dynamic_cast<const CudfAggregationNode*>(plan.get());
+  const auto* finalNode = dynamic_cast<const CudfCompactAggregationNode*>(plan.get());
   ASSERT_NE(finalNode, nullptr);
   EXPECT_TRUE(finalNode->usesCompactDecimalSum(0));
   EXPECT_FALSE(finalNode->usesCompactDecimalSum(1));

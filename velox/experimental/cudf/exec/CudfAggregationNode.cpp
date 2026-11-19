@@ -173,7 +173,7 @@ core::PlanNodePtr copyWithSources(
 } // namespace
 
 // static
-TypePtr CudfAggregationNode::compactIntermediateType(
+TypePtr CudfCompactAggregationNode::compactIntermediateType(
     const Aggregate& aggregate) {
   if (aggregate.call->name() !=
       CudfConfig::getInstance().functionNamePrefix + "sum") {
@@ -194,7 +194,7 @@ TypePtr CudfAggregationNode::compactIntermediateType(
       38, getDecimalPrecisionScale(*aggregate.rawInputTypes[0]).second);
 }
 
-CudfAggregationNode::CudfAggregationNode(
+CudfCompactAggregationNode::CudfCompactAggregationNode(
     const core::AggregationNode& node,
     std::vector<TypePtr> compactIntermediateTypes)
     : core::AggregationNode(
@@ -254,21 +254,21 @@ CudfAggregationNode::CudfAggregationNode(
   }
   VELOX_USER_CHECK(
       hasCompactState,
-      "CudfAggregationNode must have an aggregate with the compact state");
+      "CudfCompactAggregationNode must have an aggregate with the compact state");
 }
 
-bool CudfAggregationNode::canSpill(
+bool CudfCompactAggregationNode::canSpill(
     const core::QueryConfig& /*queryConfig*/) const {
   return false;
 }
 
-folly::dynamic CudfAggregationNode::serialize() const {
+folly::dynamic CudfCompactAggregationNode::serialize() const {
   VELOX_UNSUPPORTED(
       "An aggregation with the compact decimal SUM state cannot be serialized");
 }
 
 // static
-core::PlanNodePtr CudfAggregationNode::rewriteFinalAggregation(
+core::PlanNodePtr CudfCompactAggregationNode::rewriteFinalAggregation(
     const core::PlanNodePtr& finalAggregation) {
   // Without the cuDF driver adapter nothing keeps a compact aggregation off
   // the CPU.
@@ -382,7 +382,7 @@ core::PlanNodePtr CudfAggregationNode::rewriteFinalAggregation(
     }
   }
   core::PlanNodePtr compactSource =
-      std::make_shared<CudfAggregationNode>(*rewrittenPartial, stateTypes);
+      std::make_shared<CudfCompactAggregationNode>(*rewrittenPartial, stateTypes);
   if (local != nullptr) {
     compactSource = core::LocalPartitionNode::Builder(*local)
                         .partitionFunctionSpec(std::move(partitionFunction))
@@ -394,7 +394,7 @@ core::PlanNodePtr CudfAggregationNode::rewriteFinalAggregation(
           .aggregates(std::move(finalAggregates))
           .source(compactSource)
           .build();
-  core::PlanNodePtr compactFinal = std::make_shared<CudfAggregationNode>(
+  core::PlanNodePtr compactFinal = std::make_shared<CudfCompactAggregationNode>(
       *rewrittenFinal, std::move(stateTypes));
   VELOX_CHECK(
       *compactFinal->outputType() == *finalAggregation->outputType(),
@@ -404,7 +404,7 @@ core::PlanNodePtr CudfAggregationNode::rewriteFinalAggregation(
 }
 
 // static
-core::PlanNodePtr CudfAggregationNode::rewritePlan(
+core::PlanNodePtr CudfCompactAggregationNode::rewritePlan(
     const core::PlanNodePtr& plan) {
   VELOX_CHECK_NOT_NULL(plan);
   std::vector<core::PlanNodePtr> sources;
