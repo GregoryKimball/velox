@@ -47,6 +47,7 @@ add_library(
   DecimalAggregationState.cpp
   GpuCapabilities.cpp
   GpuResources.cpp
+  HostPartitionedSpill.cpp
   HostSpillBudget.cpp
   OperatorAdapters.cpp
   PartitionedBufferedState.cpp

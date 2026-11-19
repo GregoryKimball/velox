@@ -69,6 +69,10 @@ struct CudfConfig {
   /// Hash table occupancy for cudf::hash_join build tables.
   static constexpr const char* kCudfHashJoinLoadFactor{
       "cudf.hash_join_load_factor"};
+  static constexpr const char* kCudfDistinctSpillMb{
+      "cudf.distinct_spill_mb"};
+  static constexpr const char* kCudfDistinctSpillPartitions{
+      "cudf.distinct_spill_partitions"};
   static constexpr const char* kCudfConcatOptimizationEnabled{
       "cudf.concat_optimization_enabled"};
   static constexpr const char* kCudfStreamingGroupbyEnabled{
@@ -274,6 +278,17 @@ struct CudfConfig {
   /// the table for large builds at a small probe cost, which is what lets a
   /// 1.5 B-row build fit next to its own data on a 48 GiB GPU.
   double hashJoinLoadFactor{0.5};
+
+  /// A final-step distinct buffers its input on the GPU and deduplicates it
+  /// once all of it has arrived. When this is positive, every time the buffered
+  /// input reaches this many MiB it is hash-partitioned on the grouping keys
+  /// into distinctSpillPartitions parts and moved to host memory; the output is
+  /// then produced one partition at a time, so GPU memory holds about one
+  /// partition instead of the whole input. 0 disables. Independent of the
+  /// spill_host_memory_bytes pool, which does not cover distinct.
+  int64_t distinctSpillMb{0};
+  int32_t distinctSpillPartitions{16};
+
   // Query config key for the TopN batch size in the cuDF TopN operator.
   int32_t topNBatchSize{5};
 

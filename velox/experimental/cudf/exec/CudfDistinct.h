@@ -17,6 +17,7 @@
 
 #include "velox/experimental/cudf/exec/CudfAggregation.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
+#include "velox/experimental/cudf/exec/HostPartitionedSpill.h"
 
 namespace facebook::velox::cudf_velox {
 
@@ -58,6 +59,12 @@ class CudfDistinct : public CudfOperatorBase {
 
   void computePartialDistinctStreaming(CudfVectorPtr tbl);
 
+  // Moves 'inputs_' to 'spill_'.
+  void spillInputs();
+
+  // Returns the distinct keys of the next non-empty spill partition.
+  RowVectorPtr getSpilledOutput();
+
   std::vector<column_index_t> groupingKeyInputChannels_;
   std::vector<column_index_t> groupingKeyOutputChannels_;
 
@@ -72,6 +79,13 @@ class CudfDistinct : public CudfOperatorBase {
   std::vector<CudfVectorPtr> inputs_;
   TypePtr inputType_;
   CudfVectorPtr bufferedResult_;
+
+  // Final step only: buffered bytes in 'inputs_' that trigger a spill, 0 when
+  // spilling is off.
+  uint64_t spillBytes_{0};
+  uint64_t inputBytes_{0};
+  std::unique_ptr<HostPartitionedSpill> spill_;
+  int32_t nextSpillPartition_{0};
 };
 
 } // namespace facebook::velox::cudf_velox
