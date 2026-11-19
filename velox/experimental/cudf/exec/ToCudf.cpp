@@ -623,6 +623,10 @@ void CudfConfig::initialize(
         "{}",
         kCudfDistinctSpillPartitions);
   }
+  if (config.find(kCudfCompactDecimalSumState) != config.end()) {
+    compactDecimalSumState =
+        folly::to<bool>(config[kCudfCompactDecimalSumState]);
+  }
   if (config.find(kCudfBatchSizeMaxThreshold) != config.end()) {
     batchSizeMaxThreshold =
         folly::to<int32_t>(config[kCudfBatchSizeMaxThreshold]);

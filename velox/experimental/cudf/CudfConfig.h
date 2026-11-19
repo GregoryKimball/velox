@@ -73,6 +73,8 @@ struct CudfConfig {
       "cudf.distinct_spill_mb"};
   static constexpr const char* kCudfDistinctSpillPartitions{
       "cudf.distinct_spill_partitions"};
+  static constexpr const char* kCudfCompactDecimalSumState{
+      "cudf.compact_decimal_sum_state"};
   static constexpr const char* kCudfConcatOptimizationEnabled{
       "cudf.concat_optimization_enabled"};
   static constexpr const char* kCudfStreamingGroupbyEnabled{
@@ -297,6 +299,12 @@ struct CudfConfig {
   /// spill_host_memory_bytes pool, which does not cover distinct.
   int64_t distinctSpillMb{0};
   int32_t distinctSpillPartitions{16};
+
+  /// Grouped partial and final aggregations exchange a SUM over a short
+  /// decimal column as one DECIMAL(38, scale) column instead of the 32-byte
+  /// VARBINARY state, without a CudfAggregationNode in the plan. Both steps
+  /// must run in cuDF, as when all workers are GPU workers.
+  bool compactDecimalSumState{false};
 
   // Query config key for the TopN batch size in the cuDF TopN operator.
   int32_t topNBatchSize{5};

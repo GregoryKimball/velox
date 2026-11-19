@@ -219,6 +219,32 @@ std::unique_ptr<cudf::column> maskToValidityColumn(
       nullCount);
 }
 
+namespace {
+
+// Returns the compact DECIMAL(38, scale) state type of the aggregate at
+// 'index', or nullptr if it keeps its ordinary intermediate type. A
+// CudfAggregationNode declares the state; otherwise
+// cudf.compact_decimal_sum_state applies it to every eligible grouped SUM.
+TypePtr compactDecimalSumType(
+    const core::AggregationNode& aggregationNode,
+    size_t index) {
+  if (const auto* cudfNode =
+          dynamic_cast<const CudfAggregationNode*>(&aggregationNode)) {
+    return cudfNode->usesCompactDecimalSum(index)
+        ? cudfNode->intermediateType(index)
+        : nullptr;
+  }
+  if (!CudfConfig::getInstance().compactDecimalSumState ||
+      aggregationNode.groupingKeys().empty() ||
+      aggregationNode.step() == core::AggregationNode::Step::kSingle) {
+    return nullptr;
+  }
+  return CudfAggregationNode::compactIntermediateType(
+      aggregationNode.aggregates()[index]);
+}
+
+} // namespace
+
 std::vector<ResolvedAggregateInfo> resolveAggregateInfos(
     core::AggregationNode const& aggregationNode,
     core::AggregationNode::Step step,
@@ -226,8 +252,6 @@ std::vector<ResolvedAggregateInfo> resolveAggregateInfos(
     std::vector<VectorPtr> const& constants,
     std::vector<std::optional<uint32_t>> const& maskChannels) {
   const auto numKeys = aggregationNode.groupingKeys().size();
-  const auto* cudfNode =
-      dynamic_cast<const CudfAggregationNode*>(&aggregationNode);
 
   std::vector<ResolvedAggregateInfo> params;
   params.reserve(aggregationNode.aggregates().size());
@@ -235,13 +259,13 @@ std::vector<ResolvedAggregateInfo> resolveAggregateInfos(
     auto const& aggregate = aggregationNode.aggregates()[i];
     auto const companionStep = getCompanionStep(aggregate.call->name(), step);
     const auto originalName = getOriginalName(aggregate.call->name());
-    const bool compactDecimalSum =
-        cudfNode != nullptr && cudfNode->usesCompactDecimalSum(i);
+    const auto compactType = compactDecimalSumType(aggregationNode, i);
+    const bool compactDecimalSum = compactType != nullptr;
     TypePtr resultType;
     if (!exec::isPartialOutput(companionStep)) {
       resultType = outputType->childAt(numKeys + i);
     } else if (compactDecimalSum) {
-      resultType = cudfNode->intermediateType(i);
+      resultType = compactType;
     } else {
       resultType =
           exec::resolveIntermediateType(originalName, aggregate.rawInputTypes);
@@ -349,12 +373,10 @@ RowTypePtr getBufferedResultType(core::AggregationNode const& aggregationNode) {
   VELOX_CHECK_EQ(names.size(), types.size());
   VELOX_CHECK_GE(types.size(), numKeys + aggregationNode.aggregates().size());
 
-  const auto* cudfNode =
-      dynamic_cast<const CudfAggregationNode*>(&aggregationNode);
   for (auto i = 0; i < aggregationNode.aggregates().size(); ++i) {
     auto const& aggregate = aggregationNode.aggregates()[i];
-    if (cudfNode != nullptr && cudfNode->usesCompactDecimalSum(i)) {
-      types[numKeys + i] = cudfNode->intermediateType(i);
+    if (auto compactType = compactDecimalSumType(aggregationNode, i)) {
+      types[numKeys + i] = std::move(compactType);
       continue;
     }
     const auto originalName = getOriginalName(aggregate.call->name());
