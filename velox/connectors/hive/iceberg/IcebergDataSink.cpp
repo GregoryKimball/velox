@@ -97,7 +97,7 @@ std::string makeUuid() {
 
 std::pair<std::string, std::string> IcebergFileNameGenerator::gen(
     std::optional<uint32_t> bucketId,
-    const HiveInsertTableHandlePtr& insertTableHandle,
+    const std::shared_ptr<const HiveInsertTableHandle> insertTableHandle,
     const ConnectorQueryCtx& connectorQueryCtx,
     uint32_t /* maxNumBuckets */,
     bool commitRequired) const {
@@ -143,7 +143,7 @@ IcebergInsertTableHandle::IcebergInsertTableHandle(
     WriteKind writeKind,
     std::unordered_map<std::string, ExistingDeletionVector>
         existingDeletionVectors,
-    FileNameGeneratorPtr fileNameGenerator,
+    std::shared_ptr<const FileNameGenerator> fileNameGenerator,
     std::vector<std::string> insertedColumns,
     bool includePartitionPaths)
     : HiveInsertTableHandle(
@@ -151,12 +151,12 @@ IcebergInsertTableHandle::IcebergInsertTableHandle(
               inputColumns.begin(),
               inputColumns.end()),
           std::move(locationHandle),
-          HiveConfig::InsertExistingPartitionsBehavior::kError,
           tableStorageFormat,
           nullptr,
           compressionKind,
           serdeParameters,
-          /*writeEmptyFile=*/false,
+          nullptr,
+          false,
           std::move(fileNameGenerator)),
       partitionSpec_(partitionSpec),
       writeKind_(writeKind),

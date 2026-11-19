@@ -17,29 +17,27 @@
 #include "velox/connectors/hive/HiveConfig.h"
 
 #include <boost/algorithm/string.hpp>
-#include "velox/common/EnumDefine.h"
 #include "velox/common/config/Config.h"
 #include "velox/dwio/common/Options.h"
 
 namespace facebook::velox::connector::hive {
 
 namespace {
-const auto& insertExistingPartitionsBehaviorNames() {
-  static const folly::
-      F14FastMap<HiveConfig::InsertExistingPartitionsBehavior, std::string_view>
-          kNames = {
-              {HiveConfig::InsertExistingPartitionsBehavior::kError, "ERROR"},
-              {HiveConfig::InsertExistingPartitionsBehavior::kOverwrite,
-               "OVERWRITE"},
-          };
-  return kNames;
-}
-} // namespace
 
-VELOX_DEFINE_EMBEDDED_ENUM_NAME(
-    HiveConfig,
-    InsertExistingPartitionsBehavior,
-    insertExistingPartitionsBehaviorNames)
+HiveConfig::InsertExistingPartitionsBehavior
+stringToInsertExistingPartitionsBehavior(const std::string& strValue) {
+  auto upperValue = boost::algorithm::to_upper_copy(strValue);
+  if (upperValue == "ERROR") {
+    return HiveConfig::InsertExistingPartitionsBehavior::kError;
+  }
+  if (upperValue == "OVERWRITE") {
+    return HiveConfig::InsertExistingPartitionsBehavior::kOverwrite;
+  }
+  VELOX_UNSUPPORTED(
+      "Unsupported insert existing partitions behavior: {}.", strValue);
+}
+
+} // namespace
 
 const std::vector<config::ConfigProperty>& HiveConfig::registeredProperties() {
   static const std::vector<config::ConfigProperty> kProperties = [] {
@@ -72,19 +70,25 @@ const std::vector<config::ConfigProperty>& HiveConfig::registeredProperties() {
   return kProperties;
 }
 
+// static
+std::string HiveConfig::insertExistingPartitionsBehaviorString(
+    InsertExistingPartitionsBehavior behavior) {
+  switch (behavior) {
+    case InsertExistingPartitionsBehavior::kError:
+      return "ERROR";
+    case InsertExistingPartitionsBehavior::kOverwrite:
+      return "OVERWRITE";
+    default:
+      return fmt::format("UNKNOWN BEHAVIOR {}", static_cast<int>(behavior));
+  }
+}
+
 HiveConfig::InsertExistingPartitionsBehavior
 HiveConfig::insertExistingPartitionsBehavior(
     const config::ConfigBase* session) const {
-  const auto value = session->get<std::string>(
+  return stringToInsertExistingPartitionsBehavior(session->get<std::string>(
       kInsertExistingPartitionsBehaviorSession,
-      config_->get<std::string>(kInsertExistingPartitionsBehavior, "ERROR"));
-  const auto behavior = tryToInsertExistingPartitionsBehavior(
-      boost::algorithm::to_upper_copy(value));
-  VELOX_USER_CHECK(
-      behavior.has_value(),
-      "Unsupported insert existing partitions behavior: {}",
-      value);
-  return behavior.value();
+      config_->get<std::string>(kInsertExistingPartitionsBehavior, "ERROR")));
 }
 
 bool HiveConfig::immutablePartitions() const {

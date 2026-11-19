@@ -17,7 +17,6 @@
 
 #include <limits>
 
-#include "velox/common/EnumDeclare.h"
 #include "velox/connectors/common/FileConfig.h"
 #include "velox/connectors/common/FileConfigMacrosDefine.h"
 
@@ -41,7 +40,8 @@ class HiveConfig : public connector::FileConfig {
     kOverwrite,
   };
 
-  VELOX_DECLARE_EMBEDDED_ENUM_NAME(InsertExistingPartitionsBehavior);
+  static std::string insertExistingPartitionsBehaviorString(
+      InsertExistingPartitionsBehavior behavior);
 
   // --- VELOX_FILE_CONFIG_PROPERTY properties ---
 
@@ -267,9 +267,5 @@ class HiveConfig : public connector::FileConfig {
 };
 
 } // namespace facebook::velox::connector::hive
-
-VELOX_EMBEDDED_ENUM_FORMATTER(
-    facebook::velox::connector::hive::HiveConfig,
-    InsertExistingPartitionsBehavior);
 
 #include "velox/connectors/common/FileConfigMacrosUndef.h"

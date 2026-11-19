@@ -386,10 +386,11 @@ TEST_F(IcebergMergeSinkTest, tableWriterCountsUpdateOnce) {
                             /*aggregates=*/{},
                             kIcebergConnectorId,
                             /*serdeParameters=*/{},
+                            /*options=*/nullptr,
                             /*outputFileName=*/"",
                             common::CompressionKind_ZSTD,
                             kMergeInputType,
-                            /*writeEmptyFile=*/false,
+                            /*ensureFiles=*/false,
                             CommitStrategy::kNoCommit,
                             makeMergeHandle(tempDir->getPath()))
                         .project({"rows"})

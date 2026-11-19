@@ -144,6 +144,7 @@ TEST_F(BasicTableWriterTest, structAsMap) {
                           {"orc.map.flat.cols", "0"},
                           {"orc.map.flat.cols.struct.keys", "[[\"1\", \"2\"]]"},
                       },
+                      nullptr,
                       fileName,
                       common::CompressionKind_NONE,
                       outputType)
@@ -177,6 +178,7 @@ TEST_F(BasicTableWriterTest, targetFileName) {
                       directory->getPath(),
                       dwio::common::FileFormat::DWRF,
                       {},
+                      nullptr,
                       kFileName)
                   .planNode();
   auto results = AssertQueryBuilder(plan).copyResults(pool());

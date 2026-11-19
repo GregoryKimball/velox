@@ -275,9 +275,9 @@ TEST_F(HiveConnectorSerDeTest, hiveInsertTableHandle) {
           dwio::common::FileFormat::NIMBLE,
           common::CompressionKind::CompressionKind_SNAPPY,
           serdeParameters,
-          false, // writeEmptyFile
-          storageParameters,
-          HiveConfig::InsertExistingPartitionsBehavior::kOverwrite);
+          nullptr, // writerOptions
+          false, // ensureFiles
+          storageParameters);
   testSerde(*hiveInsertTableHandle);
 }
 

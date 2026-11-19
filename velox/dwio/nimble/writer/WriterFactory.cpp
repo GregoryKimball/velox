@@ -74,11 +74,10 @@ std::unique_ptr<dwio::common::Writer> WriterFactory::createWriter(
           .withReclaimerFactory(options->memoryReclaimerFactory)
           .withSpillConfig(options->spillConfig);
 
-  if (encodingExecutor_.get() != nullptr) {
-    builder.withEncodingExecutor(encodingExecutor_);
-  }
-
   auto* nimbleOptions = dynamic_cast<NimbleWriterOptions*>(options.get());
+  if (nimbleOptions && nimbleOptions->encodingExecutor) {
+    builder.withEncodingExecutor(nimbleOptions->encodingExecutor);
+  }
   if (nimbleOptions && !nimbleOptions->schemaAttributes.empty()) {
     builder.withSchemaAttributes(nimbleOptions->schemaAttributes);
   }
