@@ -45,6 +45,13 @@ class NimbleDumpLib {
       std::optional<uint32_t> stripeId);
   void
   emitHistogram(bool topLevel, bool noHeader, std::optional<uint32_t> stripeId);
+  /// Writes one tab-separated row per OpenZL-compressed encoding buffer (stripe,
+  /// stream, stream label, chunk, encoding path, compressed and decompressed
+  /// bytes, trace file) and saves the OpenZL decompression trace of each buffer
+  /// as CBOR in 'traceDir'.
+  void emitOpenZLGraphs(
+      const std::string& traceDir,
+      std::optional<uint32_t> stripeId);
   void emitContent(
       uint32_t streamId,
       std::optional<uint32_t> stripeId,

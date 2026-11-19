@@ -23,7 +23,11 @@
 #include <utility>
 
 #include <zstd.h>
+#include <fstream>
+#include "folly/String.h"
 #include "folly/cli/NestedCommandLineApp.h"
+#include "openzl/cpp/DCtx.hpp"
+#include "openzl/zl_decompress.h"
 #include "velox/common/file/FileSystems.h"
 #include "velox/dwio/nimble/common/FixedBitArray.h"
 #include "velox/dwio/nimble/common/StatsGenerated.h"
@@ -786,6 +790,8 @@ void NimbleDumpLib::emitHistogram(
       {toString(CompressionType::Uncompressed), CompressionType::Uncompressed},
       {toString(CompressionType::Zstd), CompressionType::Zstd},
       {toString(CompressionType::MetaInternal), CompressionType::MetaInternal},
+      {toString(CompressionType::Lz4), CompressionType::Lz4},
+      {toString(CompressionType::OpenZL), CompressionType::OpenZL},
   };
   traverseTablet(
       *pool_,
@@ -856,6 +862,81 @@ void NimbleDumpLib::emitHistogram(
         fmt::format("{:.2f}", it->second.bytes * 100.0 / fileSize),
     });
   }
+}
+
+void NimbleDumpLib::emitOpenZLGraphs(
+    const std::string& traceDir,
+    std::optional<uint32_t> stripeId) {
+  TabletReader::Options options;
+  options.ioOptions.emplace(pool_.get())
+      .setMetadataIoStats(std::make_shared<velox::io::IoStatistics>());
+  auto tabletReader = TabletReader::create(file_, pool_.get(), options);
+  BatchReader reader{tabletReader, *pool_};
+  StreamLabels labels{reader.schema()};
+  const std::string openzl = toString(CompressionType::OpenZL);
+
+  ostream_ << "stripe\tstream\tlabel\tchunk\tencoding\tcompressed_bytes\t"
+              "decompressed_bytes\ttrace\n";
+  traverseTablet(
+      *pool_,
+      *tabletReader,
+      stripeId,
+      nullptr,
+      [&](ChunkedStream& stream, uint32_t stripe, uint32_t streamId) {
+        uint32_t chunk = 0;
+        while (stream.hasNext()) {
+          const auto chunkCompression = stream.peekCompressionType();
+          const auto chunkData = stream.nextChunk();
+          if (chunkCompression == CompressionType::OpenZL) {
+            ostream_ << stripe << '\t' << streamId << '\t'
+                     << labels.streamLabel(streamId) << '\t' << chunk
+                     << "\tchunk\t\t" << chunkData.size() << "\t\n";
+          }
+          std::vector<std::string> path;
+          uint32_t frame = 0;
+          traverseEncodings(
+              chunkData,
+              [&](EncodingType encodingType,
+                  DataType dataType,
+                  uint32_t level,
+                  uint32_t /* index */,
+                  std::string nestedEncodingName,
+                  std::unordered_map<EncodingPropertyType, EncodingProperty>
+                      properties) {
+                path.resize(level + 1);
+                path[level] =
+                    (nestedEncodingName.empty() ? ""
+                                                : nestedEncodingName + ":") +
+                    toString(encodingType) + "<" + toString(dataType) + ">";
+                const auto compression =
+                    properties.find(EncodingPropertyType::Compression);
+                if (compression == properties.end() ||
+                    compression->second.value != openzl ||
+                    compression->second.data.empty()) {
+                  return true;
+                }
+                const auto data = compression->second.data;
+                openzl::DCtx dctx;
+                dctx.writeTraces(true, /*streamPreview=*/false);
+                const size_t size = dctx.unwrap(
+                    ZL_getDecompressedSize(data.data(), data.size()));
+                std::string output(size, '\0');
+                dctx.decompressSerial({output.data(), output.size()}, data);
+                const auto trace = dctx.getLatestTrace().first;
+                const auto name = fmt::format(
+                    "s{}_t{}_c{}_f{}.cbor", stripe, streamId, chunk, frame++);
+                std::ofstream{traceDir + "/" + name, std::ios::binary}.write(
+                    trace.data(), trace.size());
+                ostream_ << stripe << '\t' << streamId << '\t'
+                         << labels.streamLabel(streamId) << '\t' << chunk
+                         << '\t' << folly::join("/", path) << '\t'
+                         << data.size() << '\t' << size << '\t' << name
+                         << '\n';
+                return true;
+              });
+          ++chunk;
+        }
+      });
 }
 
 void NimbleDumpLib::emitContent(

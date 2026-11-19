@@ -44,6 +44,7 @@ target_link_libraries(
   nimble_velox_stats_fb
   velox_file
   Folly::folly
+  ${VELOX_OPENZL_LIBRARIES}
 )
 
 add_library(nimble_serializer_dump_lib SerializerDumpLib.cpp SerializerDumpLib.h)

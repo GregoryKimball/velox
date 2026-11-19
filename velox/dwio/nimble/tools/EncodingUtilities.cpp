@@ -34,23 +34,38 @@ uint32_t prefixSize(std::string_view stream, bool useVarintRowCount = false) {
 
 void extractCompressionType(
     EncodingType encodingType,
-    DataType /* dataType */,
+    DataType dataType,
     std::string_view stream,
     bool useVarintRowCount,
     std::unordered_map<EncodingPropertyType, EncodingProperty>& properties) {
   switch (encodingType) {
-    // Compression type is the byte right after the encoding header for both
-    // encodings.
+    // Compression type is the byte right after the encoding header for these
+    // encodings. 'data' is the compressed buffer for Trivial and
+    // FixedBitWidth: after the string lengths for Trivial strings, and after
+    // the baseline and bit width for FixedBitWidth.
     case EncodingType::Trivial:
     case EncodingType::FixedBitWidth:
     case EncodingType::BlockBitPacking:
     case EncodingType::BlockBitPackingV2: {
       auto pos = stream.data() + prefixSize(stream, useVarintRowCount);
+      const auto compressionType =
+          static_cast<CompressionType>(encoding::readChar(pos));
+      std::string_view data{};
+      if (encodingType == EncodingType::Trivial) {
+        if (dataType == DataType::String) {
+          const uint32_t lengthsBytes = encoding::readUint32(pos);
+          pos += lengthsBytes;
+        }
+        data = {pos, static_cast<size_t>(stream.data() + stream.size() - pos)};
+      } else if (encodingType == EncodingType::FixedBitWidth) {
+        pos += detail::dataTypeSize(dataType) + 1;
+        data = {pos, static_cast<size_t>(stream.data() + stream.size() - pos)};
+      }
       properties.insert(
           {EncodingPropertyType::Compression,
            EncodingProperty{
-               .value = toString(
-                   static_cast<CompressionType>(encoding::readChar(pos))),
+               .value = toString(compressionType),
+               .data = data,
            }});
       break;
     }

@@ -18,6 +18,7 @@
 // Meta-internal headers.
 //
 // Usage: nimble_dump_lite <schema|streams|layout|histogram> <file> [stripe]
+//        nimble_dump_lite openzl <file> <trace dir> [stripe]
 
 #include "velox/common/file/FileSystems.h"
 #include "velox/common/memory/Memory.h"
@@ -30,16 +31,23 @@
 int main(int argc, char** argv) {
   if (argc < 3) {
     std::cerr << "Usage: " << argv[0]
-              << " <schema|streams|layout|histogram> <file> [stripe]\n";
+              << " <schema|streams|layout|histogram> <file> [stripe]\n"
+              << "       " << argv[0]
+              << " openzl <file> <trace dir> [stripe]\n";
     return 1;
   }
   facebook::velox::memory::MemoryManager::initialize(
       facebook::velox::memory::MemoryManager::Options{});
   facebook::velox::filesystems::registerLocalFileSystem();
   const std::string command = argv[1];
+  const int stripeArg = command == "openzl" ? 4 : 3;
+  if (command == "openzl" && argc < 4) {
+    std::cerr << "openzl needs a trace directory\n";
+    return 1;
+  }
   std::optional<uint32_t> stripe;
-  if (argc > 3) {
-    stripe = static_cast<uint32_t>(std::stoul(argv[3]));
+  if (argc > stripeArg) {
+    stripe = static_cast<uint32_t>(std::stoul(argv[stripeArg]));
   }
   facebook::nimble::tools::NimbleDumpLib dump{argv[2], false, std::cout};
   if (command == "schema") {
@@ -50,6 +58,8 @@ int main(int argc, char** argv) {
     dump.emitLayout(false, false);
   } else if (command == "histogram") {
     dump.emitHistogram(false, false, stripe);
+  } else if (command == "openzl") {
+    dump.emitOpenZLGraphs(argv[3], stripe);
   } else {
     std::cerr << "Unknown command " << command << "\n";
     return 1;
