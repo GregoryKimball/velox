@@ -814,10 +814,14 @@ std::unique_ptr<ReduceAggregator> createReduceAggregator(
         *p.countInputKind,
         p.resultType,
         p.maskIndex);
-  } else if (kind.rfind(prefix + "min", 0) == 0) {
+  } else if (
+      kind.rfind(prefix + "min", 0) == 0 ||
+      kind.rfind(prefix + "bool_and", 0) == 0) {
     return std::make_unique<ReduceMinAggregator>(
         p.companionStep, p.inputIndex, p.constant, p.resultType, p.maskIndex);
-  } else if (kind.rfind(prefix + "max", 0) == 0) {
+  } else if (
+      kind.rfind(prefix + "max", 0) == 0 ||
+      kind.rfind(prefix + "bool_or", 0) == 0) {
     return std::make_unique<ReduceMaxAggregator>(
         p.companionStep, p.inputIndex, p.constant, p.resultType, p.maskIndex);
   } else if (kind.rfind(prefix + "avg", 0) == 0) {

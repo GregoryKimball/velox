@@ -345,6 +345,22 @@ void registerCommonAggregationFunctions(
       core::AggregationNode::Step::kIntermediate,
       minMaxSignatures);
 
+  // bool_or and bool_and run as max and min over booleans, which skip nulls.
+  auto boolSignatures = std::vector<exec::FunctionSignaturePtr>{
+      FunctionSignatureBuilder()
+          .returnType("boolean")
+          .argumentType("boolean")
+          .build()};
+  for (const auto& name : {prefix + "bool_or", prefix + "bool_and"}) {
+    for (auto step :
+         {core::AggregationNode::Step::kSingle,
+          core::AggregationNode::Step::kPartial,
+          core::AggregationNode::Step::kFinal,
+          core::AggregationNode::Step::kIntermediate}) {
+      registerAggregationFunctionForStep(registry, name, step, boolSignatures);
+    }
+  }
+
   // These aggregations honor a FILTER mask: masked rows are null-injected, or
   // excluded via the validity column for count(*), and cuDF's null-excluding
   // aggregations skip them. Declared here, alongside their registration and
