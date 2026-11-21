@@ -126,6 +126,17 @@ class CudfSplitReader : public NvtxHelper {
   virtual void resetSplit();
 
  protected:
+  // Returns the connector config the reader was built with.
+  const CudfHiveConfig& cudfHiveConfig() const {
+    return *cudfHiveConfig_;
+  }
+
+  // Returns the reader options, with the Hive load quantum and coalescing
+  // limits applied, that a BufferedInput for the split is built with.
+  const dwio::common::ReaderOptions& baseReaderOptions() const {
+    return baseReaderOpts_;
+  }
+
   // Performs split-specific setup after base reader state is reset.
   virtual void prepareSplitInternal(dwio::common::RuntimeStats& runtimeStats);
 

@@ -18,8 +18,9 @@
 #define VARINT_SVE2 0
 #elif defined(__aarch64__)
 #include <arm_neon.h>
-#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_SVE2_BITPERM) && \
-    __has_include(<arm_neon_sve_bridge.h>)
+// The SVE2 path applies operators to SVE vector types, a Clang extension.
+#if defined(__clang__) && defined(__ARM_FEATURE_SVE) && \
+    defined(__ARM_FEATURE_SVE2_BITPERM) && __has_include(<arm_neon_sve_bridge.h>)
 #include <arm_neon_sve_bridge.h>
 #include <arm_sve.h>
 #define VARINT_SVE2 1
