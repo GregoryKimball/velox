@@ -20,13 +20,13 @@
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
 #include "velox/common/caching/AsyncDataCache.h"
-#include "velox/connectors/common/BufferedInputBuilder.h"
+#include "velox/connectors/hive/BufferedInputBuilder.h"
 #include "velox/connectors/hive/FileHandle.h"
 #include "velox/dwio/common/BufferedInput.h"
-#include "velox/dwio/nimble/common/SchemaReader.h"
-#include "velox/dwio/nimble/common/SchemaSerialization.h"
 #include "velox/dwio/nimble/tablet/Constants.h"
 #include "velox/dwio/nimble/tablet/TabletReader.h"
+#include "velox/dwio/nimble/velox/SchemaReader.h"
+#include "velox/dwio/nimble/velox/SchemaSerialization.h"
 
 #include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
@@ -126,7 +126,7 @@ void CudfNimbleSplitReader::prepareSplitInternal(
   readFile_ = fileHandle->file;
   if (cache::AsyncDataCache::getInstance() != nullptr) {
     std::shared_ptr<dwio::common::BufferedInput> input =
-        velox::connector::BufferedInputBuilder::getInstance()->create(
+        velox::connector::hive::BufferedInputBuilder::getInstance()->create(
             *fileHandle,
             baseReaderOptions(),
             connectorQueryCtx_,
@@ -214,11 +214,13 @@ CudfNimbleSplitReader::startBatch() {
     const auto stripe = stripes_[nextStripe_];
     const auto numRows = static_cast<int64_t>(tablet_->stripeRowCount(stripe));
     const auto stripeId = tablet_->stripeIdentifier(stripe);
+    std::vector<facebook::nimble::TabletReader::StreamMetadata> locations(
+        streamIds_.size());
+    tablet_->streamLocations(stripeId, streamIds_, locations);
     size_t stripeDecoded = 0;
     for (size_t i = 0; i < streamIds_.size(); ++i) {
       stripeDecoded += cudfTypes_[i].id() == cudf::type_id::STRING
-          ? numRows * sizeof(cudf::size_type) +
-              tablet_->streamLocation(stripeId, streamIds_[i]).size
+          ? numRows * sizeof(cudf::size_type) + locations[i].size
           : numRows * cudf::size_of(cudfTypes_[i]);
     }
     if (!batch.empty() &&
@@ -229,8 +231,7 @@ CudfNimbleSplitReader::startBatch() {
     ++nextStripe_;
     const auto stripeOffset = tablet_->stripeOffset(stripe);
     batch.emplace_back().numRows = static_cast<cudf::size_type>(numRows);
-    for (size_t i = 0; i < streamIds_.size(); ++i) {
-      const auto location = tablet_->streamLocation(stripeId, streamIds_[i]);
+    for (const auto& location : locations) {
       reads.push_back({stripeOffset + location.offset, location.size});
       batchBytes += location.size;
     }
