@@ -301,8 +301,13 @@ if(${VELOX_ENABLE_DUCKDB})
 endif()
 
 if(VELOX_ENABLE_FAISS OR VELOX_ENABLE_NIMBLE)
+  # The installed FAISS package links OpenMP::OpenMP_CXX without defining it,
+  # so the target must exist in this scope before FAISS is resolved.
+  find_package(OpenMP REQUIRED)
   velox_set_source(faiss)
-  velox_resolve_dependency(faiss)
+  # FAISS 1.11.0 does not install faiss/impl/zerocopy_io.h, which the vector
+  # index includes.
+  velox_resolve_dependency(faiss 1.12.0)
   if(NOT TARGET FAISS::faiss)
     add_library(FAISS::faiss ALIAS faiss)
   endif()
