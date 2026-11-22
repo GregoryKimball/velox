@@ -41,7 +41,10 @@ if(VELOX_ENABLE_NIMBLE)
     PRIVATE CudfNimbleSplitReader.cpp NimbleGpuDecoder.cu
   )
   target_compile_definitions(velox_cudf_hive_connector PRIVATE VELOX_ENABLE_NIMBLE)
-  target_link_libraries(velox_cudf_hive_connector PRIVATE nimble_velox_reader_factory)
+  target_link_libraries(
+    velox_cudf_hive_connector
+    PRIVATE nimble_velox_reader_factory nimble_velox_common nimble_column_stats
+  )
 endif()
 
 add_subdirectory(iceberg)
