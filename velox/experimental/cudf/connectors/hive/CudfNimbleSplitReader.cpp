@@ -23,10 +23,14 @@
 #include "velox/connectors/hive/BufferedInputBuilder.h"
 #include "velox/connectors/hive/FileHandle.h"
 #include "velox/dwio/common/BufferedInput.h"
+#include "velox/dwio/common/ScanSpec.h"
+#include "velox/dwio/common/TypeWithId.h"
 #include "velox/dwio/nimble/tablet/Constants.h"
 #include "velox/dwio/nimble/tablet/TabletReader.h"
 #include "velox/dwio/nimble/velox/SchemaReader.h"
 #include "velox/dwio/nimble/velox/SchemaSerialization.h"
+#include "velox/dwio/nimble/velox/SchemaUtils.h"
+#include "velox/dwio/nimble/velox/stats/VectorizedStatistics.h"
 
 #include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
@@ -174,6 +178,10 @@ void CudfNimbleSplitReader::prepareSplitInternal(
 
   stripes_.clear();
   nextStripe_ = 0;
+  splitSkipped_ = !fileStatsMayMatch(schema);
+  if (splitSkipped_) {
+    return;
+  }
   const uint64_t splitEnd = split_->start + split_->length;
   for (uint32_t stripe = 0; stripe < tablet_->stripeCount(); ++stripe) {
     const auto offset = tablet_->stripeOffset(stripe);
@@ -181,6 +189,60 @@ void CudfNimbleSplitReader::prepareSplitInternal(
       stripes_.push_back(stripe);
     }
   }
+}
+
+bool CudfNimbleSplitReader::fileStatsMayMatch(
+    const std::shared_ptr<const facebook::nimble::Type>& schema) const {
+  static const bool kEnabled = [] {
+    const char* value = std::getenv("NIMBLE_GPU_FILE_PRUNING");
+    return value == nullptr || std::string_view{value} != "0";
+  }();
+  const auto& filters = tableHandle_->subfieldFilters();
+  if (!kEnabled || filters.empty()) {
+    return true;
+  }
+  nvtx3::scoped_range range{"CudfNimbleSplitReader::fileStatsMayMatch"};
+  const auto statsSection = tablet_->loadOptionalSection(
+      std::string(facebook::nimble::kVectorizedStatsSection));
+  if (!statsSection.has_value()) {
+    return true;
+  }
+  const auto fileStats = facebook::nimble::VectorizedFileStats::deserialize(
+      statsSection->content(), *connectorQueryCtx_->memoryPool());
+  if (fileStats == nullptr) {
+    return true;
+  }
+  const auto fileType = facebook::nimble::convertToVeloxType(*schema);
+  const auto columnStats = fileStats->toColumnStatistics(fileType, schema);
+  const auto fileTypeWithId = dwio::common::TypeWithId::create(fileType);
+  const auto& fileRowType = fileType->asRow();
+  const auto totalRows = tablet_->tabletRowCount();
+  for (const auto& [subfield, filter] : filters) {
+    // Nested subfields have no file-level statistics, and columns absent from
+    // the file, such as partition keys, are decided by the data source.
+    if (subfield.path().size() != 1) {
+      continue;
+    }
+    const auto index = fileRowType.getChildIdxIfExists(subfield.baseName());
+    if (!index.has_value()) {
+      continue;
+    }
+    const auto& column = fileTypeWithId->childAt(*index);
+    if (column->id() >= columnStats.size() ||
+        columnStats[column->id()] == nullptr) {
+      continue;
+    }
+    const auto stats = columnStats[column->id()]->toCommonStatistics();
+    if (stats != nullptr &&
+        !common::testFilter(
+            filter.get(), stats.get(), totalRows, column->type())) {
+      VLOG(1) << "Skipping " << split_->filePath
+              << " based on stats and filter for column "
+              << subfield.baseName();
+      return false;
+    }
+  }
+  return true;
 }
 
 std::optional<CudfNimbleSplitReader::PendingBatch>
@@ -376,6 +438,7 @@ void CudfNimbleSplitReader::resetSplit() {
   cudfTypes_.clear();
   stripes_.clear();
   nextStripe_ = 0;
+  splitSkipped_ = false;
   CudfSplitReader::resetSplit();
 }
 
