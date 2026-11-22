@@ -27,7 +27,8 @@
 
 namespace facebook::nimble {
 class TabletReader;
-}
+class Type;
+} // namespace facebook::nimble
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
@@ -51,7 +52,16 @@ class CudfNimbleSplitReader : public CudfSplitReader {
 
   std::optional<TableChunk> readNextChunk() override;
 
+  bool isSplitSkipped() const override {
+    return splitSkipped_;
+  }
+
  private:
+  // Returns false when the file-level column statistics show that no row of
+  // the file passes a subfield filter.
+  bool fileStatsMayMatch(
+      const std::shared_ptr<const facebook::nimble::Type>& schema) const;
+
   // A batch of stripes whose stream bytes are being read into `pinned`.
   struct PendingBatch {
     std::unique_ptr<NimbleGpuDecoder::PinnedBuffer> pinned;
@@ -78,6 +88,7 @@ class CudfNimbleSplitReader : public CudfSplitReader {
   std::vector<uint32_t> stripes_;
   size_t nextStripe_{0};
   bool compactRowCount_{false};
+  bool splitSkipped_{false};
   NimbleGpuDecoder decoder_;
   // Read while the previous batch is decoded and consumed.
   std::optional<PendingBatch> pending_;
