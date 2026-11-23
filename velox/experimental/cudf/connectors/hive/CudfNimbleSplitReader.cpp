@@ -108,6 +108,53 @@ class BufferedReadFile : public ReadFile {
   const std::shared_ptr<ReadFile> file_;
 };
 
+// Serves reads from a cuDF datasource, so that the tablet metadata and the
+// streams come through the same KvikIO source as Parquet.
+class DataSourceReadFile : public ReadFile {
+ public:
+  DataSourceReadFile(
+      std::shared_ptr<cudf::io::datasource> source,
+      std::string name)
+      : source_(std::move(source)), name_(std::move(name)) {}
+
+  std::string_view pread(
+      uint64_t offset,
+      uint64_t length,
+      void* buf,
+      const FileIoContext& /*context*/ = {}) const override {
+    if (length > 0) {
+      const auto bytes =
+          source_->host_read(offset, length, static_cast<uint8_t*>(buf));
+      VELOX_CHECK_EQ(bytes, length, "Short read at {} of {}", offset, name_);
+    }
+    return {static_cast<char*>(buf), length};
+  }
+
+  bool shouldCoalesce() const override {
+    return false;
+  }
+
+  uint64_t size() const override {
+    return source_->size();
+  }
+
+  uint64_t memoryUsage() const override {
+    return 0;
+  }
+
+  std::string getName() const override {
+    return name_;
+  }
+
+  uint64_t getNaturalReadSize() const override {
+    return 8 << 20;
+  }
+
+ private:
+  const std::shared_ptr<cudf::io::datasource> source_;
+  const std::string name_;
+};
+
 } // namespace
 
 CudfNimbleSplitReader::~CudfNimbleSplitReader() {
@@ -119,9 +166,7 @@ CudfNimbleSplitReader::fileMetaDatas() {
   return fileMetaDatas_;
 }
 
-void CudfNimbleSplitReader::prepareSplitInternal(
-    dwio::common::RuntimeStats& /*runtimeStats*/) {
-  nvtx3::scoped_range range{"CudfNimbleSplitReader::prepareSplit"};
+void CudfNimbleSplitReader::openBufferedReadFile() {
   const auto fileHandleKey = FileHandleKey{
       .filename = split_->filePath,
       .tokenProvider = connectorQueryCtx_->fsTokenProvider()};
@@ -144,6 +189,20 @@ void CudfNimbleSplitReader::prepareSplitInternal(
       readFile_ =
           std::make_shared<BufferedReadFile>(std::move(input), readFile_);
     }
+  }
+}
+
+void CudfNimbleSplitReader::prepareSplitInternal(
+    dwio::common::RuntimeStats& /*runtimeStats*/) {
+  nvtx3::scoped_range range{"CudfNimbleSplitReader::prepareSplit"};
+  if (!cudfHiveConfig().useBufferedInputSession(
+          connectorQueryCtx_->sessionProperties())) {
+    std::shared_ptr<cudf::io::datasource> source = std::move(
+        cudf::io::make_datasources(makeSourceInfo(*split_)).front());
+    readFile_ =
+        std::make_shared<DataSourceReadFile>(std::move(source), split_->filePath);
+  } else {
+    openBufferedReadFile();
   }
 
   facebook::nimble::TabletReader::Options tabletOptions;
@@ -370,8 +429,16 @@ CudfNimbleSplitReader::startBatch() {
     }
   }
   pending.stripes = std::move(batch);
-  pending.reads = folly::collect(std::move(pieces));
+  pending.reads = folly::collectAll(std::move(pieces));
   return pending;
+}
+
+void CudfNimbleSplitReader::startColumnChunkFetch() {
+  if (tablet_ == nullptr || noColumnsToRead_ || pending_) {
+    return;
+  }
+  nvtx3::scoped_range range{"CudfNimbleSplitReader::startColumnChunkFetch"};
+  pending_ = startBatch();
 }
 
 void CudfNimbleSplitReader::dropPending() {
@@ -405,7 +472,9 @@ CudfNimbleSplitReader::readNextChunk() {
   pending_ = startBatch();
   {
     nvtx3::scoped_range range{"CudfNimbleSplitReader::read"};
-    std::move(current.reads).get();
+    for (auto& result : std::move(current.reads).get()) {
+      result.throwIfFailed();
+    }
   }
   if (ioStatistics_) {
     ioStatistics_->incRawBytesRead(current.bytes);
