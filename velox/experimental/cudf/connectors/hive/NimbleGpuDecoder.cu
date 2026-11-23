@@ -41,6 +41,7 @@
 #include <glog/logging.h>
 
 #include <atomic>
+#include <bit>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -521,20 +522,22 @@ __global__ void fsstDecodeKernel(
 }
 
 // A leaf encoding that gives O(1) access to value i.
-// Varint leaves are decoded into 8-byte trivial leaves before the chunks that
-// read them.
+// Varint and DeltaBlock leaves are decoded into 8-byte trivial leaves before
+// the chunks that read them.
 struct FastLeaf {
   enum Kind : uint8_t {
     kTrivial,
     kFixedBitWidth,
     kConstant,
     kIdentity,
-    kVarint
+    kVarint,
+    kDeltaBlock
   };
   const uint8_t* data{nullptr};
-  // FixedBitWidth or Varint baseline, or the Constant value.
+  // FixedBitWidth or Varint baseline, the Constant value, or where a
+  // DeltaBlock leaf's values start in the batch's decoded DeltaBlock values.
   uint64_t baseline{0};
-  // Values and payload bytes of a Varint leaf.
+  // Values of a Varint or DeltaBlock leaf, and payload bytes of a Varint leaf.
   uint32_t count{0};
   uint32_t numBytes{0};
   Kind kind{kTrivial};
@@ -727,97 +730,137 @@ __global__ void decodeFastChunksKernel(
   }
 }
 
-void launchFastChunks(
-    const std::vector<FastChunk>& chunks,
-    cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr) {
-  if (chunks.empty()) {
-    return;
+// One block of a DeltaBlock leaf, decoded by one thread block of
+// deltaTasksKernel into the batch's 8-byte DeltaBlock values from `first` on.
+struct DeltaTask {
+  const uint8_t* data{nullptr};
+  uint64_t base{0};
+  uint64_t signBit{0};
+  uint64_t first{0};
+  uint32_t numRows{0};
+  uint8_t bitWidth{0};
+};
+
+__global__ void deltaTasksKernel(const DeltaTask* tasks, uint64_t* values) {
+  using Scan = cub::BlockScan<uint64_t, kBlockSize>;
+  __shared__ typename Scan::TempStorage temp;
+  const DeltaTask task = tasks[blockIdx.x];
+  const uint64_t mask = task.bitWidth == 64
+      ? ~uint64_t{0}
+      : (uint64_t{1} << task.bitWidth) - 1;
+  uint64_t* out = values + task.first;
+  uint64_t carry = task.base;
+  for (uint32_t first = 0; first < task.numRows; first += kBlockSize) {
+    const uint32_t row = first + threadIdx.x;
+    uint64_t delta = 0;
+    if (row > 0 && row < task.numRows && task.bitWidth > 0) {
+      const uint64_t bit = static_cast<uint64_t>(row - 1) * task.bitWidth;
+      const uint8_t* p = task.data + (bit >> 3);
+      const int shift = bit & 7;
+      uint64_t word = loadUnaligned<uint64_t>(p) >> shift;
+      if (shift + task.bitWidth > 64) {
+        word |= static_cast<uint64_t>(p[8]) << (64 - shift);
+      }
+      delta = word & mask;
+    }
+    uint64_t sum;
+    uint64_t total;
+    Scan(temp).InclusiveSum(delta, sum, total);
+    if (row < task.numRows) {
+      out[row] = (carry + sum) ^ task.signBit;
+    }
+    carry += total;
+    __syncthreads();
   }
-  std::vector<uint32_t> blockStarts;
-  blockStarts.reserve(chunks.size());
-  uint32_t numBlocks = 0;
-  for (const auto& chunk : chunks) {
-    blockStarts.push_back(numBlocks);
-    numBlocks += (chunk.numRows + kFastRowsPerBlock - 1) / kFastRowsPerBlock;
-  }
-  rmm::device_uvector<FastChunk> deviceChunks(chunks.size(), stream, mr);
-  rmm::device_uvector<uint32_t> deviceStarts(blockStarts.size(), stream, mr);
-  checkCuda(cudaMemcpyAsync(
-      deviceChunks.data(),
-      chunks.data(),
-      chunks.size() * sizeof(FastChunk),
-      cudaMemcpyHostToDevice,
-      stream.get()));
-  checkCuda(cudaMemcpyAsync(
-      deviceStarts.data(),
-      blockStarts.data(),
-      blockStarts.size() * sizeof(uint32_t),
-      cudaMemcpyHostToDevice,
-      stream.get()));
-  decodeFastChunksKernel<<<numBlocks, kBlockSize, 0, stream.get()>>>(
-      deviceChunks.data(), deviceStarts.data(), static_cast<int>(chunks.size()));
-  checkCuda(cudaGetLastError());
 }
 
-template <typename T>
-void scanInPlace(
-    T* data,
-    int64_t n,
-    bool inclusive,
-    cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr);
+// The string bytes of one chunk of a column that has FSST chunks, whose
+// decoded sizes are known only on the device. FSST chunks expand their codes
+// with tables[table]; others (table -1) copy their bytes.
+struct StringChunk {
+  const uint8_t* src{nullptr};
+  // An FSST chunk's code lengths and their exclusive scan over the batch, at
+  // the chunk's first entry.
+  const uint32_t* codeLengths{nullptr};
+  const uint32_t* codeOffsets{nullptr};
+  // The column's entry lengths and then, once scanned, string offsets, at the
+  // chunk's first entry.
+  int32_t* entries{nullptr};
+  char* chars{nullptr};
+  uint32_t numEntries{0};
+  int32_t table{-1};
+};
 
-// Decodes the varints of all segments into out, in segment order.
-void decodeVarints(
-    const std::vector<VarintSegment>& segments,
-    uint32_t numBytes,
-    uint64_t* out,
-    uint32_t numValues,
-    cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr) {
-  std::vector<VarintSegment> nonEmpty;
-  std::vector<uint32_t> blockStarts;
-  uint32_t numBlocks = 0;
-  for (const auto& segment : segments) {
-    if (segment.numBytes == 0) {
+constexpr int kStringsPerBlock = 1024;
+
+__global__ void fsstLengthsBatchKernel(
+    const StringChunk* chunks,
+    const uint32_t* blockStarts,
+    int numChunks,
+    const FsstTable* tables) {
+  __shared__ FsstTable shared;
+  const int c = findSegment(blockStarts, numChunks);
+  const StringChunk chunk = chunks[c];
+  loadFsstTable(tables[chunk.table], shared);
+  const uint32_t begin = (blockIdx.x - blockStarts[c]) * kStringsPerBlock;
+  const uint32_t end = min(begin + kStringsPerBlock, chunk.numEntries);
+  const uint32_t base = chunk.codeOffsets[0];
+  for (uint32_t i = begin + threadIdx.x; i < end; i += blockDim.x) {
+    const uint8_t* p = chunk.src + (chunk.codeOffsets[i] - base);
+    const uint8_t* stop = p + chunk.codeLengths[i];
+    int32_t length = 0;
+    while (p < stop) {
+      const uint8_t code = *p++;
+      if (code == kFsstEscape) {
+        ++p;
+        ++length;
+      } else {
+        length += shared.len[code];
+      }
+    }
+    chunk.entries[i] = length;
+  }
+}
+
+__global__ void stringCharsKernel(
+    const StringChunk* chunks,
+    const uint32_t* blockStarts,
+    int numChunks,
+    const FsstTable* tables) {
+  __shared__ FsstTable shared;
+  const int c = findSegment(blockStarts, numChunks);
+  const StringChunk chunk = chunks[c];
+  if (chunk.table >= 0) {
+    loadFsstTable(tables[chunk.table], shared);
+  }
+  const uint32_t begin = (blockIdx.x - blockStarts[c]) * kStringsPerBlock;
+  const uint32_t end = min(begin + kStringsPerBlock, chunk.numEntries);
+  for (uint32_t i = begin + threadIdx.x; i < end; i += blockDim.x) {
+    char* out = chunk.chars + chunk.entries[i];
+    if (chunk.table < 0) {
+      const uint8_t* p = chunk.src + (chunk.entries[i] - chunk.entries[0]);
+      const int32_t length = chunk.entries[i + 1] - chunk.entries[i];
+      for (int32_t k = 0; k < length; ++k) {
+        out[k] = static_cast<char>(p[k]);
+      }
       continue;
     }
-    nonEmpty.push_back(segment);
-    blockStarts.push_back(numBlocks);
-    numBlocks +=
-        (segment.numBytes + kVarintBytesPerBlock - 1) / kVarintBytesPerBlock;
+    const uint8_t* p = chunk.src + (chunk.codeOffsets[i] - chunk.codeOffsets[0]);
+    const uint8_t* stop = p + chunk.codeLengths[i];
+    while (p < stop) {
+      const uint8_t code = *p++;
+      if (code == kFsstEscape) {
+        *out++ = static_cast<char>(*p++);
+        continue;
+      }
+      const uint64_t symbol = shared.symbol[code];
+      const int length = shared.len[code];
+      for (int k = 0; k < length; ++k) {
+        out[k] = static_cast<char>(symbol >> (8 * k));
+      }
+      out += length;
+    }
   }
-  if (nonEmpty.empty()) {
-    return;
-  }
-  rmm::device_uvector<VarintSegment> deviceSegments(nonEmpty.size(), stream, mr);
-  rmm::device_uvector<uint32_t> deviceStarts(blockStarts.size(), stream, mr);
-  rmm::device_uvector<uint32_t> index(numBytes, stream, mr);
-  checkCuda(cudaMemcpyAsync(
-      deviceSegments.data(),
-      nonEmpty.data(),
-      nonEmpty.size() * sizeof(VarintSegment),
-      cudaMemcpyHostToDevice,
-      stream.get()));
-  checkCuda(cudaMemcpyAsync(
-      deviceStarts.data(),
-      blockStarts.data(),
-      blockStarts.size() * sizeof(uint32_t),
-      cudaMemcpyHostToDevice,
-      stream.get()));
-  const auto numSegments = static_cast<int>(nonEmpty.size());
-  varintEndFlagsKernel<<<numBlocks, kBlockSize, 0, stream.get()>>>(
-      deviceSegments.data(), deviceStarts.data(), numSegments, index.data());
-  scanInPlace(index.data(), numBytes, false, stream, mr);
-  varintValuesKernel<<<numBlocks, kBlockSize, 0, stream.get()>>>(
-      deviceSegments.data(),
-      deviceStarts.data(),
-      numSegments,
-      index.data(),
-      out,
-      numValues);
-  checkCuda(cudaGetLastError());
 }
 
 template <typename T>
@@ -854,10 +897,16 @@ struct ChunkShape {
   FastChunk chunk;
   FastLeaf runLengths;
   FastLeaf entryLengths;
+  // String bytes, or FSST codes. charsSize is 0 for FSST entries, whose
+  // decoded size is known only on the device.
   const uint8_t* chars{nullptr};
   uint64_t charsSize{0};
   uint32_t numEntries{0};
-  // A trivial string chunk whose entries are its rows.
+  // FSST entries: entryLengths holds their code lengths, and fsstTable
+  // indexes the batch's FSST tables once resolved.
+  bool fsst{false};
+  int32_t fsstTable{-1};
+  // A trivial or FSST string chunk whose entries are its rows.
   bool direct{false};
 };
 
@@ -903,6 +952,143 @@ size_t alignUp(size_t n) {
   return (n + 15) & ~size_t{15};
 }
 
+// Pinned host buffers for launch descriptors and values read back from the
+// device, in a pool of their own so that they do not take the large stream
+// buffers. cudaMallocHost is slow, so buffers are never freed.
+class SmallPinned {
+ public:
+  explicit SmallPinned(size_t size) {
+    auto& pool = smallPool();
+    {
+      std::lock_guard<std::mutex> lock{pool.mutex};
+      auto best = pool.free.end();
+      for (auto it = pool.free.begin(); it != pool.free.end(); ++it) {
+        if (it->second >= size &&
+            (best == pool.free.end() || it->second < best->second)) {
+          best = it;
+        }
+      }
+      if (best != pool.free.end()) {
+        data_ = best->first;
+        size_ = best->second;
+        pool.free.erase(best);
+        return;
+      }
+    }
+    size_ = std::max(std::bit_ceil(size), size_t{1} << 20);
+    void* data = nullptr;
+    checkCuda(cudaMallocHost(&data, size_));
+    data_ = static_cast<uint8_t*>(data);
+  }
+
+  ~SmallPinned() {
+    auto& pool = smallPool();
+    std::lock_guard<std::mutex> lock{pool.mutex};
+    pool.free.emplace_back(data_, size_);
+  }
+
+  SmallPinned(const SmallPinned&) = delete;
+  SmallPinned& operator=(const SmallPinned&) = delete;
+
+  uint8_t* data() const {
+    return data_;
+  }
+
+ private:
+  struct Pool {
+    std::mutex mutex;
+    std::vector<std::pair<uint8_t*, size_t>> free;
+  };
+
+  static Pool& smallPool() {
+    static auto* pool = new Pool();
+    return *pool;
+  }
+
+  uint8_t* data_;
+  size_t size_;
+};
+
+// Small host arrays read by a set of launches, packed into one pinned buffer
+// and copied to the device in one transfer: a copy from pageable memory
+// blocks the host.
+class Metadata {
+ public:
+  template <typename T>
+  size_t add(std::span<const T> values) {
+    const size_t offset = alignUp(bytes_.size());
+    bytes_.resize(offset + values.size_bytes());
+    if (!values.empty()) {
+      std::memcpy(bytes_.data() + offset, values.data(), values.size_bytes());
+    }
+    return offset;
+  }
+
+  template <typename T>
+  size_t add(const std::vector<T>& values) {
+    return add(std::span<const T>{values});
+  }
+
+  // The pinned buffer and the device copy live until the object is
+  // destroyed, which must be after the stream has run the launches.
+  void upload(cuda::stream_ref stream, rmm::device_async_resource_ref mr) {
+    if (bytes_.empty()) {
+      return;
+    }
+    pinned_.emplace(bytes_.size());
+    std::memcpy(pinned_->data(), bytes_.data(), bytes_.size());
+    device_ = rmm::device_buffer(bytes_.size(), stream, mr);
+    checkCuda(cudaMemcpyAsync(
+        device_.data(),
+        pinned_->data(),
+        bytes_.size(),
+        cudaMemcpyHostToDevice,
+        stream.get()));
+  }
+
+  template <typename T>
+  T* device(size_t offset) const {
+    return reinterpret_cast<T*>(
+        static_cast<uint8_t*>(const_cast<void*>(device_.data())) + offset);
+  }
+
+ private:
+  std::vector<uint8_t> bytes_;
+  std::optional<SmallPinned> pinned_;
+  rmm::device_buffer device_;
+};
+
+// Items launched as one or more blocks each: item i starts at block starts[i].
+struct BlockLaunch {
+  size_t items{0};
+  size_t starts{0};
+  int count{0};
+  uint32_t numBlocks{0};
+};
+
+template <typename T, typename Units>
+BlockLaunch addBlocks(
+    Metadata& metadata,
+    const std::vector<T>& items,
+    Units units,
+    uint64_t unitsPerBlock) {
+  std::vector<uint32_t> starts;
+  starts.reserve(items.size());
+  uint64_t numBlocks = 0;
+  for (const auto& item : items) {
+    starts.push_back(static_cast<uint32_t>(numBlocks));
+    numBlocks += (units(item) + unitsPerBlock - 1) / unitsPerBlock;
+  }
+  NIMBLE_GPU_CHECK(
+      numBlocks <= std::numeric_limits<int32_t>::max(), "too many blocks");
+  BlockLaunch launch;
+  launch.count = static_cast<int>(items.size());
+  launch.numBlocks = static_cast<uint32_t>(numBlocks);
+  launch.items = metadata.add(items);
+  launch.starts = metadata.add(starts);
+  return launch;
+}
+
 // Walks the chunks and encodings of a stripe's streams twice: first to find
 // the payloads, which are then staged and decompressed, and then to decode
 // them on the device.
@@ -916,6 +1102,10 @@ class StripeDecode {
 
   bool collecting{true};
   std::vector<Payload> payloads;
+  // Found while resolving fast chunk shapes.
+  std::vector<FsstTable> fsstTables;
+  std::vector<DeltaTask> deltaTasks;
+  uint64_t numDeltaValues{0};
 
   std::unique_ptr<cudf::column> decodeStream(
       std::span<const uint8_t> bytes,
@@ -1038,7 +1228,9 @@ class StripeDecode {
         if (!valueLeaf(bytes, type, resolve, shape, count) || count != rows) {
           return false;
         }
-        shape.direct = isString && encoding == EncodingType::kTrivial;
+        shape.direct = isString &&
+            (encoding == EncodingType::kTrivial ||
+             encoding == EncodingType::kFsst);
         return true;
     }
   }
@@ -1155,6 +1347,23 @@ class StripeDecode {
       }
       return true;
     }
+    if (encoding == EncodingType::kFsst) {
+      const auto codec = static_cast<Codec>(reader.u8());
+      const auto table = reader.take(reader.varint());
+      const auto codeLengths = reader.take(reader.varint());
+      uint32_t lengthRows = 0;
+      if (!fastLeaf(codeLengths, 4, resolve, shape.entryLengths, lengthRows) ||
+          lengthRows != count) {
+        return false;
+      }
+      shape.fsst = true;
+      if (resolve) {
+        shape.chars = payload(codec, reader.rest()).data;
+        shape.fsstTable = static_cast<int32_t>(fsstTables.size());
+        fsstTables.push_back(fsstTable(table));
+      }
+      return true;
+    }
     if (encoding != EncodingType::kTrivial) {
       return false;
     }
@@ -1245,9 +1454,62 @@ class StripeDecode {
         }
         return true;
       }
+      case EncodingType::kDeltaBlock: {
+        leaf.kind = FastLeaf::kDeltaBlock;
+        leaf.count = rows;
+        if (resolve) {
+          addDeltaTasks(reader, dataType, rows, leaf);
+        }
+        return true;
+      }
       default:
         return false;
     }
+  }
+
+  // Lists the blocks of a DeltaBlock leaf for deltaTasksKernel, which decodes
+  // them into the batch's DeltaBlock values from leaf.baseline on.
+  void addDeltaTasks(
+      ByteReader& reader,
+      DataType dataType,
+      uint32_t rows,
+      FastLeaf& leaf) {
+    const auto blockSize = reader.varint();
+    const auto numBlocks = reader.varint();
+    NIMBLE_GPU_CHECK(
+        blockSize > 0 &&
+            numBlocks == (static_cast<uint64_t>(rows) + blockSize - 1) / blockSize,
+        "DeltaBlock block count");
+    const size_t firstTask = deltaTasks.size();
+    deltaTasks.resize(firstTask + numBlocks);
+    auto* tasks = deltaTasks.data() + firstTask;
+    for (uint32_t b = 0; b < numBlocks; ++b) {
+      tasks[b].base = reader.varint64();
+    }
+    for (uint32_t b = 0; b < numBlocks; ++b) {
+      tasks[b].bitWidth = reader.u8();
+      NIMBLE_GPU_CHECK(tasks[b].bitWidth <= 64, "DeltaBlock bit width");
+    }
+    std::vector<uint32_t> offsets(numBlocks);
+    for (auto& offset : offsets) {
+      offset = reader.varint();
+    }
+    const auto packed = payload(Codec::kUncompressed, reader.rest());
+    const bool isSigned = dataType == DataType::kInt8 ||
+        dataType == DataType::kInt16 || dataType == DataType::kInt32 ||
+        dataType == DataType::kInt64;
+    const uint64_t signBit = isSigned
+        ? uint64_t{1} << (8 * physicalWidth(dataType) - 1)
+        : 0;
+    leaf.baseline = numDeltaValues;
+    for (uint32_t b = 0; b < numBlocks; ++b) {
+      NIMBLE_GPU_CHECK(offsets[b] <= packed.size, "DeltaBlock offset");
+      tasks[b].data = packed.data + offsets[b];
+      tasks[b].signBit = signBit;
+      tasks[b].first = numDeltaValues + uint64_t{b} * blockSize;
+      tasks[b].numRows = std::min<uint32_t>(blockSize, rows - b * blockSize);
+    }
+    numDeltaValues += rows;
   }
 
   std::unique_ptr<cudf::column> decodeEncoding(
@@ -1895,20 +2157,34 @@ class StripeDecode {
   std::unordered_map<const uint8_t*, size_t> payloadIndex_;
 };
 
-// Decompresses every payload of one codec in one batch.
-void decompressPayloads(
+using CodecResult = cudf::io::detail::codec_exec_result;
+
+// The payloads of one codec, decompressed in one batch. Their spans and
+// results are in the decode's Metadata.
+struct Decompression {
+  Codec codec;
+  size_t count{0};
+  size_t maxSize{0};
+  size_t totalSize{0};
+  size_t inputs{0};
+  size_t outputs{0};
+  size_t results{0};
+  std::vector<size_t> expected;
+  std::vector<size_t> storedSizes;
+};
+
+// Points each payload of the codec at its decompressed slot and lists the
+// batch's spans and results.
+Decompression prepareDecompression(
     std::vector<Payload>& payloads,
     Codec codec,
     const uint8_t* staging,
     uint8_t* output,
     std::span<const size_t> outputOffsets,
-    cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr) {
+    Metadata& metadata) {
+  Decompression batch{codec};
   std::vector<cudf::device_span<uint8_t const>> inputs;
   std::vector<cudf::device_span<uint8_t>> outputs;
-  std::vector<size_t> expected;
-  size_t maxSize = 0;
-  size_t totalSize = 0;
   for (size_t i = 0; i < payloads.size(); ++i) {
     auto& payload = payloads[i];
     if (payload.codec != codec) {
@@ -1917,75 +2193,72 @@ void decompressPayloads(
     inputs.emplace_back(staging + payload.stagingOffset, payload.stored.size());
     outputs.emplace_back(output + outputOffsets[i], payload.size);
     payload.device = {output + outputOffsets[i], payload.size};
-    expected.push_back(payload.size);
-    maxSize = std::max(maxSize, payload.size);
-    totalSize += payload.size;
+    batch.expected.push_back(payload.size);
+    batch.storedSizes.push_back(payload.stored.size());
+    batch.maxSize = std::max(batch.maxSize, payload.size);
+    batch.totalSize += payload.size;
   }
-  if (inputs.empty()) {
+  batch.count = inputs.size();
+  if (batch.count == 0) {
+    return batch;
+  }
+  batch.inputs = metadata.add(inputs);
+  batch.outputs = metadata.add(outputs);
+  // Entries that enter as SKIPPED are left untouched by the codec.
+  batch.results = metadata.add(std::vector<CodecResult>(
+      batch.count,
+      CodecResult{0, cudf::io::detail::codec_status::FAILURE}));
+  return batch;
+}
+
+// Decompresses the batch and copies its results to `readback`, a pinned
+// buffer checked by checkDecompression once the stream has run.
+void launchDecompression(
+    const Decompression& batch,
+    const Metadata& metadata,
+    CodecResult* readback,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  if (batch.count == 0) {
     return;
   }
   nvtx3::scoped_range range{"NimbleGpuDecoder::decompress"};
-  const auto count = inputs.size();
-  rmm::device_uvector<cudf::device_span<uint8_t const>> deviceInputs(
-      count, stream, mr);
-  rmm::device_uvector<cudf::device_span<uint8_t>> deviceOutputs(
-      count, stream, mr);
-  rmm::device_uvector<cudf::io::detail::codec_exec_result> results(
-      count, stream, mr);
-  checkCuda(cudaMemcpyAsync(
-      deviceInputs.data(),
-      inputs.data(),
-      count * sizeof(inputs[0]),
-      cudaMemcpyHostToDevice,
-      stream.get()));
-  checkCuda(cudaMemcpyAsync(
-      deviceOutputs.data(),
-      outputs.data(),
-      count * sizeof(outputs[0]),
-      cudaMemcpyHostToDevice,
-      stream.get()));
-  // Entries that enter as SKIPPED are left untouched by the codec.
-  std::vector<cudf::io::detail::codec_exec_result> hostResults(
-      count,
-      cudf::io::detail::codec_exec_result{
-          0, cudf::io::detail::codec_status::FAILURE});
-  checkCuda(cudaMemcpyAsync(
-      results.data(),
-      hostResults.data(),
-      count * sizeof(hostResults[0]),
-      cudaMemcpyHostToDevice,
-      stream.get()));
+  auto* results = metadata.device<CodecResult>(batch.results);
   cudf::io::detail::decompress(
-      codec == Codec::kZstd ? cudf::io::compression_type::ZSTD
-                            : cudf::io::compression_type::LZ4,
+      batch.codec == Codec::kZstd ? cudf::io::compression_type::ZSTD
+                                  : cudf::io::compression_type::LZ4,
       cudf::device_span<cudf::device_span<uint8_t const> const>{
-          deviceInputs.data(), count},
+          metadata.device<cudf::device_span<uint8_t const>>(batch.inputs),
+          batch.count},
       cudf::device_span<cudf::device_span<uint8_t> const>{
-          deviceOutputs.data(), count},
-      cudf::device_span<cudf::io::detail::codec_exec_result>{
-          results.data(), count},
-      maxSize,
-      totalSize,
+          metadata.device<cudf::device_span<uint8_t>>(batch.outputs),
+          batch.count},
+      cudf::device_span<CodecResult>{results, batch.count},
+      batch.maxSize,
+      batch.totalSize,
       stream,
       cudf::memory_resources{mr, mr});
   checkCuda(cudaMemcpyAsync(
-      hostResults.data(),
-      results.data(),
-      count * sizeof(hostResults[0]),
+      readback,
+      results,
+      batch.count * sizeof(CodecResult),
       cudaMemcpyDeviceToHost,
       stream.get()));
-  checkCuda(cudaStreamSynchronize(stream.get()));
-  for (size_t i = 0; i < count; ++i) {
+}
+
+void checkDecompression(const Decompression& batch, const CodecResult* results) {
+  for (size_t i = 0; i < batch.count; ++i) {
     NIMBLE_GPU_CHECK(
-        hostResults[i].status == cudf::io::detail::codec_status::SUCCESS &&
-            hostResults[i].bytes_written == expected[i],
+        results[i].status == cudf::io::detail::codec_status::SUCCESS &&
+            results[i].bytes_written == batch.expected[i],
         "decompression failed for payload " + std::to_string(i) + " of " +
-            std::to_string(count) + ": status " +
-            std::to_string(static_cast<int>(hostResults[i].status)) +
-            ", wrote " + std::to_string(hostResults[i].bytes_written) +
-            " of " + std::to_string(expected[i]) + " bytes from " +
-            std::to_string(inputs[i].size()) + " compressed, max " +
-            std::to_string(maxSize) + ", total " + std::to_string(totalSize));
+            std::to_string(batch.count) + ": status " +
+            std::to_string(static_cast<int>(results[i].status)) + ", wrote " +
+            std::to_string(results[i].bytes_written) + " of " +
+            std::to_string(batch.expected[i]) + " bytes from " +
+            std::to_string(batch.storedSizes[i]) + " compressed, max " +
+            std::to_string(batch.maxSize) + ", total " +
+            std::to_string(batch.totalSize));
   }
 }
 
@@ -2123,10 +2396,27 @@ std::vector<std::unique_ptr<cudf::column>> NimbleGpuDecoder::decode(
     }
   }
   auto* outputData = static_cast<uint8_t*>(output.data());
-  decompressPayloads(
-      payloads, Codec::kZstd, stagingData, outputData, outputOffsets, stream, mr);
-  decompressPayloads(
-      payloads, Codec::kLz4, stagingData, outputData, outputOffsets, stream, mr);
+  // Every descriptor the fast path launches with goes over in one transfer
+  // before the launches. The decompression results and the decoded sizes of
+  // FSST columns come back in `readback`, read after the next wait on the
+  // stream: a failed decompression is reported after the kernels that read
+  // its output have run.
+  Metadata metadata;
+  Metadata charsMetadata;
+  const auto zstd = prepareDecompression(
+      payloads, Codec::kZstd, stagingData, outputData, outputOffsets, metadata);
+  const auto lz4 = prepareDecompression(
+      payloads, Codec::kLz4, stagingData, outputData, outputOffsets, metadata);
+  std::optional<SmallPinned> readback;
+  CodecResult* results = nullptr;
+  bool decompressionChecked = false;
+  auto checkDecompressed = [&] {
+    if (!decompressionChecked && results != nullptr) {
+      checkDecompression(zstd, results);
+      checkDecompression(lz4, results + zstd.count);
+    }
+    decompressionChecked = true;
+  };
 
   std::vector<std::unique_ptr<cudf::column>> columns(types.size());
   walk.collecting = false;
@@ -2142,9 +2432,12 @@ std::vector<std::unique_ptr<cudf::column>> NimbleGpuDecoder::decode(
       uint32_t numEntries{0};
       uint64_t numChars{0};
       bool direct{true};
+      // Has FSST chunks, so its string bytes are sized on the device.
+      bool fsst{false};
     };
     std::vector<ColumnShapes> fastColumns(types.size());
     size_t totalRuns = 0;
+    uint64_t numCodeLengths = 0;
     for (size_t i = 0; i < types.size(); ++i) {
       if (!fast[i]) {
         continue;
@@ -2167,6 +2460,10 @@ std::vector<std::unique_ptr<cudf::column>> NimbleGpuDecoder::decode(
           column.numEntries += shape.numEntries;
           column.numChars += shape.charsSize;
           column.direct = column.direct && shape.direct;
+          column.fsst = column.fsst || shape.fsst;
+          if (shape.fsst) {
+            numCodeLengths += shape.numEntries;
+          }
           column.shapes.push_back(shape);
         }
         NIMBLE_GPU_CHECK(
@@ -2176,9 +2473,11 @@ std::vector<std::unique_ptr<cudf::column>> NimbleGpuDecoder::decode(
       }
     }
 
-    // Varint leaves are decoded first and then read as 8-byte trivial leaves.
+    // Varint and DeltaBlock leaves are decoded first and then read as 8-byte
+    // trivial leaves.
     std::vector<VarintSegment> segments;
     std::vector<std::pair<FastLeaf*, uint64_t>> varintLeaves;
+    std::vector<FastLeaf*> deltaLeaves;
     uint64_t numVarintBytes = 0;
     uint64_t numVarints = 0;
     for (auto& column : fastColumns) {
@@ -2188,6 +2487,10 @@ std::vector<std::unique_ptr<cudf::column>> NimbleGpuDecoder::decode(
               &shape.chunk.indices,
               &shape.runLengths,
               &shape.entryLengths}) {
+          if (leaf->kind == FastLeaf::kDeltaBlock) {
+            deltaLeaves.push_back(leaf);
+            continue;
+          }
           if (leaf->kind != FastLeaf::kVarint) {
             continue;
           }
@@ -2214,13 +2517,14 @@ std::vector<std::unique_ptr<cudf::column>> NimbleGpuDecoder::decode(
       leaf->baseline = 0;
       leaf->data = reinterpret_cast<const uint8_t*>(varints.data() + offset);
     }
-    decodeVarints(
-        segments,
-        static_cast<uint32_t>(numVarintBytes),
-        varints.data(),
-        static_cast<uint32_t>(numVarints),
-        stream,
-        mr);
+    rmm::device_uvector<uint64_t> deltaValues(walk.numDeltaValues, stream, mr);
+    for (FastLeaf* leaf : deltaLeaves) {
+      leaf->kind = FastLeaf::kTrivial;
+      leaf->width = 8;
+      leaf->data =
+          reinterpret_cast<const uint8_t*>(deltaValues.data() + leaf->baseline);
+      leaf->baseline = 0;
+    }
 
     // Run lengths, string entry lengths and string bytes go first; the
     // run lengths and entry lengths are then scanned into run ends and
@@ -2231,6 +2535,17 @@ std::vector<std::unique_ptr<cudf::column>> NimbleGpuDecoder::decode(
     std::vector<std::unique_ptr<cudf::column>> indices(types.size());
     std::vector<FastChunk> before;
     std::vector<FastChunk> main;
+    // The FSST chunks, and every string chunk of the columns that have them
+    // with the column it belongs to.
+    NIMBLE_GPU_CHECK(
+        numCodeLengths <= std::numeric_limits<uint32_t>::max(),
+        "too many FSST strings in a batch");
+    rmm::device_uvector<uint32_t> codeLengths(numCodeLengths, stream, mr);
+    rmm::device_uvector<uint32_t> codeOffsets(numCodeLengths, stream, mr);
+    std::vector<StringChunk> fsstChunks;
+    std::vector<StringChunk> stringChunks;
+    std::vector<size_t> stringChunkColumns;
+    uint32_t codeBase = 0;
     uint32_t runBase = 0;
     uint32_t rowBase = 0;
     for (size_t i = 0; i < types.size(); ++i) {
@@ -2252,8 +2567,10 @@ std::vector<std::unique_ptr<cudf::column>> NimbleGpuDecoder::decode(
         entryOffsets = offsets[i]->mutable_view().head<int32_t>();
         checkCuda(cudaMemsetAsync(
             entryOffsets + column.numEntries, 0, sizeof(int32_t), stream.get()));
-        stringChars[i] = rmm::device_buffer(column.numChars, stream, mr);
-        chars = static_cast<uint8_t*>(stringChars[i].data());
+        if (!column.fsst) {
+          stringChars[i] = rmm::device_buffer(column.numChars, stream, mr);
+          chars = static_cast<uint8_t*>(stringChars[i].data());
+        }
         if (!column.direct) {
           indices[i] = cudf::make_fixed_width_column(
               cudf::data_type{cudf::type_id::INT32},
@@ -2285,14 +2602,39 @@ std::vector<std::unique_ptr<cudf::column>> NimbleGpuDecoder::decode(
           runBase += chunk.numRuns;
           rowBase += chunk.numRows;
         }
-        if (isString) {
+        if (isString && shape.fsst) {
+          FastChunk lengths;
+          lengths.values = shape.entryLengths;
+          lengths.out = reinterpret_cast<uint8_t*>(codeLengths.data() + codeBase);
+          lengths.numRows = shape.numEntries;
+          lengths.outWidth = 4;
+          before.push_back(lengths);
+          StringChunk strings;
+          strings.src = shape.chars;
+          strings.codeLengths = codeLengths.data() + codeBase;
+          strings.codeOffsets = codeOffsets.data() + codeBase;
+          strings.entries = entryOffsets + entryBase;
+          strings.numEntries = shape.numEntries;
+          strings.table = shape.fsstTable;
+          fsstChunks.push_back(strings);
+          stringChunks.push_back(strings);
+          stringChunkColumns.push_back(i);
+          codeBase += shape.numEntries;
+        } else if (isString) {
           FastChunk lengths;
           lengths.values = shape.entryLengths;
           lengths.out = reinterpret_cast<uint8_t*>(entryOffsets + entryBase);
           lengths.numRows = shape.numEntries;
           lengths.outWidth = 4;
           before.push_back(lengths);
-          if (shape.charsSize > 0) {
+          if (column.fsst) {
+            StringChunk strings;
+            strings.src = shape.chars;
+            strings.entries = entryOffsets + entryBase;
+            strings.numEntries = shape.numEntries;
+            stringChunks.push_back(strings);
+            stringChunkColumns.push_back(i);
+          } else if (shape.charsSize > 0) {
             FastChunk bytes;
             bytes.values.kind = FastLeaf::kTrivial;
             bytes.values.width = 1;
@@ -2302,6 +2644,8 @@ std::vector<std::unique_ptr<cudf::column>> NimbleGpuDecoder::decode(
             bytes.outWidth = 1;
             before.push_back(bytes);
           }
+        }
+        if (isString) {
           chunk.add = entryBase;
           entryBase += shape.numEntries;
           charBase += shape.charsSize;
@@ -2313,8 +2657,96 @@ std::vector<std::unique_ptr<cudf::column>> NimbleGpuDecoder::decode(
         row += chunk.numRows;
       }
     }
-    launchFastChunks(before, stream, mr);
+    const auto varintLaunch = addBlocks(
+        metadata,
+        segments,
+        [](const VarintSegment& segment) { return segment.numBytes; },
+        kVarintBytesPerBlock);
+    const auto deltaTasks = metadata.add(walk.deltaTasks);
+    const auto fastRows = [](const FastChunk& chunk) { return chunk.numRows; };
+    const auto beforeLaunch =
+        addBlocks(metadata, before, fastRows, kFastRowsPerBlock);
+    const auto mainLaunch = addBlocks(metadata, main, fastRows, kFastRowsPerBlock);
+    const auto entryCount = [](const StringChunk& chunk) {
+      return chunk.numEntries;
+    };
+    const auto fsstLaunch =
+        addBlocks(metadata, fsstChunks, entryCount, kStringsPerBlock);
+    const auto tablesOffset = metadata.add(walk.fsstTables);
+    metadata.upload(stream, mr);
+    const auto* tables = metadata.device<FsstTable>(tablesOffset);
+
+    std::vector<size_t> fsstColumns;
+    for (size_t i = 0; i < types.size(); ++i) {
+      if (fast[i] && fastColumns[i].fsst) {
+        fsstColumns.push_back(i);
+      }
+    }
+    const size_t numResults = zstd.count + lz4.count;
+    const size_t numCharsOffset = alignUp(numResults * sizeof(CodecResult));
+    if (numResults > 0 || !fsstColumns.empty()) {
+      readback.emplace(numCharsOffset + fsstColumns.size() * sizeof(int32_t));
+      results = reinterpret_cast<CodecResult*>(readback->data());
+    }
+    launchDecompression(zstd, metadata, results, stream, mr);
+    launchDecompression(lz4, metadata, results + zstd.count, stream, mr);
+
+    if (varintLaunch.numBlocks > 0) {
+      rmm::device_uvector<uint32_t> index(numVarintBytes, stream, mr);
+      const auto* deviceSegments =
+          metadata.device<VarintSegment>(varintLaunch.items);
+      const auto* starts = metadata.device<uint32_t>(varintLaunch.starts);
+      varintEndFlagsKernel<<<varintLaunch.numBlocks, kBlockSize, 0, stream.get()>>>(
+          deviceSegments, starts, varintLaunch.count, index.data());
+      scanInPlace(index.data(), numVarintBytes, false, stream, mr);
+      varintValuesKernel<<<varintLaunch.numBlocks, kBlockSize, 0, stream.get()>>>(
+          deviceSegments,
+          starts,
+          varintLaunch.count,
+          index.data(),
+          varints.data(),
+          static_cast<uint32_t>(numVarints));
+      checkCuda(cudaGetLastError());
+    }
+    if (!walk.deltaTasks.empty()) {
+      NIMBLE_GPU_CHECK(
+          walk.deltaTasks.size() <= std::numeric_limits<int32_t>::max(),
+          "too many DeltaBlock blocks in a batch");
+      deltaTasksKernel<<<
+          static_cast<uint32_t>(walk.deltaTasks.size()),
+          kBlockSize,
+          0,
+          stream.get()>>>(
+          metadata.device<DeltaTask>(deltaTasks), deltaValues.data());
+      checkCuda(cudaGetLastError());
+    }
+    auto launchFast = [&](const BlockLaunch& launch) {
+      if (launch.numBlocks == 0) {
+        return;
+      }
+      decodeFastChunksKernel<<<launch.numBlocks, kBlockSize, 0, stream.get()>>>(
+          metadata.device<FastChunk>(launch.items),
+          metadata.device<uint32_t>(launch.starts),
+          launch.count);
+      checkCuda(cudaGetLastError());
+    };
+    launchFast(beforeLaunch);
     scanInPlace(runEnds.data(), totalRuns, true, stream, mr);
+    if (fsstLaunch.numBlocks > 0) {
+      checkCuda(cudaMemcpyAsync(
+          codeOffsets.data(),
+          codeLengths.data(),
+          numCodeLengths * sizeof(uint32_t),
+          cudaMemcpyDeviceToDevice,
+          stream.get()));
+      scanInPlace(codeOffsets.data(), numCodeLengths, false, stream, mr);
+      fsstLengthsBatchKernel<<<fsstLaunch.numBlocks, kBlockSize, 0, stream.get()>>>(
+          metadata.device<StringChunk>(fsstLaunch.items),
+          metadata.device<uint32_t>(fsstLaunch.starts),
+          fsstLaunch.count,
+          tables);
+      checkCuda(cudaGetLastError());
+    }
     for (size_t i = 0; i < types.size(); ++i) {
       if (offsets[i]) {
         scanInPlace(
@@ -2325,7 +2757,45 @@ std::vector<std::unique_ptr<cudf::column>> NimbleGpuDecoder::decode(
             mr);
       }
     }
-    launchFastChunks(main, stream, mr);
+    launchFast(mainLaunch);
+
+    // One wait for the string sizes of every FSST column.
+    if (!fsstColumns.empty()) {
+      auto* numChars =
+          reinterpret_cast<int32_t*>(readback->data() + numCharsOffset);
+      for (size_t k = 0; k < fsstColumns.size(); ++k) {
+        const auto i = fsstColumns[k];
+        checkCuda(cudaMemcpyAsync(
+            numChars + k,
+            offsets[i]->view().head<int32_t>() + fastColumns[i].numEntries,
+            sizeof(int32_t),
+            cudaMemcpyDeviceToHost,
+            stream.get()));
+      }
+      checkCuda(cudaStreamSynchronize(stream.get()));
+      checkDecompressed();
+      for (size_t k = 0; k < fsstColumns.size(); ++k) {
+        NIMBLE_GPU_CHECK(numChars[k] >= 0, "too many string bytes in a column");
+        stringChars[fsstColumns[k]] =
+            rmm::device_buffer(numChars[k], stream, mr);
+      }
+      for (size_t c = 0; c < stringChunks.size(); ++c) {
+        stringChunks[c].chars =
+            static_cast<char*>(stringChars[stringChunkColumns[c]].data());
+      }
+      const auto charsLaunch =
+          addBlocks(charsMetadata, stringChunks, entryCount, kStringsPerBlock);
+      charsMetadata.upload(stream, mr);
+      if (charsLaunch.numBlocks > 0) {
+        stringCharsKernel<<<charsLaunch.numBlocks, kBlockSize, 0, stream.get()>>>(
+            charsMetadata.device<StringChunk>(charsLaunch.items),
+            charsMetadata.device<uint32_t>(charsLaunch.starts),
+            charsLaunch.count,
+            tables);
+        checkCuda(cudaGetLastError());
+      }
+    }
+
     for (size_t i = 0; i < types.size(); ++i) {
       if (!offsets[i]) {
         continue;
@@ -2373,6 +2843,7 @@ std::vector<std::unique_ptr<cudf::column>> NimbleGpuDecoder::decode(
   }
   checkCuda(cudaGetLastError());
   checkCuda(cudaStreamSynchronize(stream.get()));
+  checkDecompressed();
   return columns;
 }
 
