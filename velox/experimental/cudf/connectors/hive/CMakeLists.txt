@@ -35,4 +35,8 @@ if(VELOX_ENABLE_ABFS)
   target_link_libraries(velox_cudf_hive_connector PRIVATE velox_abfs)
 endif()
 
+if(VELOX_ENABLE_NIMBLE)
+  target_sources(velox_cudf_hive_connector PRIVATE NimbleGpuDecoder.cu)
+endif()
+
 add_subdirectory(iceberg)
