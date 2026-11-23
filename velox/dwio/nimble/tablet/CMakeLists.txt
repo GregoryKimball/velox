@@ -268,6 +268,7 @@ target_link_libraries(
   nimble_tablet_writer
   nimble_encodings
   nimble_tablet_common
+  nimble_tablet_reader
   nimble_encodings
   nimble_cluster_index_fb
   nimble_chunk_stats_fb

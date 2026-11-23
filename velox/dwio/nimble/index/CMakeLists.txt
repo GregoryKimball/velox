@@ -111,6 +111,11 @@ target_link_libraries(
   Folly::folly
 )
 
+# The index writers use ChunkedStreamWriter and BufferGrowthPolicy, which live in
+# libraries that depend on nimble_index. Declaring the cycle lets reader-only
+# binaries link against the static libraries.
+target_link_libraries(nimble_index nimble_writer nimble_velox_field_writer)
+
 add_library(
   nimble_vector_index
   VectorIndex.cpp
