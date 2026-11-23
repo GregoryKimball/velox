@@ -546,10 +546,6 @@ bool CudfSplitReader::hasSplitSpecificPushdownFilter() const {
   return hasSplitSpecificPushdownFilter_;
 }
 
-namespace {
-
-// Names the split's file for cuDF, with its size when the split carries one,
-// so that a remote open skips the request for the size.
 cudf::io::source_info makeSourceInfo(const CudfHiveConnectorSplit& split) {
   cudf::io::filepath_source source{.path = split.filePath};
   if (const auto fileSize = split.fileSize()) {
@@ -558,8 +554,6 @@ cudf::io::source_info makeSourceInfo(const CudfHiveConnectorSplit& split) {
   return cudf::io::source_info{
       std::vector<cudf::io::filepath_source>{std::move(source)}};
 }
-
-} // namespace
 
 bool CudfSplitReader::ignoreMissingFiles() const {
   const HiveConfig hiveConfig(cudfHiveConfig_->config());

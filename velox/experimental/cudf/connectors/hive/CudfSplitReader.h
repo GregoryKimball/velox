@@ -49,6 +49,10 @@ using CudfParquetReader =
     cudf::io::parquet::experimental::hybrid_scan_multifile;
 using CudfParquetReaderPtr = std::unique_ptr<CudfParquetReader>;
 
+/// Names the split's file for cuDF, with its size when the split carries one,
+/// so that a remote open skips the request for the size.
+cudf::io::source_info makeSourceInfo(const CudfHiveConnectorSplit& split);
+
 /// Normalizes decimal columns, recursively, to their logical Velox types.
 /// columnTypes must describe every column after numPrependedColumns, which
 /// are left unchanged. Casts and buffer releases use the supplied stream.
@@ -121,7 +125,7 @@ class CudfSplitReader : public NvtxHelper {
 
   /// Start the reads of the column chunks of the current pass without waiting
   /// for them. Does nothing when they are already in flight or complete.
-  void startColumnChunkFetch();
+  virtual void startColumnChunkFetch();
 
   /// Get the stream.
   cuda::stream_ref stream() const {
