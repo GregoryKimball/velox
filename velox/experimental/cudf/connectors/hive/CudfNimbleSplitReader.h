@@ -95,6 +95,8 @@ class CudfNimbleSplitReader : public CudfSplitReader {
   // KvikIO, like the Parquet reader, and otherwise through a BufferedInput
   // over the AsyncDataCache and its SSD tier.
   std::shared_ptr<ReadFile> readFile_;
+  // Runs the blocking reads of `readFile_`, each a piece of a batch.
+  folly::Executor* readExecutor_{nullptr};
   std::shared_ptr<facebook::nimble::TabletReader> tablet_;
   // The stream id of each read column.
   std::vector<uint32_t> streamIds_;

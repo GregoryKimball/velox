@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfNoDefaults.h"
+#include "velox/experimental/cudf/connectors/hive/CachingDataSource.h"
 #include "velox/experimental/cudf/connectors/hive/CudfNimbleSplitReader.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -51,8 +52,9 @@
 namespace facebook::velox::cudf_velox::connector::hive {
 namespace {
 
-// Object stores need many concurrent ranged reads to reach line rate; the
-// S3 client's connection limit (hive.s3.max-connections) must allow as many.
+// Threads for reads through a BufferedInput. Object stores need many
+// concurrent ranged reads to reach line rate; the S3 client's connection limit
+// (hive.s3.max-connections) must allow as many.
 folly::Executor* readExecutor() {
   static auto* executor = [] {
     const char* threads = std::getenv("NIMBLE_GPU_READ_THREADS");
@@ -207,8 +209,10 @@ void CudfNimbleSplitReader::prepareSplitInternal(
           connectorQueryCtx_->sessionProperties())) {
     readFile_ = std::make_shared<DataSourceReadFile>(
         makeKvikioDataSource(*split_, ioStats_), split_->filePath);
+    readExecutor_ = kvikioReadExecutor();
   } else {
     openBufferedReadFile();
+    readExecutor_ = readExecutor();
   }
 
   facebook::nimble::TabletReader::Options tabletOptions;
@@ -422,7 +426,7 @@ CudfNimbleSplitReader::startBatch() {
       const auto fileOffset = range.fileOffset + done;
       pieces.push_back(
           folly::via(
-              readExecutor(),
+              readExecutor_,
               [file = readFile_, fileOffset, size, out] {
                 file->pread(fileOffset, size, out);
               })

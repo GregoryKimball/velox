@@ -21,10 +21,18 @@
 
 #include <cudf/io/datasource.hpp>
 
+#include <folly/Executor.h>
+
 #include <memory>
 #include <string_view>
 
 namespace facebook::velox::cudf_velox::connector::hive {
+
+/// Threads that do blocking KvikIO reads, one read each. The thread count
+/// equals KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS (default 256), or 64 when
+/// that is 0 (concurrency unlimited), so that the readers sharing it keep as
+/// many requests in flight as KvikIO allows.
+folly::Executor* kvikioReadExecutor();
 
 /// Returns 'kvikioSource' wrapped so that its reads go through the async data
 /// cache, or 'kvikioSource' itself when the async data cache is null or the

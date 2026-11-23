@@ -73,10 +73,9 @@ namespace {
 // without the cache.
 constexpr size_t kMaxCacheEntryBytes = std::numeric_limits<int32_t>::max();
 
-// Threads that put ranges in the cache. A fill thread waits while KvikIO reads
-// a miss. The thread count equals KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS
-// (default 256), or 64 when that is 0 (concurrency unlimited).
-folly::Executor* fillExecutor() {
+} // namespace
+
+folly::Executor* kvikioReadExecutor() {
   static auto* executor = [] {
     size_t threads = 256;
     if (const char* value =
@@ -90,6 +89,14 @@ folly::Executor* fillExecutor() {
         threads, std::make_shared<folly::NamedThreadFactory>("CudfCacheFill"));
   }();
   return executor;
+}
+
+namespace {
+
+// Threads that put ranges in the cache. A fill thread waits while KvikIO reads
+// a miss.
+folly::Executor* fillExecutor() {
+  return kvikioReadExecutor();
 }
 
 // Threads that copy a range to the GPU, each through its own pinned buffer.
