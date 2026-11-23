@@ -19,6 +19,9 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSource.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveTableHandle.h"
+#ifdef VELOX_ENABLE_NIMBLE
+#include "velox/experimental/cudf/connectors/hive/CudfNimbleSplitReader.h"
+#endif
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -626,6 +629,22 @@ CudfHiveDataSource::CudfHiveDataSource(
 }
 
 std::unique_ptr<CudfSplitReader> CudfHiveDataSource::createCudfSplitReader() {
+#ifdef VELOX_ENABLE_NIMBLE
+  if (split_->fileFormat == dwio::common::FileFormat::NIMBLE) {
+    return std::make_unique<CudfNimbleSplitReader>(
+        split_,
+        tableHandle_,
+        readerOutputType_,
+        readColumnNames_,
+        fileHandleFactory_,
+        executor_,
+        connectorQueryCtx_,
+        cudfHiveConfig_,
+        ioStatistics_,
+        ioStats_,
+        subfieldFilterAst_);
+  }
+#endif
   return std::make_unique<CudfSplitReader>(
       split_,
       tableHandle_,
@@ -650,10 +669,14 @@ void CudfHiveDataSource::convertSplit(std::shared_ptr<ConnectorSplit> split) {
   // Convert `HiveConnectorSplit` to `CudfHiveConnectorSplit`
   auto hiveSplit = checkedPointerCast<hive::HiveConnectorSplit>(split);
 
-  VELOX_CHECK_EQ(
-      hiveSplit->fileFormat,
-      dwio::common::FileFormat::PARQUET,
-      "Unsupported file format for conversion from HiveConnectorSplit to CudfHiveConnectorSplit");
+  VELOX_CHECK(
+      hiveSplit->fileFormat == dwio::common::FileFormat::PARQUET
+#ifdef VELOX_ENABLE_NIMBLE
+          || hiveSplit->fileFormat == dwio::common::FileFormat::NIMBLE
+#endif
+      ,
+      "Unsupported file format for conversion from HiveConnectorSplit to CudfHiveConnectorSplit: {}",
+      dwio::common::FileFormatName::toName(hiveSplit->fileFormat));
 
   // Remove "file:" prefix from the file path if present
   std::string cleanedPath = hiveSplit->filePath;
@@ -670,7 +693,8 @@ void CudfHiveDataSource::convertSplit(std::shared_ptr<ConnectorSplit> split) {
                                   .start(hiveSplit->start)
                                   .length(hiveSplit->length)
                                   .connectorId(hiveSplit->connectorId)
-                                  .splitWeight(hiveSplit->splitWeight);
+                                  .splitWeight(hiveSplit->splitWeight)
+                                  .fileFormat(hiveSplit->fileFormat);
   for (auto const& infoColumn : hiveSplit->infoColumns) {
     cudfHiveSplitBuilder.infoColumn(infoColumn.first, infoColumn.second);
   }

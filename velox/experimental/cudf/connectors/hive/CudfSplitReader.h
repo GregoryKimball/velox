@@ -87,8 +87,8 @@ class CudfSplitReader : public NvtxHelper {
 
   /// Reads and returns the Parquet file metadatas, cached until prepareSplit()
   /// hands them to the cuDF reader. Returns no metadata when the split is
-  /// empty.
-  const std::vector<cudf::io::parquet::FileMetaData>& fileMetaDatas();
+  /// empty or its file is not Parquet.
+  virtual const std::vector<cudf::io::parquet::FileMetaData>& fileMetaDatas();
 
   /// Sets the split-specific pushdown filter. The expression must remain alive
   /// while the split is being read.
@@ -136,6 +136,12 @@ class CudfSplitReader : public NvtxHelper {
   // Returns the connector config the reader was built with.
   const CudfHiveConfig& cudfHiveConfig() const {
     return *cudfHiveConfig_;
+  }
+
+  // Returns the reader options, with the Hive load quantum and coalescing
+  // limits applied, that a BufferedInput for the split is built with.
+  const dwio::common::ReaderOptions& baseReaderOptions() const {
+    return baseReaderOpts_;
   }
 
   // Performs split-specific setup after the Parquet footer is loaded.
