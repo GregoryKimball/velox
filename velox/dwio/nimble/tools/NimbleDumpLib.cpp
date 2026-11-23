@@ -188,8 +188,16 @@ uint64_t getRawDataSize(
       break;
     }
 
-    default:
-      NIMBLE_UNSUPPORTED("Encoding type does not support strings.");
+    default: {
+      auto values = EncodingFactory().create(
+          memoryPool, encodingStr, stringBufferFactory, Encoding::Options{});
+      std::vector<std::string_view> valuesBuffer(rowCount);
+      values->materialize(rowCount, valuesBuffer.data());
+      for (const auto& value : valuesBuffer) {
+        result += value.size();
+      }
+      break;
+    }
   }
   return result;
 }
