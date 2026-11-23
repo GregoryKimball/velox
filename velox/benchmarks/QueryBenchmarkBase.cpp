@@ -16,6 +16,7 @@
 
 #include "velox/benchmarks/QueryBenchmarkBase.h"
 #include <folly/String.h>
+#include <chrono>
 #include <iostream>
 #include "velox/common/base/SuccinctPrinter.h"
 #include "velox/common/file/FileSystems.h"
@@ -23,6 +24,9 @@
 #include "velox/connectors/hive/HiveConnector.h"
 #include "velox/dwio/dwrf/RegisterDwrfReader.h"
 #include "velox/dwio/dwrf/common/Config.h"
+#ifdef VELOX_ENABLE_NIMBLE
+#include "velox/dwio/nimble/reader/NimbleReaderFactory.h"
+#endif
 #include "velox/dwio/parquet/RegisterParquetReader.h"
 #include "velox/exec/Split.h"
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
@@ -32,21 +36,36 @@
 
 namespace {
 
+#ifdef VELOX_ENABLE_NIMBLE
+constexpr std::string_view kAllowedDataFormats{
+    "[\"parquet\", \"dwrf\", \"nimble\"]"};
+#else
+constexpr std::string_view kAllowedDataFormats{"[\"parquet\", \"dwrf\"]"};
+#endif
+
 bool validateDataFormat(const char* flagname, const std::string& value) {
   if ((value.compare("parquet") == 0) || (value.compare("dwrf") == 0)) {
     return true;
   }
-  std::cout
-      << fmt::format(
-             "Invalid value for --{}: {}. Allowed values are [\"parquet\", \"dwrf\"]",
-             flagname,
-             value)
-      << std::endl;
+#ifdef VELOX_ENABLE_NIMBLE
+  if (value.compare("nimble") == 0) {
+    return true;
+  }
+#endif
+  std::cout << fmt::format(
+                   "Invalid value for --{}: {}. Allowed values are {}",
+                   flagname,
+                   value,
+                   kAllowedDataFormats)
+            << std::endl;
   return false;
 }
 } // namespace
 
-DEFINE_string(data_format, "parquet", "Data format: parquet or dwrf.");
+DEFINE_string(
+    data_format,
+    "parquet",
+    "Data format: parquet, dwrf or, when built with Nimble, nimble.");
 
 DEFINE_validator(data_format, &validateDataFormat);
 
@@ -252,6 +271,9 @@ void QueryBenchmarkBase::initialize() {
       hiveConnector->connectorId(), hiveConnector);
   parquet::registerParquetReaderFactory();
   dwrf::registerDwrfReaderFactory();
+#ifdef VELOX_ENABLE_NIMBLE
+  nimble::registerNimbleReaderFactory();
+#endif
 }
 
 std::shared_ptr<config::ConfigBase>
@@ -321,8 +343,16 @@ QueryBenchmarkBase::run(
         }
         taskCursor->setNoMoreSplits();
       };
+      const auto start = std::chrono::steady_clock::now();
       auto result = readCursor(params, addSplits);
       ensureTaskCompletion(result.first->task().get());
+      std::cout << fmt::format(
+                       "Repeat {} wall time us: {}",
+                       repeat,
+                       std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count())
+                << std::endl;
       if (++repeat >= FLAGS_num_repeats) {
         return result;
       }
