@@ -59,6 +59,12 @@ std::unique_ptr<cudf::table> castDecimalColumnsToVeloxTypes(
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr);
 
+/// Opens the whole file of 'split' through KvikIO, wrapped in the async data
+/// cache when the split is cacheable.
+std::unique_ptr<cudf::io::datasource> makeKvikioDataSource(
+    const CudfHiveConnectorSplit& split,
+    const std::shared_ptr<IoStats>& ioStats);
+
 class CudfSplitReader : public NvtxHelper {
  public:
   CudfSplitReader(
@@ -108,7 +114,7 @@ class CudfSplitReader : public NvtxHelper {
 
   /// Start the reads of the column chunks of the current pass without waiting
   /// for them. Does nothing when they are already in flight or complete.
-  void startColumnChunkFetch();
+  virtual void startColumnChunkFetch();
 
   /// Waits for the column chunks of the first pass and sets up its chunked
   /// read, so that background split preparation can do this work and the

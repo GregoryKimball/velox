@@ -20,6 +20,7 @@
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
 #include "velox/common/caching/AsyncDataCache.h"
+#include "velox/common/time/Timer.h"
 #include "velox/connectors/hive/BufferedInputBuilder.h"
 #include "velox/connectors/hive/FileHandle.h"
 #include "velox/dwio/common/BufferedInput.h"
@@ -108,15 +109,70 @@ class BufferedReadFile : public ReadFile {
   const std::shared_ptr<ReadFile> file_;
 };
 
+// Serves reads from a cuDF datasource, so that the tablet metadata and the
+// streams come through the same KvikIO source and async data cache as Parquet.
+class DataSourceReadFile : public ReadFile {
+ public:
+  DataSourceReadFile(
+      std::shared_ptr<cudf::io::datasource> source,
+      std::string name)
+      : source_(std::move(source)), name_(std::move(name)) {}
+
+  std::string_view pread(
+      uint64_t offset,
+      uint64_t length,
+      void* buf,
+      const FileIoContext& /*context*/ = {}) const override {
+    if (length > 0) {
+      const auto bytes =
+          source_->host_read(offset, length, static_cast<uint8_t*>(buf));
+      VELOX_CHECK_EQ(
+          bytes, length, "Short read at {} of {}", offset, name_);
+    }
+    return {static_cast<char*>(buf), length};
+  }
+
+  bool shouldCoalesce() const override {
+    return false;
+  }
+
+  uint64_t size() const override {
+    return source_->size();
+  }
+
+  uint64_t memoryUsage() const override {
+    return 0;
+  }
+
+  std::string getName() const override {
+    return name_;
+  }
+
+  uint64_t getNaturalReadSize() const override {
+    return 8 << 20;
+  }
+
+ private:
+  const std::shared_ptr<cudf::io::datasource> source_;
+  const std::string name_;
+};
+
+void addCounter(
+    const std::shared_ptr<IoStats>& ioStats,
+    const std::string& name,
+    RuntimeCounter counter) {
+  if (ioStats) {
+    ioStats->addCounter(name, counter);
+  }
+}
+
 } // namespace
 
 CudfNimbleSplitReader::~CudfNimbleSplitReader() {
   dropPending();
 }
 
-void CudfNimbleSplitReader::prepareSplitInternal(
-    dwio::common::RuntimeStats& /*runtimeStats*/) {
-  nvtx3::scoped_range range{"CudfNimbleSplitReader::prepareSplit"};
+void CudfNimbleSplitReader::openBufferedReadFile() {
   const auto fileHandleKey = FileHandleKey{
       .filename = split_->filePath,
       .tokenProvider = connectorQueryCtx_->fsTokenProvider()};
@@ -141,6 +197,18 @@ void CudfNimbleSplitReader::prepareSplitInternal(
       readFile_ =
           std::make_shared<BufferedReadFile>(std::move(input), readFile_);
     }
+  }
+}
+
+void CudfNimbleSplitReader::prepareSplitInternal(
+    dwio::common::RuntimeStats& /*runtimeStats*/) {
+  nvtx3::scoped_range range{"CudfNimbleSplitReader::prepareSplit"};
+  if (!cudfHiveConfig().useBufferedInputSession(
+          connectorQueryCtx_->sessionProperties())) {
+    readFile_ = std::make_shared<DataSourceReadFile>(
+        makeKvikioDataSource(*split_, ioStats_), split_->filePath);
+  } else {
+    openBufferedReadFile();
   }
 
   facebook::nimble::TabletReader::Options tabletOptions;
@@ -367,16 +435,47 @@ CudfNimbleSplitReader::startBatch() {
       entry.streams.emplace_back(host + hostOffsets[next], reads[next].size);
     }
   }
+  addCounter(ioStats_, "nimbleGpuBatches", RuntimeCounter(1));
+  addCounter(
+      ioStats_, "nimbleGpuBatchStripes", RuntimeCounter(batch.size()));
+  addCounter(
+      ioStats_,
+      "nimbleGpuBatchBytes",
+      RuntimeCounter(hostBytes, RuntimeCounter::Unit::kBytes));
   pending.stripes = std::move(batch);
-  pending.reads = folly::collect(std::move(pieces));
+  pending.reads = folly::collectAll(std::move(pieces));
   return pending;
 }
 
-void CudfNimbleSplitReader::dropPending() {
-  if (pending_) {
-    pending_->reads.wait();
-    pending_.reset();
+void CudfNimbleSplitReader::fillPending() {
+  // Batches in flight while the previous one is decoded. Each holds up to the
+  // batch byte budget in pinned host memory.
+  static const size_t kDepth = [] {
+    const char* depth = std::getenv("NIMBLE_GPU_PREFETCH_BATCHES");
+    return std::max<size_t>(1, depth != nullptr ? std::stoul(depth) : 2);
+  }();
+  while (pending_.size() < kDepth) {
+    auto batch = startBatch();
+    if (!batch) {
+      return;
+    }
+    pending_.push_back(std::move(*batch));
   }
+}
+
+void CudfNimbleSplitReader::startColumnChunkFetch() {
+  if (tablet_ == nullptr || noColumnsToRead_) {
+    return;
+  }
+  nvtx3::scoped_range range{"CudfNimbleSplitReader::startColumnChunkFetch"};
+  fillPending();
+}
+
+void CudfNimbleSplitReader::dropPending() {
+  for (auto& batch : pending_) {
+    batch.reads.wait();
+  }
+  pending_.clear();
 }
 
 std::optional<CudfSplitReader::TableChunk>
@@ -393,17 +492,25 @@ CudfNimbleSplitReader::readNextChunk() {
         static_cast<cudf::size_type>(tablet_->stripeRowCount(stripe))};
   }
 
-  if (!pending_) {
-    pending_ = startBatch();
-  }
-  if (!pending_) {
+  fillPending();
+  if (pending_.empty()) {
     return std::nullopt;
   }
-  auto current = std::move(*pending_);
-  pending_ = startBatch();
+  auto current = std::move(pending_.front());
+  pending_.pop_front();
+  fillPending();
   {
     nvtx3::scoped_range range{"CudfNimbleSplitReader::read"};
-    std::move(current.reads).get();
+    const auto startNanos = getCurrentTimeNano();
+    auto results = std::move(current.reads).get();
+    addCounter(
+        ioStats_,
+        "nimbleGpuReadWaitNanos",
+        RuntimeCounter(
+            getCurrentTimeNano() - startNanos, RuntimeCounter::Unit::kNanos));
+    for (auto& result : results) {
+      result.throwIfFailed();
+    }
   }
   if (ioStatistics_) {
     ioStatistics_->incRawBytesRead(current.bytes);

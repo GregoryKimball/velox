@@ -908,8 +908,6 @@ bool CudfSplitReader::hasSplitSpecificPushdownFilter() const {
   return hasSplitSpecificPushdownFilter_;
 }
 
-namespace {
-
 std::unique_ptr<cudf::io::datasource> makeKvikioDataSource(
     const CudfHiveConnectorSplit& split,
     const std::shared_ptr<IoStats>& ioStats) {
@@ -932,8 +930,6 @@ std::unique_ptr<cudf::io::datasource> makeKvikioDataSource(
       split.cacheable,
       ioStats);
 }
-
-} // namespace
 
 void CudfSplitReader::setupCudfDataSource() {
   if (dataSource_) {

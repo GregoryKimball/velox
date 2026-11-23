@@ -23,6 +23,7 @@
 
 #include <folly/futures/Future.h>
 
+#include <deque>
 #include <optional>
 
 namespace facebook::nimble {
@@ -44,6 +45,11 @@ class CudfNimbleSplitReader : public CudfSplitReader {
 
   void resetSplit() override;
 
+  /// Starts the reads of the first batches of the split, so that a split
+  /// prepared in the background has its stream bytes in flight before a
+  /// driver adopts it.
+  void startColumnChunkFetch() override;
+
  protected:
   void prepareSplitInternal(dwio::common::RuntimeStats& runtimeStats) override;
 
@@ -64,18 +70,30 @@ class CudfNimbleSplitReader : public CudfSplitReader {
     std::unique_ptr<NimbleGpuDecoder::PinnedBuffer> pinned;
     std::vector<NimbleStripeStreams> stripes;
     size_t bytes{0};
-    folly::SemiFuture<std::vector<folly::Unit>> reads{
-        folly::makeSemiFuture(std::vector<folly::Unit>{})};
+    // Ready once every read has finished, failed or not, so that `pinned` can
+    // be freed.
+    folly::SemiFuture<std::vector<folly::Try<folly::Unit>>> reads{
+        folly::makeSemiFuture(std::vector<folly::Try<folly::Unit>>{})};
   };
+
+  // Opens the split's file through a BufferedInput over the AsyncDataCache,
+  // when the process has one.
+  void openBufferedReadFile();
 
   // Starts reading the next batch, if any stripes are left.
   std::optional<PendingBatch> startBatch();
 
-  // Waits for the reads of the pending batch, ignoring their errors.
+  // Starts batches until the prefetch depth is in flight or no stripes are
+  // left.
+  void fillPending();
+
+  // Waits for the reads of every pending batch, ignoring their errors, and
+  // frees them.
   void dropPending();
 
-  // Reads through the AsyncDataCache and its SSD tier when the process has a
-  // cache.
+  // Reads through KvikIO and its async data cache when the connector uses
+  // KvikIO, like the Parquet reader, and otherwise through a BufferedInput
+  // over the AsyncDataCache and its SSD tier.
   std::shared_ptr<ReadFile> readFile_;
   std::shared_ptr<facebook::nimble::TabletReader> tablet_;
   // The stream id of each read column.
@@ -87,8 +105,8 @@ class CudfNimbleSplitReader : public CudfSplitReader {
   bool compactRowCount_{false};
   bool splitSkipped_{false};
   NimbleGpuDecoder decoder_;
-  // Read while the previous batch is decoded and consumed.
-  std::optional<PendingBatch> pending_;
+  // Read, in file order, while the previous batch is decoded and consumed.
+  std::deque<PendingBatch> pending_;
 };
 
 } // namespace facebook::velox::cudf_velox::connector::hive
