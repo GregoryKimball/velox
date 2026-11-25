@@ -51,8 +51,6 @@ struct CudfRegexPattern {
   bool canMatchEmpty;
   // True if the pattern uses leading mode modifiers, which become 'flags'.
   bool hasModifiers;
-  // True if the pattern uses \b or \B.
-  bool hasWordBoundary;
 };
 
 /// Translates an RE2 pattern, as Velox's RE2-based regex functions compile it,

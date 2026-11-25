@@ -119,7 +119,6 @@ class Re2ToCudfTranslator {
         .numGroups = numGroups_,
         .canMatchEmpty = node->nullable,
         .hasModifiers = hasModifiers,
-        .hasWordBoundary = hasWordBoundary_,
     };
   }
 
@@ -515,12 +514,11 @@ class Re2ToCudfTranslator {
       case 'S':
         ++pos_;
         return Node{std::string(kNotSpace), false, false};
+      // libcudf's '\b' tests for Unicode word characters even with the ASCII
+      // flag, where RE2's tests for ASCII ones.
       case 'b':
       case 'B':
-        ++pos_;
-        hasWordBoundary_ = true;
-        foldSensitive_ = true;
-        return Node{std::string("\\") + c, true, true};
+        return std::nullopt;
       case 'A':
         ++pos_;
         return Node{"\\A", true, true};
@@ -647,7 +645,6 @@ class Re2ToCudfTranslator {
   int32_t numGroups_{0};
   bool ignoreCase_{false};
   bool foldSensitive_{false};
-  bool hasWordBoundary_{false};
 };
 
 std::optional<int64_t> constantIntegerValue(const core::TypedExprPtr& expr) {
@@ -837,10 +834,8 @@ std::optional<RegexCall> analyzeRegexCall(
       regex->canMatchEmpty) {
     return std::nullopt;
   }
-  // split_record_re() ignores the regex flags, including ASCII, which \b
-  // depends on.
-  if (op == RegexOp::kSplit &&
-      (regex->hasModifiers || regex->hasWordBoundary)) {
+  // split_record_re() ignores the regex flags.
+  if (op == RegexOp::kSplit && regex->hasModifiers) {
     return std::nullopt;
   }
   try {
@@ -933,12 +928,22 @@ class RegexExtractAllFunction : public RegexFunction {
     // extract_all_record() returns NULL for a row without a match, where
     // Velox returns an empty array. Such rows hold no elements, so the input's
     // null mask makes them empty arrays.
+    auto nullMask = cudf::copy_bitmask(
+        input, stream, cudf::memory_resources{mr, get_temp_mr()});
     auto result =
         cudf::strings::extract_all_record(input, *program_, stream, mr);
-    result->set_null_mask(
-        cudf::copy_bitmask(
-            input, stream, cudf::memory_resources{mr, get_temp_mr()}),
-        input.null_count());
+    // When no row matches, extract_all_record() returns a column with no
+    // rows rather than one null row per input row.
+    if (result->size() != input.size()) {
+      cudf::numeric_scalar<cudf::size_type> zero(0, true, stream, mr);
+      return cudf::make_lists_column(
+          input.size(),
+          cudf::make_column_from_scalar(zero, input.size() + 1, stream, mr),
+          cudf::make_empty_column(cudf::type_id::STRING),
+          input.null_count(),
+          std::move(nullMask));
+    }
+    result->set_null_mask(std::move(nullMask), input.null_count());
     return result;
   }
 };

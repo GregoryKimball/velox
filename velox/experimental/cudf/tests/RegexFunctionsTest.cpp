@@ -179,8 +179,6 @@ const std::vector<std::string>& gpuPatterns() {
       "😀",
       "\\n",
       "\\t+",
-      "\\bfoo\\b",
-      "foo\\B",
       "[\\w.]+@[\\w.]+",
       "https?://[^/\\s]+",
       "\\d{4}-\\d{2}-\\d{2}",
@@ -206,7 +204,6 @@ const std::vector<std::string>& nullablePatterns() {
       "x?",
       "^",
       "$",
-      "\\b",
       "(?:ab)*",
       "(a|b){0,2}",
   };
@@ -229,6 +226,9 @@ const std::vector<std::string>& cpuOnlyPatterns() {
       "(?i)k",
       "(?i)[a-z]",
       "(?i)\\w",
+      "\\b",
+      "\\bfoo\\b",
+      "foo\\B",
       "\\Qa.b\\E",
       "\\C",
       "a|",
@@ -351,7 +351,6 @@ TEST(RegexTranslationTest, reportsPatternProperties) {
   EXPECT_FALSE(a->canMatchEmpty);
   EXPECT_TRUE(translateRe2Pattern("a*")->canMatchEmpty);
   EXPECT_TRUE(translateRe2Pattern("a|b*")->canMatchEmpty);
-  EXPECT_TRUE(translateRe2Pattern("\\bfoo")->hasWordBoundary);
 }
 
 TEST_F(CudfPrestoRegexTest, regexpLike) {
