@@ -36,6 +36,7 @@ add_library(
   prestosql/DateAddFunction.cpp
   prestosql/DatePlusIntervalFunction.cpp
   prestosql/UnixtimeFunctions.cpp
+  RegexFunctions.cpp
   SparkFunctions.cpp
   sparksql/DateAddFunction.cpp
   sparksql/HashFunction.cpp
@@ -53,6 +54,8 @@ target_link_libraries(
     velox_cudf_vector
     velox_exception
     velox_expression
+    velox_functions_lib
+    re2::re2
 )
 
 target_compile_options(velox_cudf_expression PRIVATE -Wno-missing-field-initializers)
