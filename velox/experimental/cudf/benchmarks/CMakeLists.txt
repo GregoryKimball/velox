@@ -36,6 +36,18 @@ target_link_libraries(
 
 # --- other benchmarks ---
 
+add_executable(velox_cudf_regex_benchmark CudfRegexBenchmark.cpp)
+
+target_link_libraries(
+  velox_cudf_regex_benchmark
+  velox_cudf_exec
+  velox_functions_prestosql
+  velox_parse_parser
+  velox_parse_utils
+  Folly::folly
+  gflags::gflags
+)
+
 add_executable(velox_cudf_interop_benchmark CudfInteropBenchmark.cpp)
 
 target_link_libraries(

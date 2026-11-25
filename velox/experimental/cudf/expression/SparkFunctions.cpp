@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/expression/CommonFunctions.h"
 #include "velox/experimental/cudf/expression/DateTruncFunction.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
+#include "velox/experimental/cudf/expression/RegexFunctions.h"
 #include "velox/experimental/cudf/expression/SparkFunctions.h"
 #include "velox/experimental/cudf/expression/sparksql/DateAddFunction.h"
 #include "velox/experimental/cudf/expression/sparksql/HashFunction.h"
@@ -153,6 +154,7 @@ void registerSparkFunctions(const std::string& prefix) {
       });
 
   registerSparkArrayAccessFunctions(prefix);
+  registerSparkRegexFunctions(prefix);
 }
 
 } // namespace facebook::velox::cudf_velox

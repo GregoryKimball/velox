@@ -21,6 +21,7 @@
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/expression/NullMask.h"
 #include "velox/experimental/cudf/expression/PrestoFunctions.h"
+#include "velox/experimental/cudf/expression/RegexFunctions.h"
 #include "velox/experimental/cudf/expression/prestosql/ArrayJoinFunction.h"
 #include "velox/experimental/cudf/expression/prestosql/DateAddFunction.h"
 #include "velox/experimental/cudf/expression/prestosql/DatePlusIntervalFunction.h"
@@ -295,6 +296,7 @@ void registerPrestoFunctions(const std::string& prefix) {
   // Presto's rules.
   setPrestoCastEnabled(true);
   registerPrestoArrayAccessFunctions(prefix);
+  registerPrestoRegexFunctions(prefix);
 
   registerCudfFunction(
       prefix + "array_join",
