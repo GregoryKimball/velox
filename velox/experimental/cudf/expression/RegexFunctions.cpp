@@ -85,9 +85,11 @@ class Re2ToCudfTranslator {
       auto modifierFlags = flags;
       while (end < pattern_.size() &&
              (pattern_[end] == 'i' || pattern_[end] == 's')) {
-        modifierFlags = modifierFlags |
-            (pattern_[end] == 'i' ? regex_flags::IGNORECASE
-                                  : regex_flags::DOTALL);
+        modifierFlags = static_cast<regex_flags>(
+            static_cast<uint32_t>(modifierFlags) |
+            static_cast<uint32_t>(
+                pattern_[end] == 'i' ? regex_flags::IGNORECASE
+                                     : regex_flags::DOTALL));
         ++end;
       }
       if (end == pos_ + 2 || end >= pattern_.size() || pattern_[end] != ')') {
@@ -933,14 +935,10 @@ class RegexExtractAllFunction : public RegexFunction {
     // null mask makes them empty arrays.
     auto result =
         cudf::strings::extract_all_record(input, *program_, stream, mr);
-    if (input.nullable()) {
-      result->set_null_mask(
-          cudf::copy_bitmask(
-              input, stream, cudf::memory_resources{mr, get_temp_mr()}),
-          input.null_count());
-    } else {
-      result->set_null_mask(rmm::device_buffer{0, stream, mr}, 0);
-    }
+    result->set_null_mask(
+        cudf::copy_bitmask(
+            input, stream, cudf::memory_resources{mr, get_temp_mr()}),
+        input.null_count());
     return result;
   }
 };
